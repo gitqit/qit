@@ -3,5 +3,6 @@
 *.db
 *.db-journal
 .DS_Store
+.cursor/
 
 example-out.txt
