@@ -62,10 +62,12 @@ impl FilesystemRegistry {
     fn load_registry(&self) -> Result<RegistryFile, RegistryError> {
         let path = self.registry_path();
         match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents).map_err(|err| RegistryError::CorruptRegistry {
-                path,
-                message: err.to_string(),
-            }),
+            Ok(contents) => {
+                serde_json::from_str(&contents).map_err(|err| RegistryError::CorruptRegistry {
+                    path,
+                    message: err.to_string(),
+                })
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(RegistryFile::default()),
             Err(err) => Err(RegistryError::Io {
                 operation: "read registry",
@@ -188,7 +190,11 @@ impl RegistryStore for FilesystemRegistry {
     }
 
     fn load(&self, id: WorkspaceId) -> Result<Option<WorkspaceRecord>, RegistryError> {
-        Ok(self.load_registry()?.workspaces.get(&id.0.to_string()).cloned())
+        Ok(self
+            .load_registry()?
+            .workspaces
+            .get(&id.0.to_string())
+            .cloned())
     }
 
     fn save(&self, id: WorkspaceId, record: WorkspaceRecord) -> Result<(), RegistryError> {

@@ -133,7 +133,9 @@ pub enum RegistryError {
     },
     #[error("registry JSON is invalid at {path}: {message}")]
     CorruptRegistry { path: PathBuf, message: String },
-    #[error("workspace record for {id:?} points at {actual_worktree} instead of {expected_worktree}")]
+    #[error(
+        "workspace record for {id:?} points at {actual_worktree} instead of {expected_worktree}"
+    )]
     WorkspaceRecordMismatch {
         id: WorkspaceId,
         expected_worktree: PathBuf,
@@ -268,7 +270,10 @@ pub struct WorkspaceService {
 }
 
 impl WorkspaceService {
-    fn lock_resolved_workspace(&self, workspace: &WorkspaceSpec) -> Result<WorkspaceLockGuard, DomainError> {
+    fn lock_resolved_workspace(
+        &self,
+        workspace: &WorkspaceSpec,
+    ) -> Result<WorkspaceLockGuard, DomainError> {
         lock_workspace(workspace).map_err(DomainError::Repository)
     }
 
@@ -798,7 +803,12 @@ mod tests {
         let worktree = temp.path().join("worktree");
         let sidecar = temp.path().join("sidecar.git");
         std::fs::create_dir_all(&worktree).unwrap();
-        (temp, worktree.clone(), sidecar, WorkspaceId::from_worktree(&worktree))
+        (
+            temp,
+            worktree.clone(),
+            sidecar,
+            WorkspaceId::from_worktree(&worktree),
+        )
     }
 
     #[tokio::test]
@@ -1008,11 +1018,7 @@ mod tests {
 
         std::fs::create_dir_all(&sidecar).unwrap();
         let (workspace, outcome) = service
-            .apply(
-                PathBuf::from("."),
-                DEFAULT_BRANCH,
-                Some("main".to_string()),
-            )
+            .apply(PathBuf::from("."), DEFAULT_BRANCH, Some("main".to_string()))
             .await
             .unwrap();
 
@@ -1048,11 +1054,8 @@ mod tests {
                 },
             )])),
         });
-        let service = WorkspaceService::new(
-            Arc::new(StubRepoStore),
-            registry,
-            Arc::new(StubIssuer),
-        );
+        let service =
+            WorkspaceService::new(Arc::new(StubRepoStore), registry, Arc::new(StubIssuer));
 
         std::fs::create_dir_all(&sidecar).unwrap();
         assert!(matches!(

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use qit_domain::{CredentialIssuer, SessionCredentials, WorkspaceService};
 use qit_git::{GitHttpBackendAdapter, GitRepoStore};
-use qit_http::{repo_mount_path, GitHttpServer, DEFAULT_MAX_BODY_BYTES};
+use qit_http::{repo_mount_path, GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
 use qit_storage::FilesystemRegistry;
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener as StdTcpListener;
@@ -127,7 +127,7 @@ fn spawn_qit_serve_with_options(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             let _ = tx.send(line);
         }
     });
@@ -185,10 +185,14 @@ fn wait_for_clone_url(rx: &std::sync::mpsc::Receiver<String>) -> Result<String> 
                     .ok();
             }
             Ok(line) if line.trim_start().starts_with("username: ") => {
-                username = line.split_once(':').map(|(_, value)| value.trim().to_string());
+                username = line
+                    .split_once(':')
+                    .map(|(_, value)| value.trim().to_string());
             }
             Ok(line) if line.trim_start().starts_with("password: ") => {
-                password = line.split_once(':').map(|(_, value)| value.trim().to_string());
+                password = line
+                    .split_once(':')
+                    .map(|(_, value)| value.trim().to_string());
             }
             Ok(_) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -231,7 +235,11 @@ async fn start_server(
     let repo_store = Arc::new(GitRepoStore);
     let registry = Arc::new(FilesystemRegistry::with_root(root.path().join("data")));
     let issuer = Arc::new(StaticIssuer);
-    let service = Arc::new(WorkspaceService::new(repo_store.clone(), registry.clone(), issuer));
+    let service = Arc::new(WorkspaceService::new(
+        repo_store.clone(),
+        registry.clone(),
+        issuer,
+    ));
     let prepared = service
         .prepare_serve(worktree.clone(), Some("main"), "integration snapshot")
         .await
@@ -245,12 +253,14 @@ async fn start_server(
         Arc::new(GitHttpBackendAdapter),
         registry.clone(),
         service.clone(),
-        prepared.workspace,
-        credentials.clone(),
-        auto_apply,
-        mount_path.clone(),
-        "http".into(),
-        DEFAULT_MAX_BODY_BYTES,
+        GitHttpServerConfig {
+            workspace: prepared.workspace,
+            credentials: credentials.clone(),
+            auto_apply,
+            repo_mount_path: mount_path.clone(),
+            request_scheme: "http".into(),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        },
     )
     .router();
     let task = tokio::spawn(async move { axum::serve(listener, router).await });
@@ -415,7 +425,11 @@ fn qit_cli_hides_password_with_hidden_pass() -> Result<()> {
     let mut saw_uncredentialed_clone = false;
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(line) if line.trim_start().starts_with("password: hidden from stdout") => {
+            Ok(line)
+                if line
+                    .trim_start()
+                    .starts_with("password: hidden from stdout") =>
+            {
                 saw_hidden_password = true;
             }
             Ok(line) if line.contains("git clone http://") && !line.contains('@') => {

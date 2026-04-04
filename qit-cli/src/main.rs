@@ -4,7 +4,7 @@ use qit_domain::{
     BranchInfo, CredentialIssuer, SessionCredentials, WorkspaceService, DEFAULT_BRANCH,
 };
 use qit_git::{GitHttpBackendAdapter, GitRepoStore};
-use qit_http::{repo_mount_path, GitHttpServer, DEFAULT_MAX_BODY_BYTES};
+use qit_http::{repo_mount_path, GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
 use qit_storage::FilesystemRegistry;
 use qit_transports::{expose, PublicTransport};
 use rand::distributions::{Alphanumeric, DistString};
@@ -486,7 +486,8 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                let (workspace, branches) = service.list_branches(path, default_branch, &list).await?;
+                let (workspace, branches) =
+                    service.list_branches(path, default_branch, &list).await?;
                 say(&format!("branches for {}:", workspace.worktree.display()));
                 print_branch_list(&branches, verbose);
                 return Ok(());
@@ -610,12 +611,14 @@ async fn main() -> Result<()> {
         Arc::new(GitHttpBackendAdapter),
         registry_store,
         service.clone(),
-        workspace.clone(),
-        credentials.clone(),
-        cli.auto_apply,
-        repo_mount_path.clone(),
-        request_scheme,
-        cli.max_body_bytes,
+        GitHttpServerConfig {
+            workspace: workspace.clone(),
+            credentials: credentials.clone(),
+            auto_apply: cli.auto_apply,
+            repo_mount_path: repo_mount_path.clone(),
+            request_scheme,
+            max_body_bytes: cli.max_body_bytes,
+        },
     )
     .router();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -657,6 +660,9 @@ async fn main() -> Result<()> {
         Ok(Err(error)) => bail!("git http server task failed: {error}"),
         Err(_) => bail!("timed out waiting for git http server shutdown"),
     }
-    endpoint.shutdown().await.context("shutdown public endpoint")?;
+    endpoint
+        .shutdown()
+        .await
+        .context("shutdown public endpoint")?;
     Ok(())
 }

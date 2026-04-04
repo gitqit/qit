@@ -132,11 +132,7 @@ impl ManagedWorkspace {
         repo.set_workdir(&managed.worktree, false)?;
 
         let host_refname = managed.host_refname();
-        if managed
-            .open_repo()?
-            .find_reference(&host_refname)
-            .is_err()
-        {
+        if managed.open_repo()?.find_reference(&host_refname).is_err() {
             managed.snapshot("Initial snapshot")?;
         }
 
@@ -497,7 +493,9 @@ impl ManagedWorkspace {
             .find_reference(&target_refname)
             .map_err(|_| GitStoreError::RefNotFound(target_refname.clone()))?;
         let target_commit = target.peel_to_commit()?;
-        let previous_commit = repo.find_reference(&self.host_refname())?.peel_to_commit()?;
+        let previous_commit = repo
+            .find_reference(&self.host_refname())?
+            .peel_to_commit()?;
 
         if name == self.checked_out_branch {
             return Ok(target_commit.id().to_string());
@@ -742,8 +740,7 @@ pub async fn run_git_http_backend(
             .ok_or_else(|| GitHttpBackendError::Io {
                 operation: "encode git project root",
                 message: "git repo path is not valid UTF-8".into(),
-            })?
-            .to_string(),
+            })?,
     );
     cmd.env("GIT_HTTP_EXPORT_ALL", "1");
     cmd.env("REQUEST_METHOD", &request.method);
@@ -772,23 +769,24 @@ pub async fn run_git_http_backend(
         cmd.env(env_name, value);
     }
 
-    let buffered_body = if request.method.eq_ignore_ascii_case("POST") && request.content_length.is_none() {
-        let mut bytes = Vec::new();
-        body.read_to_end(&mut bytes)
-            .await
-            .map_err(|err| GitHttpBackendError::Io {
-                operation: "buffer git http-backend request body",
-                message: err.to_string(),
-            })?;
-        tracing::info!(
-            path = %request.path_info,
-            buffered_bytes = bytes.len(),
-            "buffered chunked git HTTP request to synthesize Content-Length"
-        );
-        Some(bytes)
-    } else {
-        None
-    };
+    let buffered_body =
+        if request.method.eq_ignore_ascii_case("POST") && request.content_length.is_none() {
+            let mut bytes = Vec::new();
+            body.read_to_end(&mut bytes)
+                .await
+                .map_err(|err| GitHttpBackendError::Io {
+                    operation: "buffer git http-backend request body",
+                    message: err.to_string(),
+                })?;
+            tracing::info!(
+                path = %request.path_info,
+                buffered_bytes = bytes.len(),
+                "buffered chunked git HTTP request to synthesize Content-Length"
+            );
+            Some(bytes)
+        } else {
+            None
+        };
     if request.method.eq_ignore_ascii_case("POST") {
         let content_length = request
             .content_length
@@ -847,10 +845,13 @@ pub async fn run_git_http_backend(
                     message: err.to_string(),
                 })?;
         }
-        stdin.shutdown().await.map_err(|err| GitHttpBackendError::Io {
-            operation: "close git http-backend stdin",
-            message: err.to_string(),
-        })
+        stdin
+            .shutdown()
+            .await
+            .map_err(|err| GitHttpBackendError::Io {
+                operation: "close git http-backend stdin",
+                message: err.to_string(),
+            })
     });
     let stderr_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
@@ -899,10 +900,13 @@ pub async fn run_git_http_backend(
             }
         };
 
-        let exit = child.wait().await.map_err(|error| GitHttpBackendError::Io {
-            operation: "wait for git http-backend",
-            message: error.to_string(),
-        })?;
+        let exit = child
+            .wait()
+            .await
+            .map_err(|error| GitHttpBackendError::Io {
+                operation: "wait for git http-backend",
+                message: error.to_string(),
+            })?;
         if exit.success() {
             return Ok(());
         }
@@ -981,17 +985,19 @@ async fn read_streaming_cgi_response(
         if buffer.len() >= MAX_CGI_HEADER_BYTES {
             return Err(GitHttpBackendError::InvalidResponse);
         }
-        let read = stdout.read(&mut chunk).await.map_err(|err| GitHttpBackendError::Io {
-            operation: "read git http-backend stdout",
-            message: err.to_string(),
-        })?;
+        let read = stdout
+            .read(&mut chunk)
+            .await
+            .map_err(|err| GitHttpBackendError::Io {
+                operation: "read git http-backend stdout",
+                message: err.to_string(),
+            })?;
         if read == 0 {
             return Err(GitHttpBackendError::InvalidResponse);
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1043,7 +1049,11 @@ mod tests {
         let worktree = base.path().join("wt");
         let sidecar = base.path().join("side.git");
         fs::create_dir_all(worktree.join("node_modules/pkg")).unwrap();
-        fs::write(worktree.join("node_modules/pkg/index.js"), "module.exports = 1;\n").unwrap();
+        fs::write(
+            worktree.join("node_modules/pkg/index.js"),
+            "module.exports = 1;\n",
+        )
+        .unwrap();
 
         let workspace = WorkspaceSpec {
             id: WorkspaceId(Uuid::nil()),
@@ -1057,7 +1067,11 @@ mod tests {
         let head = repo.find_reference("refs/heads/main").unwrap();
         let commit = head.peel_to_commit().unwrap();
         let tree = commit.tree().unwrap();
-        let modules = tree.get_name("node_modules").unwrap().to_object(&repo).unwrap();
+        let modules = tree
+            .get_name("node_modules")
+            .unwrap()
+            .to_object(&repo)
+            .unwrap();
         let modules = modules.peel_to_tree().unwrap();
         let pkg = modules.get_name("pkg").unwrap().to_object(&repo).unwrap();
         let pkg = pkg.peel_to_tree().unwrap();

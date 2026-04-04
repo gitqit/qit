@@ -19,6 +19,15 @@ use tracing::{info, warn};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
 
+pub struct GitHttpServerConfig {
+    pub workspace: WorkspaceSpec,
+    pub credentials: SessionCredentials,
+    pub auto_apply: bool,
+    pub repo_mount_path: String,
+    pub request_scheme: String,
+    pub max_body_bytes: usize,
+}
+
 #[derive(Clone)]
 pub struct GitHttpServer {
     git_http_backend: Arc<dyn GitHttpBackend>,
@@ -37,23 +46,18 @@ impl GitHttpServer {
         git_http_backend: Arc<dyn GitHttpBackend>,
         registry_store: Arc<dyn RegistryStore>,
         workspace_service: Arc<WorkspaceService>,
-        workspace: WorkspaceSpec,
-        credentials: SessionCredentials,
-        auto_apply: bool,
-        repo_mount_path: String,
-        request_scheme: String,
-        max_body_bytes: usize,
+        config: GitHttpServerConfig,
     ) -> Self {
         Self {
             git_http_backend,
             registry_store,
             workspace_service,
-            workspace,
-            credentials,
-            auto_apply,
-            repo_mount_path,
-            request_scheme,
-            max_body_bytes,
+            workspace: config.workspace,
+            credentials: config.credentials,
+            auto_apply: config.auto_apply,
+            repo_mount_path: config.repo_mount_path,
+            request_scheme: config.request_scheme,
+            max_body_bytes: config.max_body_bytes,
         }
     }
 
@@ -197,11 +201,7 @@ impl GitHttpServer {
             let lower = key.as_str().to_ascii_lowercase();
             if matches!(
                 lower.as_str(),
-                "authorization"
-                    | "connection"
-                    | "transfer-encoding"
-                    | "te"
-                    | "trailer"
+                "authorization" | "connection" | "transfer-encoding" | "te" | "trailer"
             ) {
                 continue;
             }
@@ -242,8 +242,11 @@ impl GitHttpServer {
 
         if is_receive_pack && self.auto_apply {
             if let Some(completion) = response.completion.take() {
-                self.clone()
-                    .spawn_auto_apply(method.to_string(), uri.path().to_string(), completion);
+                self.clone().spawn_auto_apply(
+                    method.to_string(),
+                    uri.path().to_string(),
+                    completion,
+                );
             }
         }
 
@@ -301,7 +304,7 @@ fn build_response(streaming_response: GitHttpBackendResponse) -> Response<Body> 
             tokio_stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(
                 streaming_response.body_prefix,
             ))])
-                .chain(ReaderStream::new(stdout)),
+            .chain(ReaderStream::new(stdout)),
         ),
         None => Body::from(streaming_response.body_prefix),
     };
@@ -405,7 +408,10 @@ mod tests {
             strip_repo_mount("/My-Project/info/refs", "/My-Project"),
             Some("/info/refs".into())
         );
-        assert_eq!(strip_repo_mount("/My-Projectish/info/refs", "/My-Project"), None);
+        assert_eq!(
+            strip_repo_mount("/My-Projectish/info/refs", "/My-Project"),
+            None
+        );
         assert_eq!(strip_repo_mount("/other/info/refs", "/My-Project"), None);
     }
 }
