@@ -1011,6 +1011,10 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn read_normalized(path: &Path) -> String {
+        fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+    }
+
     #[test]
     fn snapshot_applies_gitignore_when_worktree_has_no_dot_git() {
         let base = tempfile::tempdir().unwrap();
@@ -1166,10 +1170,7 @@ mod tests {
 
         let outcome = managed.apply_fast_forward("refs/heads/main").unwrap();
         assert_eq!(outcome.merged_to, "main");
-        assert_eq!(
-            fs::read_to_string(worktree.join("file.txt")).unwrap(),
-            "v2\n"
-        );
+        assert_eq!(read_normalized(&worktree.join("file.txt")), "v2\n");
     }
 
     #[cfg(unix)]
@@ -1240,10 +1241,7 @@ mod tests {
                 .id(),
             next_commit
         );
-        assert_eq!(
-            fs::read_to_string(worktree.join("file.txt")).unwrap(),
-            "v1\n"
-        );
+        assert_eq!(read_normalized(&worktree.join("file.txt")), "v1\n");
     }
 
     #[test]
@@ -1337,10 +1335,7 @@ mod tests {
 
         let switched = managed.switch_branch("feature").unwrap();
         assert_eq!(switched, feature_commit.to_string());
-        assert_eq!(
-            std::fs::read_to_string(worktree.join("file.txt")).unwrap(),
-            "feature\n"
-        );
+        assert_eq!(read_normalized(&worktree.join("file.txt")), "feature\n");
 
         managed.rename_branch("feature", "renamed", false).unwrap();
         branches = managed
@@ -1518,10 +1513,7 @@ mod tests {
 
         managed.checkout_branch("feature", false).unwrap();
         assert_eq!(repo.head().unwrap().name(), Some("refs/heads/main"));
-        assert_eq!(
-            std::fs::read_to_string(worktree.join("file.txt")).unwrap(),
-            "feature\n"
-        );
+        assert_eq!(read_normalized(&worktree.join("file.txt")), "feature\n");
     }
 
     #[test]
