@@ -12,6 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   fmt:
@@ -65,3 +66,47 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test workspace
         run: cargo test --workspace --all-targets --locked
+
+  release-build:
+    name: Release build (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            archive_extension: tar.gz
+          - os: macos-latest
+            platform: macos
+            archive_extension: tar.gz
+          - os: windows-latest
+            platform: windows
+            archive_extension: zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked -p qit
+      - name: Package Unix release artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          artifact_name="qit-ci-${{ matrix.platform }}-${{ runner.arch }}"
+          mkdir -p dist
+          cp target/release/qit dist/qit
+          tar -C dist -czf "dist/${artifact_name}.${{ matrix.archive_extension }}" qit
+          shasum -a 256 "dist/${artifact_name}.${{ matrix.archive_extension }}" > "dist/${artifact_name}.${{ matrix.archive_extension }}.sha256"
+      - name: Package Windows release artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $artifactName = "qit-ci-${{ matrix.platform }}-${{ runner.arch }}"
+          $archivePath = "dist/$artifactName.${{ matrix.archive_extension }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/qit.exe" "dist/qit.exe"
+          Compress-Archive -Path "dist/qit.exe" -DestinationPath $archivePath
+          $hash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLower()
+          Set-Content -Path "$archivePath.sha256" -Value "$hash *$artifactName.${{ matrix.archive_extension }}"

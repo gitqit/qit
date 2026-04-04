@@ -10,6 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   verify-tag:
@@ -45,26 +46,24 @@ jobs:
 
           echo "version=$workspace_version" >> "$GITHUB_OUTPUT"
 
-  preflight:
-    name: Preflight checks
+  create-release:
+    name: Create draft release
     needs: verify-tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --all --check
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Test workspace
-        run: cargo test --workspace --all-targets --locked
+      - name: Create or reset GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --draft=true --title "$GITHUB_REF_NAME"
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --generate-notes --title "$GITHUB_REF_NAME"
+          fi
 
   build-artifacts:
     name: Build release (${{ matrix.os }})
-    needs: [verify-tag, preflight]
+    needs: [verify-tag, create-release]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -93,36 +92,30 @@ jobs:
           mkdir -p dist
           cp target/release/qit dist/qit
           tar -C dist -czf "dist/${artifact_name}.${{ matrix.archive_extension }}" qit
+          shasum -a 256 "dist/${artifact_name}.${{ matrix.archive_extension }}" > "dist/${artifact_name}.${{ matrix.archive_extension }}.sha256"
       - name: Package Windows artifact
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $artifactName = "qit-v${{ needs.verify-tag.outputs.version }}-${{ matrix.platform }}-${{ runner.arch }}"
+          $archivePath = "dist/$artifactName.${{ matrix.archive_extension }}"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target/release/qit.exe" "dist/qit.exe"
-          Compress-Archive -Path "dist/qit.exe" -DestinationPath "dist/$artifactName.${{ matrix.archive_extension }}"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.platform }}
-          path: dist/*.${{ matrix.archive_extension }}
-          if-no-files-found: error
+          Compress-Archive -Path "dist/qit.exe" -DestinationPath $archivePath
+          $hash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLower()
+          Set-Content -Path "$archivePath.sha256" -Value "$hash *$artifactName.${{ matrix.archive_extension }}"
+      - name: Upload assets to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
 
-  github-release:
+  publish-release:
     name: Publish GitHub release
     needs: [verify-tag, build-artifacts]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          pattern: release-*
-          merge-multiple: true
-      - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum * > SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            dist/*
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
