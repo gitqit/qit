@@ -270,7 +270,12 @@ async fn start_server(
 fn wait_for_file_contents(path: &Path, expected: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if std::fs::read_to_string(path).ok().as_deref() == Some(expected) {
+        if std::fs::read_to_string(path)
+            .ok()
+            .map(|contents| contents.replace("\r\n", "\n"))
+            .as_deref()
+            == Some(expected)
+        {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -350,7 +355,7 @@ fn qit_cli_serves_and_manual_apply_updates_host() -> Result<()> {
     run_git(Some(&clone_dir), &["push", "origin", "HEAD:main"])?;
 
     assert_eq!(
-        std::fs::read_to_string(worktree.join("README.md"))?,
+        std::fs::read_to_string(worktree.join("README.md"))?.replace("\r\n", "\n"),
         "initial\n"
     );
 
@@ -477,7 +482,7 @@ fn qit_cli_branch_commands_manage_sidecar_branches() -> Result<()> {
     run_git(Some(&clone_dir), &["push", "origin", "HEAD:feature"])?;
 
     assert_eq!(
-        std::fs::read_to_string(worktree.join("README.md"))?,
+        std::fs::read_to_string(worktree.join("README.md"))?.replace("\r\n", "\n"),
         "initial\n"
     );
 
@@ -490,7 +495,7 @@ fn qit_cli_branch_commands_manage_sidecar_branches() -> Result<()> {
         &["clone", &clone_url, clone_main_dir.to_str().unwrap()],
     )?;
     assert_eq!(
-        std::fs::read_to_string(clone_main_dir.join("README.md"))?,
+        std::fs::read_to_string(clone_main_dir.join("README.md"))?.replace("\r\n", "\n"),
         "initial\n"
     );
 
@@ -661,7 +666,7 @@ fn auto_apply_skips_when_checked_out_branch_differs_from_served_branch() -> Resu
 
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
-        std::fs::read_to_string(worktree.join("README.md"))?,
+        std::fs::read_to_string(worktree.join("README.md"))?.replace("\r\n", "\n"),
         "feature branch\n"
     );
 
