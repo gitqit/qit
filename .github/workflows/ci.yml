@@ -40,12 +40,24 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - name: linux-x64
+            runner: ubuntu-latest
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: windows-x64
+            runner: windows-latest
+          - name: windows-arm64
+            runner: windows-11-arm
+          - name: macos-arm64
+            runner: macos-latest
+          - name: macos-x64
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -54,12 +66,24 @@ jobs:
         run: cargo build --workspace --all-targets --locked
 
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - name: linux-x64
+            runner: ubuntu-latest
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: windows-x64
+            runner: windows-latest
+          - name: windows-arm64
+            runner: windows-11-arm
+          - name: macos-arm64
+            runner: macos-latest
+          - name: macos-x64
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,20 +92,35 @@ jobs:
         run: cargo test --workspace --all-targets --locked
 
   release-build:
-    name: Release build (${{ matrix.os }})
+    name: Release build (${{ matrix.name }})
     if: github.event_name != 'pull_request'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - name: linux-x64
+            runner: ubuntu-latest
             platform: linux
             archive_extension: tar.gz
-          - os: macos-latest
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            platform: linux
+            archive_extension: tar.gz
+          - name: macos-arm64
+            runner: macos-latest
             platform: macos
             archive_extension: tar.gz
-          - os: windows-latest
+          - name: macos-x64
+            runner: macos-15-intel
+            platform: macos
+            archive_extension: tar.gz
+          - name: windows-x64
+            runner: windows-latest
+            platform: windows
+            archive_extension: zip
+          - name: windows-arm64
+            runner: windows-11-arm
             platform: windows
             archive_extension: zip
     steps:
@@ -99,6 +138,7 @@ jobs:
           cp target/release/qit dist/qit
           tar -C dist -czf "dist/${artifact_name}.${{ matrix.archive_extension }}" qit
           shasum -a 256 "dist/${artifact_name}.${{ matrix.archive_extension }}" > "dist/${artifact_name}.${{ matrix.archive_extension }}.sha256"
+          rm dist/qit
       - name: Package Windows release artifact
         if: runner.os == 'Windows'
         shell: pwsh
@@ -110,3 +150,4 @@ jobs:
           Compress-Archive -Path "dist/qit.exe" -DestinationPath $archivePath
           $hash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLower()
           Set-Content -Path "$archivePath.sha256" -Value "$hash *$artifactName.${{ matrix.archive_extension }}"
+          Remove-Item "dist/qit.exe"

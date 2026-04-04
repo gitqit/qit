@@ -63,20 +63,35 @@ jobs:
           fi
 
   build-artifacts:
-    name: Build release (${{ matrix.os }})
+    name: Build release (${{ matrix.name }})
     needs: [verify-tag, create-release]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - name: linux-x64
+            runner: ubuntu-latest
             platform: linux
             archive_extension: tar.gz
-          - os: macos-latest
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            platform: linux
+            archive_extension: tar.gz
+          - name: macos-arm64
+            runner: macos-latest
             platform: macos
             archive_extension: tar.gz
-          - os: windows-latest
+          - name: macos-x64
+            runner: macos-15-intel
+            platform: macos
+            archive_extension: tar.gz
+          - name: windows-x64
+            runner: windows-latest
+            platform: windows
+            archive_extension: zip
+          - name: windows-arm64
+            runner: windows-11-arm
             platform: windows
             archive_extension: zip
     steps:
@@ -94,6 +109,7 @@ jobs:
           cp target/release/qit dist/qit
           tar -C dist -czf "dist/${artifact_name}.${{ matrix.archive_extension }}" qit
           shasum -a 256 "dist/${artifact_name}.${{ matrix.archive_extension }}" > "dist/${artifact_name}.${{ matrix.archive_extension }}.sha256"
+          rm dist/qit
       - name: Package Windows artifact
         if: runner.os == 'Windows'
         shell: pwsh
@@ -105,6 +121,7 @@ jobs:
           Compress-Archive -Path "dist/qit.exe" -DestinationPath $archivePath
           $hash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLower()
           Set-Content -Path "$archivePath.sha256" -Value "$hash *$artifactName.${{ matrix.archive_extension }}"
+          Remove-Item "dist/qit.exe"
       - name: Upload assets to GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
