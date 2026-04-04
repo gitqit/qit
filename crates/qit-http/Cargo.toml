@@ -1,0 +1,20 @@
+[package]
+name = "qit-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
+http-body-util = { workspace = true }
+qit-domain = { path = "../qit-domain" }
+qit-http-backend = { path = "../qit-http-backend" }
+tokio = { workspace = true }
+tokio-stream = "0.1.18"
+tokio-util = { version = "0.7.18", features = ["io"] }
+tower = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

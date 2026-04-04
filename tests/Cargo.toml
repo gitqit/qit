@@ -1,0 +1,19 @@
+[package]
+name = "qit-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+http-body-util = { workspace = true }
+qit-domain = { path = "../crates/qit-domain" }
+qit-git = { path = "../crates/qit-git" }
+qit-http = { path = "../crates/qit-http" }
+qit-storage = { path = "../crates/qit-storage" }
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+url = { workspace = true }

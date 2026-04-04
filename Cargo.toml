@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "qit-cli",
+    "crates/qit-http-backend",
+    "crates/qit-domain",
+    "crates/qit-git",
+    "crates/qit-http",
+    "crates/qit-storage",
+    "crates/qit-transports",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+directories = "5.0"
+dunce = "1.0"
+git2 = { version = "0.19", features = ["vendored-libgit2"] }
+http-body-util = "0.1"
+ignore = "0.4"
+ngrok = "0.18"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.12"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+uuid = { version = "1.11", features = ["serde", "v4", "v5"] }

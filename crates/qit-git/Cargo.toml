@@ -1,0 +1,20 @@
+[package]
+name = "qit-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+git2 = { workspace = true }
+ignore = { workspace = true }
+qit-domain = { path = "../qit-domain" }
+qit-http-backend = { path = "../qit-http-backend" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+dunce = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
