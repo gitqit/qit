@@ -18,6 +18,7 @@ qit-git = { path = "../crates/qit-git" }
 qit-http = { path = "../crates/qit-http" }
 qit-storage = { path = "../crates/qit-storage" }
 qit-transports = { path = "../crates/qit-transports" }
+qit-webui = { path = "../crates/qit-webui" }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }

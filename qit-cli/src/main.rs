@@ -7,6 +7,7 @@ use qit_git::{GitHttpBackendAdapter, GitRepoStore};
 use qit_http::{repo_mount_path, GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
 use qit_storage::FilesystemRegistry;
 use qit_transports::{expose, PublicTransport};
+use qit_webui::{WebUiConfig, WebUiServer};
 use rand::distributions::{Alphanumeric, DistString};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -42,8 +43,12 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Folder to publish (no `.git` in this folder required).
+    /// Folder to publish.
     path: Option<PathBuf>,
+
+    /// Allow serving a folder that already contains its own `.git` directory.
+    #[arg(long)]
+    allow_existing_git: bool,
 
     /// Public transport to expose the repo.
     #[arg(long, value_enum)]
@@ -53,8 +58,12 @@ struct Cli {
     #[arg(long)]
     auto_apply: bool,
 
-    /// Hide the password from stdout and omit it from the suggested clone command.
+    /// Show the password in stdout and embed it in the suggested clone command.
     #[arg(long)]
+    show_pass: bool,
+
+    /// Backward-compatible no-op alias; credentials are hidden by default.
+    #[arg(long, hide = true, conflicts_with = "show_pass")]
     hidden_pass: bool,
 
     /// Local port for Git Smart HTTP.
@@ -248,10 +257,10 @@ fn clone_command(public_url: &Url, transport: PublicTransport) -> String {
 fn repo_url_with_credentials(
     public_url: &Url,
     credentials: &SessionCredentials,
-    hidden_pass: bool,
+    show_pass: bool,
 ) -> Result<Url> {
     let mut url = public_url.clone();
-    if hidden_pass {
+    if !show_pass {
         return Ok(url);
     }
     url.set_username(&credentials.username)
@@ -276,46 +285,46 @@ fn write_credentials_file(credentials: &SessionCredentials) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn print_banner(
+fn print_serve_summary(
+    worktree: &Path,
+    exported_branch: &str,
     label: &str,
     public_url: &Url,
+    local_browser_url: &Url,
+    browser_url: &Url,
     credentials: &SessionCredentials,
     credentials_path: &Path,
-    hidden_pass: bool,
+    show_pass: bool,
     clone_cmd: &str,
-    note: &str,
+    auto_apply: bool,
 ) {
     println!();
-    println!("===========================================================");
-    println!(
-        "  {label} URL  -> {}/",
-        public_url.as_str().trim_end_matches('/')
-    );
-    println!("===========================================================");
+    println!("Serving");
+    println!("  path: {}", worktree.display());
+    println!("  branch: {exported_branch}");
+    println!("  transport: {}", label.to_ascii_lowercase());
+    if auto_apply {
+        println!("  auto-apply: on");
+    }
     println!();
-    println!("Session credentials:");
+    println!("Web UI");
+    println!("  local: {}", local_browser_url.as_str().trim_end_matches('/'));
+    if local_browser_url != browser_url {
+        println!("  public: {}", browser_url.as_str().trim_end_matches('/'));
+    }
+    println!();
+    println!("Git");
+    println!("  repo: {}/", public_url.as_str().trim_end_matches('/'));
+    println!("  clone: {clone_cmd}");
+    println!();
+    println!("Session");
     println!("  username: {}", credentials.username);
-    println!("  file: {}", credentials_path.display());
-    if hidden_pass {
-        println!("  password: hidden from stdout; open the credentials file above if you need it");
-    } else {
+    if show_pass {
         println!("  password: {}", credentials.password);
-    }
-    println!();
-    println!("Repo URL:");
-    println!("  {}/", public_url.as_str().trim_end_matches('/'));
-    println!();
-    println!("Clone this repo:");
-    println!("  {clone_cmd}");
-    if hidden_pass {
-        println!(
-            "  Git will prompt for the username/password from the credentials file unless you use a credential helper."
-        );
     } else {
-        println!("  The clone command already includes the session credentials.");
+        println!("  password: hidden (see file)");
     }
-    println!();
-    println!("{note}");
+    println!("  file: {}", credentials_path.display());
 }
 
 fn print_branch_list(branches: &[BranchInfo], verbose: u8) {
@@ -568,26 +577,18 @@ async fn main() -> Result<()> {
     }
 
     let path = cli.path.context("path is required")?;
-    say("qit: starting...");
-
     let prepared = service
-        .prepare_serve(path, cli.branch.as_deref(), "qit snapshot")
+        .prepare_serve(
+            path,
+            cli.branch.as_deref(),
+            "qit snapshot",
+            cli.allow_existing_git,
+        )
         .await?;
     let workspace = prepared.workspace.clone();
     let credentials = prepared.credentials.clone();
     let credentials_path = write_credentials_file(&credentials)?;
     let repo_mount_path = repo_mount_path(&repo_name_from_worktree(&workspace.worktree));
-
-    say(&format!("  folder: {}", workspace.worktree.display()));
-    say(&format!("  sidecar: {}", workspace.sidecar.display()));
-    if let Some(snapshot_commit) = &prepared.snapshot_commit {
-        say(&format!("  snapshot: {snapshot_commit}"));
-    } else {
-        say("  snapshot: no file changes detected");
-    }
-    if cli.auto_apply {
-        say("  auto-apply: enabled");
-    }
 
     let addr = SocketAddr::from_str(&format!("127.0.0.1:{}", cli.port)).expect("valid socket addr");
     let listener = TcpListener::bind(addr)
@@ -606,8 +607,9 @@ async fn main() -> Result<()> {
     } else {
         "https".to_string()
     };
+    let show_pass = cli.show_pass;
 
-    let server = GitHttpServer::new(
+    let git_router = GitHttpServer::new(
         Arc::new(GitHttpBackendAdapter),
         registry_store,
         service.clone(),
@@ -620,33 +622,50 @@ async fn main() -> Result<()> {
             max_body_bytes: cli.max_body_bytes,
         },
     )
-    .router();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let serve = tokio::spawn(async move {
-        axum::serve(listener, server)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!(err))
-    });
-
-    say(&format!(
-        "  local Git HTTP: {}/",
-        local_url.as_str().trim_end_matches('/')
-    ));
+    .git_router();
+    let local_browser_url = repo_url(&local_url, &repo_mount_path)?;
     let endpoint = expose(transport, &local_url).await?;
     let public_repo_url = repo_url(&endpoint.public_url, &repo_mount_path)?;
-    let clone_url = repo_url_with_credentials(&public_repo_url, &credentials, cli.hidden_pass)?;
+    let clone_url = repo_url_with_credentials(&public_repo_url, &credentials, show_pass)?;
     let clone_cmd = clone_command(&clone_url, transport);
-    print_banner(
+    let web_router = WebUiServer::new(
+        repo_store.clone(),
+        service.clone(),
+        WebUiConfig {
+            workspace: workspace.clone(),
+            repo_mount_path: repo_mount_path.clone(),
+            credentials: credentials.clone(),
+            implicit_owner_mode: true,
+            secure_cookies: transport != PublicTransport::Local,
+            public_repo_url: Some(public_repo_url.as_str().trim_end_matches('/').to_string()),
+        },
+    )
+    .router();
+    let app = web_router.merge(git_router);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!(err))
+    });
+    print_serve_summary(
+        &workspace.worktree,
+        &workspace.exported_branch,
         endpoint.label,
+        &public_repo_url,
+        &local_browser_url,
         &public_repo_url,
         &credentials,
         &credentials_path,
-        cli.hidden_pass,
+        show_pass,
         &clone_cmd,
-        &endpoint.note,
+        cli.auto_apply,
     );
     println!("Ctrl+C to stop.");
     println!();

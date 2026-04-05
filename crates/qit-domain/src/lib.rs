@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use fs2::FileExt;
+use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -29,6 +31,8 @@ pub struct WorkspaceRecord {
     pub exported_branch: String,
     #[serde(default)]
     pub checked_out_branch: Option<String>,
+    #[serde(default)]
+    pub web_ui: WorkspaceWebUiState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +50,7 @@ pub struct WorkspaceLockGuard {
     _file: File,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionCredentials {
     pub username: String,
     pub password: String,
@@ -58,14 +62,14 @@ pub struct ApplyOutcome {
     pub commit: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreparedServe {
     pub workspace: WorkspaceSpec,
     pub credentials: SessionCredentials,
     pub snapshot_commit: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BranchInfo {
     pub name: String,
     pub is_current: bool,
@@ -101,6 +105,160 @@ pub struct BranchRecord {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UiRole {
+    Owner,
+    User,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestStatus {
+    Open,
+    Merged,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestRecord {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub source_branch: String,
+    pub target_branch: String,
+    #[serde(default)]
+    pub source_commit: Option<String>,
+    #[serde(default)]
+    pub target_commit: Option<String>,
+    pub status: PullRequestStatus,
+    pub author_role: UiRole,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    #[serde(default)]
+    pub merged_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePullRequest {
+    pub title: String,
+    pub description: String,
+    pub source_branch: String,
+    pub target_branch: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WorkspaceWebUiState {
+    #[serde(default)]
+    pub pull_requests: Vec<PullRequestRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommitSummary {
+    pub id: String,
+    pub summary: String,
+    pub author: String,
+    pub authored_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitRefKind {
+    Branch,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommitRefDecoration {
+    pub name: String,
+    pub kind: CommitRefKind,
+    pub is_current: bool,
+    pub is_served: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommitHistoryNode {
+    pub id: String,
+    pub summary: String,
+    pub author: String,
+    pub authored_at: i64,
+    pub parents: Vec<String>,
+    #[serde(default)]
+    pub refs: Vec<CommitRefDecoration>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommitHistory {
+    pub reference: String,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
+    pub commits: Vec<CommitHistoryNode>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommitFileChange {
+    pub path: String,
+    pub status: String,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommitDetail {
+    pub id: String,
+    pub summary: String,
+    pub message: String,
+    pub author: String,
+    pub authored_at: i64,
+    pub parents: Vec<String>,
+    pub changes: Vec<CommitFileChange>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TreeEntryKind {
+    Tree,
+    Blob,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub name: String,
+    pub path: String,
+    pub oid: String,
+    pub kind: TreeEntryKind,
+    pub size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BlobContent {
+    pub path: String,
+    pub text: Option<String>,
+    pub is_binary: bool,
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RefComparison {
+    pub base_ref: String,
+    pub head_ref: String,
+    pub merge_base: Option<String>,
+    pub ahead_by: usize,
+    pub behind_by: usize,
+    pub commits: Vec<CommitSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RefDiffFile {
+    pub path: String,
+    pub previous_path: Option<String>,
+    pub status: String,
+    pub additions: usize,
+    pub deletions: usize,
+    pub original: Option<BlobContent>,
+    pub modified: Option<BlobContent>,
+}
+
 #[derive(Debug, Error)]
 pub enum DomainError {
     #[error("path resolution failed: {0}")]
@@ -109,6 +267,10 @@ pub enum DomainError {
     Registry(#[source] RegistryError),
     #[error("repository operation failed: {0}")]
     Repository(#[source] RepositoryError),
+    #[error(
+        "refusing to serve existing Git worktree {0}; rerun with --allow-existing-git to opt in"
+    )]
+    ExistingGitWorktreeRequiresFlag(PathBuf),
     #[error("sidecar repo not found: {0}")]
     MissingSidecar(PathBuf),
     #[error(
@@ -226,6 +388,53 @@ pub trait RepoStore: Send + Sync {
         name: &str,
         force: bool,
     ) -> Result<String, RepositoryError>;
+    async fn merge_branch(
+        &self,
+        workspace: &WorkspaceSpec,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> Result<String, RepositoryError>;
+}
+
+#[async_trait]
+pub trait RepoReadStore: Send + Sync {
+    async fn list_commits(
+        &self,
+        workspace: &WorkspaceSpec,
+        reference: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<CommitHistory, RepositoryError>;
+    async fn read_commit(
+        &self,
+        workspace: &WorkspaceSpec,
+        commitish: &str,
+    ) -> Result<CommitDetail, RepositoryError>;
+    async fn list_tree(
+        &self,
+        workspace: &WorkspaceSpec,
+        reference: &str,
+        path: Option<&Path>,
+    ) -> Result<Vec<TreeEntry>, RepositoryError>;
+    async fn read_blob(
+        &self,
+        workspace: &WorkspaceSpec,
+        reference: &str,
+        path: &Path,
+    ) -> Result<BlobContent, RepositoryError>;
+    async fn compare_refs(
+        &self,
+        workspace: &WorkspaceSpec,
+        base_ref: &str,
+        head_ref: &str,
+        limit: usize,
+    ) -> Result<RefComparison, RepositoryError>;
+    async fn diff_refs(
+        &self,
+        workspace: &WorkspaceSpec,
+        base_ref: &str,
+        head_ref: &str,
+    ) -> Result<Vec<RefDiffFile>, RepositoryError>;
 }
 
 pub trait RegistryStore: Send + Sync {
@@ -270,6 +479,13 @@ pub struct WorkspaceService {
 }
 
 impl WorkspaceService {
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
     fn lock_resolved_workspace(
         &self,
         workspace: &WorkspaceSpec,
@@ -312,20 +528,98 @@ impl WorkspaceService {
         }
     }
 
+    fn existing_git_worktree_branch(worktree: &Path) -> Result<Option<String>, RepositoryError> {
+        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        if !worktree.join(".git").exists() {
+            return Ok(None);
+        }
+
+        let repo = Repository::discover(&worktree).map_err(|error| {
+            RepositoryError::Git(format!(
+                "inspect existing Git worktree {}: {}",
+                worktree.display(),
+                error
+            ))
+        })?;
+        if repo.is_bare() {
+            return Ok(None);
+        }
+
+        let Some(repo_workdir) = repo.workdir() else {
+            return Ok(None);
+        };
+        let repo_workdir =
+            dunce::canonicalize(repo_workdir).unwrap_or_else(|_| repo_workdir.to_path_buf());
+        if repo_workdir != worktree {
+            return Ok(None);
+        }
+
+        let branch = repo
+            .head()
+            .ok()
+            .filter(|head| head.is_branch())
+            .and_then(|head| head.shorthand().map(ToString::to_string))
+            .unwrap_or_else(|| DEFAULT_BRANCH.to_string());
+        Ok(Some(branch))
+    }
+
+    fn resolve_serve_workspace(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        requested_exported_branch: Option<&str>,
+        allow_existing_git: bool,
+    ) -> Result<WorkspaceSpec, DomainError> {
+        let mut workspace = self
+            .resolve_workspace(path, fallback_branch)
+            .map_err(DomainError::PathResolution)?;
+        let has_record = self
+            .registry_store
+            .load(workspace.id)
+            .map_err(DomainError::PathResolution)?
+            .is_some();
+        if has_record {
+            return Ok(workspace);
+        }
+
+        if let Some(current_branch) = Self::existing_git_worktree_branch(&workspace.worktree)
+            .map_err(DomainError::Repository)?
+        {
+            if !allow_existing_git {
+                return Err(DomainError::ExistingGitWorktreeRequiresFlag(
+                    workspace.worktree.clone(),
+                ));
+            }
+            workspace.checked_out_branch = current_branch.clone();
+            workspace.exported_branch = requested_exported_branch
+                .unwrap_or(&current_branch)
+                .to_string();
+        }
+
+        Ok(workspace)
+    }
+
     pub async fn prepare_serve(
         &self,
         path: PathBuf,
         requested_exported_branch: Option<&str>,
         snapshot_message: &str,
+        allow_existing_git: bool,
     ) -> Result<PreparedServe, DomainError> {
         let fallback_branch = requested_exported_branch.unwrap_or(DEFAULT_BRANCH);
-        let initial_workspace = self
-            .resolve_workspace(path.clone(), fallback_branch)
-            .map_err(DomainError::PathResolution)?;
+        let initial_workspace = self.resolve_serve_workspace(
+            path.clone(),
+            fallback_branch,
+            requested_exported_branch,
+            allow_existing_git,
+        )?;
         let _lock = self.lock_resolved_workspace(&initial_workspace)?;
-        let workspace = self
-            .resolve_workspace(path, fallback_branch)
-            .map_err(DomainError::PathResolution)?;
+        let workspace = self.resolve_serve_workspace(
+            path,
+            fallback_branch,
+            requested_exported_branch,
+            allow_existing_git,
+        )?;
         if let Some(requested_branch) = requested_exported_branch {
             if workspace.exported_branch != requested_branch {
                 return Err(DomainError::ExportedBranchConflict {
@@ -404,7 +698,23 @@ impl WorkspaceService {
         Ok(workspace)
     }
 
-    fn save_workspace(&self, workspace: &WorkspaceSpec) -> Result<(), DomainError> {
+    fn load_web_ui_state(
+        &self,
+        workspace: &WorkspaceSpec,
+    ) -> Result<WorkspaceWebUiState, DomainError> {
+        Ok(self
+            .registry_store
+            .load(workspace.id)
+            .map_err(DomainError::Registry)?
+            .map(|record| record.web_ui)
+            .unwrap_or_default())
+    }
+
+    fn save_workspace_with_web_ui(
+        &self,
+        workspace: &WorkspaceSpec,
+        web_ui: WorkspaceWebUiState,
+    ) -> Result<(), DomainError> {
         self.registry_store
             .save(
                 workspace.id,
@@ -413,9 +723,118 @@ impl WorkspaceService {
                     sidecar: workspace.sidecar.clone(),
                     exported_branch: workspace.exported_branch.clone(),
                     checked_out_branch: Some(workspace.checked_out_branch.clone()),
+                    web_ui,
                 },
             )
             .map_err(DomainError::Registry)
+    }
+
+    fn save_workspace(&self, workspace: &WorkspaceSpec) -> Result<(), DomainError> {
+        let web_ui = self.load_web_ui_state(workspace)?;
+        self.save_workspace_with_web_ui(workspace, web_ui)
+    }
+
+    pub fn load_web_ui(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+    ) -> Result<(WorkspaceSpec, WorkspaceWebUiState), DomainError> {
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let web_ui = self.load_web_ui_state(&workspace)?;
+        Ok((workspace, web_ui))
+    }
+
+    pub async fn create_pull_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        draft: CreatePullRequest,
+        author_role: UiRole,
+    ) -> Result<(WorkspaceSpec, PullRequestRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let branches = self
+            .repo_store
+            .list_branches(&workspace)
+            .await
+            .map_err(DomainError::Repository)?;
+        let source_branch = branches
+            .iter()
+            .find(|branch| branch.name == draft.source_branch);
+        let Some(source_branch) = source_branch else {
+            return Err(DomainError::Repository(RepositoryError::RefNotFound(
+                draft.source_branch.clone(),
+            )));
+        };
+        let target_branch = branches
+            .iter()
+            .find(|branch| branch.name == draft.target_branch);
+        let Some(target_branch) = target_branch else {
+            return Err(DomainError::Repository(RepositoryError::RefNotFound(
+                draft.target_branch.clone(),
+            )));
+        };
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let timestamp = Self::now_ms();
+        let pull_request = PullRequestRecord {
+            id: Uuid::new_v4().to_string(),
+            title: draft.title,
+            description: draft.description,
+            source_branch: draft.source_branch,
+            target_branch: draft.target_branch,
+            source_commit: Some(source_branch.commit.clone()),
+            target_commit: Some(target_branch.commit.clone()),
+            status: PullRequestStatus::Open,
+            author_role,
+            created_at_ms: timestamp,
+            updated_at_ms: timestamp,
+            merged_commit: None,
+        };
+        web_ui.pull_requests.push(pull_request.clone());
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, pull_request))
+    }
+
+    pub async fn merge_pull_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        pull_request_id: &str,
+    ) -> Result<(WorkspaceSpec, PullRequestRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let Some(index) = web_ui
+            .pull_requests
+            .iter()
+            .position(|pull_request| pull_request.id == pull_request_id)
+        else {
+            return Err(DomainError::Repository(RepositoryError::RefNotFound(
+                pull_request_id.to_string(),
+            )));
+        };
+        if web_ui.pull_requests[index].status != PullRequestStatus::Open {
+            return Ok((workspace, web_ui.pull_requests[index].clone()));
+        }
+
+        let merged_commit = self
+            .repo_store
+            .merge_branch(
+                &workspace,
+                &web_ui.pull_requests[index].source_branch,
+                &web_ui.pull_requests[index].target_branch,
+            )
+            .await
+            .map_err(DomainError::Repository)?;
+
+        web_ui.pull_requests[index].status = PullRequestStatus::Merged;
+        web_ui.pull_requests[index].updated_at_ms = Self::now_ms();
+        web_ui.pull_requests[index].merged_commit = Some(merged_commit);
+        let pull_request = web_ui.pull_requests[index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, pull_request))
     }
 
     pub async fn apply(
@@ -760,6 +1179,15 @@ mod tests {
         ) -> Result<String, RepositoryError> {
             Ok(format!("{}-checkout", workspace.checked_out_branch))
         }
+
+        async fn merge_branch(
+            &self,
+            _workspace: &WorkspaceSpec,
+            source_branch: &str,
+            _target_branch: &str,
+        ) -> Result<String, RepositoryError> {
+            Ok(format!("{source_branch}-merged"))
+        }
     }
 
     struct StubRegistry {
@@ -823,7 +1251,7 @@ mod tests {
             WorkspaceService::new(Arc::new(StubRepoStore), registry, Arc::new(StubIssuer));
 
         let prepared = service
-            .prepare_serve(PathBuf::from("."), Some(DEFAULT_BRANCH), "snapshot")
+            .prepare_serve(PathBuf::from("."), Some(DEFAULT_BRANCH), "snapshot", false)
             .await
             .unwrap();
 
@@ -844,6 +1272,7 @@ mod tests {
                     sidecar: sidecar.clone(),
                     exported_branch: "main".into(),
                     checked_out_branch: Some("main".into()),
+                    web_ui: WorkspaceWebUiState::default(),
                 },
             )])),
         });
@@ -899,6 +1328,7 @@ mod tests {
                     sidecar: sidecar.clone(),
                     exported_branch: "main".into(),
                     checked_out_branch: Some("main".into()),
+                    web_ui: WorkspaceWebUiState::default(),
                 },
             )])),
         });
@@ -954,6 +1384,7 @@ mod tests {
                     sidecar: sidecar.clone(),
                     exported_branch: "main".into(),
                     checked_out_branch: Some("main".into()),
+                    web_ui: WorkspaceWebUiState::default(),
                 },
             )])),
         });
@@ -1007,6 +1438,7 @@ mod tests {
                     sidecar: sidecar.clone(),
                     exported_branch: "main".into(),
                     checked_out_branch: Some("feature".into()),
+                    web_ui: WorkspaceWebUiState::default(),
                 },
             )])),
         });
@@ -1051,6 +1483,7 @@ mod tests {
                     sidecar: sidecar.clone(),
                     exported_branch: "feature".into(),
                     checked_out_branch: Some("feature".into()),
+                    web_ui: WorkspaceWebUiState::default(),
                 },
             )])),
         });
@@ -1060,10 +1493,63 @@ mod tests {
         std::fs::create_dir_all(&sidecar).unwrap();
         assert!(matches!(
             service
-                .prepare_serve(PathBuf::from("."), Some("main"), "snapshot")
+                .prepare_serve(PathBuf::from("."), Some("main"), "snapshot", false)
                 .await,
             Err(DomainError::ExportedBranchConflict { current, requested })
                 if current == "feature" && requested == "main"
         ));
+    }
+
+    #[tokio::test]
+    async fn prepare_serve_rejects_existing_git_worktree_without_flag() {
+        let (_temp, worktree, sidecar, _workspace_id) = temp_workspace();
+        Repository::init(&worktree).unwrap();
+        let registry = Arc::new(StubRegistry {
+            worktree: worktree.clone(),
+            default_sidecar: sidecar,
+            records: Mutex::new(HashMap::new()),
+        });
+        let service =
+            WorkspaceService::new(Arc::new(StubRepoStore), registry, Arc::new(StubIssuer));
+
+        assert!(matches!(
+            service
+                .prepare_serve(PathBuf::from("."), None, "snapshot", false)
+                .await,
+            Err(DomainError::ExistingGitWorktreeRequiresFlag(path)) if path == worktree
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_serve_allows_existing_git_worktree_with_flag_and_infers_branch() {
+        let (_temp, worktree, sidecar, _workspace_id) = temp_workspace();
+        let repo = Repository::init(&worktree).unwrap();
+        std::fs::write(worktree.join("README.md"), "hello\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("README.md")).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("tester", "tester@example.com").unwrap();
+        let commit_id = repo
+            .commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+        let commit = repo.find_commit(commit_id).unwrap();
+        repo.branch("trunk", &commit, true).unwrap();
+        repo.set_head("refs/heads/trunk").unwrap();
+        let registry = Arc::new(StubRegistry {
+            worktree: worktree.clone(),
+            default_sidecar: sidecar,
+            records: Mutex::new(HashMap::new()),
+        });
+        let service =
+            WorkspaceService::new(Arc::new(StubRepoStore), registry, Arc::new(StubIssuer));
+
+        let prepared = service
+            .prepare_serve(PathBuf::from("."), None, "snapshot", true)
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.workspace.checked_out_branch, "trunk");
+        assert_eq!(prepared.workspace.exported_branch, "trunk");
     }
 }

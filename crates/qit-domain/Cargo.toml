@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+dunce = { workspace = true }
 fs2 = "0.4.3"
+git2 = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }

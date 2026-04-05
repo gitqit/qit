@@ -1575,6 +1575,7 @@ dependencies = [
  "qit-http",
  "qit-storage",
  "qit-transports",
+ "qit-webui",
  "rand 0.8.5",
  "tempfile",
  "tokio",
@@ -1587,7 +1588,9 @@ name = "qit-domain"
 version = "0.1.5"
 dependencies = [
  "async-trait",
+ "dunce",
  "fs2",
+ "git2",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
@@ -1663,6 +1666,7 @@ dependencies = [
  "qit-git",
  "qit-http",
  "qit-storage",
+ "qit-webui",
  "reqwest",
  "tempfile",
  "tokio",
@@ -1680,6 +1684,24 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "qit-webui"
+version = "0.1.5"
+dependencies = [
+ "async-trait",
+ "axum",
+ "http-body-util",
+ "qit-domain",
+ "qit-http",
+ "qit-http-backend",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "uuid",
 ]
 
 [[package]]

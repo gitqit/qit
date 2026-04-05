@@ -3,6 +3,7 @@ use qit_domain::{CredentialIssuer, SessionCredentials, WorkspaceService};
 use qit_git::{GitHttpBackendAdapter, GitRepoStore};
 use qit_http::{repo_mount_path, GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
 use qit_storage::FilesystemRegistry;
+use qit_webui::{WebUiConfig, WebUiServer};
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
@@ -81,7 +82,7 @@ fn spawn_qit_serve(
     worktree: &Path,
     port: u16,
 ) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
-    spawn_qit_serve_with_options(worktree, port, false, None, false)
+    spawn_qit_serve_with_options(worktree, port, false, None, true)
 }
 
 fn spawn_qit_serve_with_env(
@@ -90,7 +91,7 @@ fn spawn_qit_serve_with_env(
     auto_apply: bool,
     data_dir: Option<&Path>,
 ) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
-    spawn_qit_serve_with_options(worktree, port, auto_apply, data_dir, false)
+    spawn_qit_serve_with_options(worktree, port, auto_apply, data_dir, true)
 }
 
 fn spawn_qit_serve_with_options(
@@ -98,7 +99,7 @@ fn spawn_qit_serve_with_options(
     port: u16,
     auto_apply: bool,
     data_dir: Option<&Path>,
-    hidden_pass: bool,
+    show_pass: bool,
 ) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
     let bin = qit_binary_path()?;
     let mut command = Command::new(bin);
@@ -107,8 +108,8 @@ fn spawn_qit_serve_with_options(
         .arg("local")
         .arg("--port")
         .arg(port.to_string());
-    if hidden_pass {
-        command.arg("--hidden-pass");
+    if show_pass {
+        command.arg("--show-pass");
     }
     if auto_apply {
         command.arg("--auto-apply");
@@ -241,20 +242,26 @@ async fn start_server(
         issuer,
     ));
     let prepared = service
-        .prepare_serve(worktree.clone(), Some("main"), "integration snapshot")
+        .prepare_serve(
+            worktree.clone(),
+            Some("main"),
+            "integration snapshot",
+            false,
+        )
         .await
         .map_err(|err| anyhow!(err.to_string()))?;
     let credentials = prepared.credentials.clone();
+    let workspace = prepared.workspace.clone();
     let mount_path = repo_mount_path("host");
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
-    let router = GitHttpServer::new(
+    let git_router = GitHttpServer::new(
         Arc::new(GitHttpBackendAdapter),
         registry.clone(),
         service.clone(),
         GitHttpServerConfig {
-            workspace: prepared.workspace,
+            workspace: workspace.clone(),
             credentials: credentials.clone(),
             auto_apply,
             repo_mount_path: mount_path.clone(),
@@ -262,8 +269,28 @@ async fn start_server(
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         },
     )
+    .git_router();
+    let web_router = WebUiServer::new(
+        repo_store.clone(),
+        service.clone(),
+        WebUiConfig {
+            workspace,
+            repo_mount_path: mount_path.clone(),
+            credentials: credentials.clone(),
+            implicit_owner_mode: false,
+            secure_cookies: false,
+            public_repo_url: None,
+        },
+    )
     .router();
-    let task = tokio::spawn(async move { axum::serve(listener, router).await });
+    let app = web_router.merge(git_router);
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     Ok((port, task, credentials, worktree, mount_path))
 }
 
@@ -301,6 +328,20 @@ async fn git_http_requires_basic_auth() -> Result<()> {
     assert!(authorized.status().is_success());
 
     task.abort();
+    Ok(())
+}
+
+#[test]
+fn serve_rejects_existing_git_worktree_without_flag() -> Result<()> {
+    let root = TempDir::new()?;
+    let worktree = root.path().join("repo");
+    std::fs::create_dir_all(&worktree)?;
+    run_git(Some(&worktree), &["init"])?;
+
+    let output = run_qit_output(&["--transport", "local", worktree.to_str().unwrap()])?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--allow-existing-git"));
     Ok(())
 }
 
@@ -376,7 +417,7 @@ fn qit_cli_serves_and_manual_apply_updates_host() -> Result<()> {
 }
 
 #[test]
-fn qit_cli_shows_password_and_clone_credentials_by_default() -> Result<()> {
+fn qit_cli_hides_password_and_clone_credentials_by_default() -> Result<()> {
     let root = TempDir::new()?;
     let worktree = root.path().join("host");
     std::fs::create_dir_all(&worktree)?;
@@ -385,16 +426,68 @@ fn qit_cli_shows_password_and_clone_credentials_by_default() -> Result<()> {
     let port = free_port()?;
     let (mut child, rx) = spawn_qit_serve_with_options(&worktree, port, false, None, false)?;
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut saw_password = false;
+    let mut saw_hidden_password = false;
     let mut saw_credentials_file = false;
+    let mut saw_uncredentialed_clone = false;
+    let mut saw_old_banner = false;
+    let mut saw_internal_startup_noise = false;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) if line.trim_start().starts_with("password: ") => {
+                saw_hidden_password = line.contains("hidden (see file)");
+            }
+            Ok(line) if line.trim_start().starts_with("file: ") => {
+                saw_credentials_file = true;
+            }
+            Ok(line) if line.contains("git clone http://") && !line.contains('@') => {
+                saw_uncredentialed_clone = true;
+            }
+            Ok(line) if line.contains("===========================================================") => {
+                saw_old_banner = true;
+            }
+            Ok(line)
+                if line.contains("qit: starting...")
+                    || line.contains("sidecar:")
+                    || line.contains("snapshot:")
+                    || line.contains("local Git HTTP:") =>
+            {
+                saw_internal_startup_noise = true;
+            }
+            Ok(line) if line.contains("Ctrl+C to stop.") => break,
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("qit server exited before printing banner")
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(saw_hidden_password);
+    assert!(saw_credentials_file);
+    assert!(saw_uncredentialed_clone);
+    assert!(!saw_old_banner);
+    assert!(!saw_internal_startup_noise);
+    Ok(())
+}
+
+#[test]
+fn qit_cli_shows_password_with_show_pass() -> Result<()> {
+    let root = TempDir::new()?;
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "initial\n")?;
+
+    let port = free_port()?;
+    let (mut child, rx) = spawn_qit_serve_with_options(&worktree, port, false, None, true)?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_password = false;
     let mut saw_credentialed_clone = false;
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(line) if line.trim_start().starts_with("password: ") => {
                 saw_password = !line.contains("hidden from stdout");
-            }
-            Ok(line) if line.trim_start().starts_with("file: ") => {
-                saw_credentials_file = true;
             }
             Ok(line) if line.contains("git clone http://") && line.contains('@') => {
                 saw_credentialed_clone = true;
@@ -411,48 +504,7 @@ fn qit_cli_shows_password_and_clone_credentials_by_default() -> Result<()> {
     let _ = child.kill();
     let _ = child.wait();
     assert!(saw_password);
-    assert!(saw_credentials_file);
     assert!(saw_credentialed_clone);
-    Ok(())
-}
-
-#[test]
-fn qit_cli_hides_password_with_hidden_pass() -> Result<()> {
-    let root = TempDir::new()?;
-    let worktree = root.path().join("host");
-    std::fs::create_dir_all(&worktree)?;
-    std::fs::write(worktree.join("README.md"), "initial\n")?;
-
-    let port = free_port()?;
-    let (mut child, rx) = spawn_qit_serve_with_options(&worktree, port, false, None, true)?;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut saw_hidden_password = false;
-    let mut saw_uncredentialed_clone = false;
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(line)
-                if line
-                    .trim_start()
-                    .starts_with("password: hidden from stdout") =>
-            {
-                saw_hidden_password = true;
-            }
-            Ok(line) if line.contains("git clone http://") && !line.contains('@') => {
-                saw_uncredentialed_clone = true;
-            }
-            Ok(line) if line.contains("Ctrl+C to stop.") => break,
-            Ok(_) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("qit server exited before printing banner")
-            }
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    assert!(saw_hidden_password);
-    assert!(saw_uncredentialed_clone);
     Ok(())
 }
 

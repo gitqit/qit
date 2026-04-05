@@ -8,7 +8,7 @@ members = [
     "crates/qit-http",
     "crates/qit-storage",
     "crates/qit-transports",
-    "tests",
+    "tests", "crates/qit-webui",
 ]
 
 [workspace.package]

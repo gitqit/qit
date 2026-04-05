@@ -222,6 +222,7 @@ mod tests {
             sidecar: temp.path().join("repos/sidecar.git"),
             exported_branch: "main".into(),
             checked_out_branch: Some("main".into()),
+            web_ui: qit_domain::WorkspaceWebUiState::default(),
         };
 
         registry.save(id, record.clone()).unwrap();

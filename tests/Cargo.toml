@@ -12,6 +12,7 @@ qit-domain = { path = "../crates/qit-domain" }
 qit-git = { path = "../crates/qit-git" }
 qit-http = { path = "../crates/qit-http" }
 qit-storage = { path = "../crates/qit-storage" }
+qit-webui = { path = "../crates/qit-webui" }
 reqwest = { version = "0.12", features = ["rustls-tls"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }

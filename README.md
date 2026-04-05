@@ -57,10 +57,10 @@ cargo run --manifest-path Cargo.toml -p qit -- --transport local ./my-app
 Clone from another machine or terminal:
 
 ```bash
-git clone http://qit-user:qit-pass@127.0.0.1:8080/my-app
+git clone http://127.0.0.1:8080/my-app
 ```
 
-`qit` prints the real session username/password and includes them in the suggested clone command by default. Pass `--hidden-pass` if you want stdout to hide the password and leave the clone command uncredentialed.
+`qit` hides the password from stdout and omits it from the suggested clone command by default. Pass `--show-pass` if you explicitly want stdout to print the password and embed credentials in the clone command.
 
 ## Commands
 
@@ -76,6 +76,12 @@ Choose a transport:
 cargo run -p qit -- --transport ngrok ./my-app
 cargo run -p qit -- --transport tailscale ./my-app
 cargo run -p qit -- --transport local ./my-app
+```
+
+Serve an existing Git worktree root explicitly:
+
+```bash
+cargo run -p qit -- --allow-existing-git .
 ```
 
 Enable auto-apply:
@@ -117,8 +123,8 @@ Unlike the current LocalCollab build, `qit` does not default to anonymous access
 - every server session generates a fresh username and password
 - authentication uses HTTP Basic Auth so standard Git clients can use normal clone and push commands
 - credentials live only for the lifetime of the serving process
-- credentials are written to a local file and also printed to stdout by default, including in the suggested clone command
-- pass `--hidden-pass` to hide the password from stdout and force Git to prompt instead
+- credentials are written to a local file; stdout hides the password by default and the suggested clone command is uncredentialed unless you pass `--show-pass`
+- the Web UI enters as owner automatically only in local-only mode; exposed sessions must authenticate explicitly
 - pushes still land in the sidecar repository first
 - host-folder writes still require `apply` or `--auto-apply`
 
@@ -141,6 +147,7 @@ This is intentionally simple authentication, not a full multi-user permission sy
 - snapshots honor the published tree's local `.gitignore` rules even when the host folder is not a Git repository
 - snapshots do not inherit machine-global Git ignore rules from the operator's environment
 - snapshots include vendor/build directories when they are part of the published tree
+- serving an existing Git worktree root requires `--allow-existing-git`; `qit` snapshots the checked-out branch while skipping `.git` metadata
 - the sidecar repository still lives outside the host folder, so `qit` does not snapshot sidecar Git metadata into the published tree
 
 ## Operational Notes

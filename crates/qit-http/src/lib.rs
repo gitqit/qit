@@ -74,15 +74,23 @@ impl GitHttpServer {
         Ok(self.workspace.clone())
     }
 
-    pub fn router(self) -> Router {
+    pub fn git_router(self) -> Router {
+        let git_path = format!("{}/{{*git_path}}", self.repo_mount_path);
         let max_body_bytes = self.max_body_bytes;
         let state = Arc::new(self);
         Router::new()
-            .fallback(any(move |req: Request| {
-                let state = state.clone();
-                async move { state.handle(req).await }
-            }))
+            .route(
+                &git_path,
+                any(move |req: Request| {
+                    let state = state.clone();
+                    async move { state.handle(req).await }
+                }),
+            )
             .layer(DefaultBodyLimit::max(max_body_bytes))
+    }
+
+    pub fn router(self) -> Router {
+        self.git_router()
     }
 
     fn spawn_auto_apply(
@@ -186,6 +194,9 @@ impl GitHttpServer {
             Some(path_info) => path_info,
             None => return Err(StatusCode::NOT_FOUND),
         };
+        if !is_git_path_info(&path_info) {
+            return Err(StatusCode::NOT_FOUND);
+        }
         let query = uri.query().map(ToString::to_string);
         let is_receive_pack =
             method == axum::http::Method::POST && path_info.ends_with("git-receive-pack");
@@ -273,7 +284,18 @@ pub fn authorize(headers: &HeaderMap, credentials: &SessionCredentials) -> bool 
     let Some((username, password)) = decoded.split_once(':') else {
         return false;
     };
-    username == credentials.username && password == credentials.password
+    secure_eq(username, &credentials.username) && secure_eq(password, &credentials.password)
+}
+
+fn secure_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0_u8, |acc, (lhs, rhs)| acc | (lhs ^ rhs))
+        == 0
 }
 
 pub fn request_scheme(configured_scheme: &str) -> String {
@@ -351,6 +373,20 @@ pub fn strip_repo_mount(path: &str, repo_mount_path: &str) -> Option<String> {
         .map(|suffix| format!("/{}", suffix))
 }
 
+pub fn is_git_request_path(path: &str, repo_mount_path: &str) -> bool {
+    strip_repo_mount(path, repo_mount_path)
+        .map(|path_info| is_git_path_info(&path_info))
+        .unwrap_or(false)
+}
+
+pub fn is_git_path_info(path_info: &str) -> bool {
+    matches!(
+        path_info,
+        "/HEAD" | "/info/refs" | "/git-upload-pack" | "/git-receive-pack"
+    ) || path_info.starts_with("/objects/")
+        || path_info.starts_with("/refs/")
+}
+
 fn unauthorized_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
@@ -413,5 +449,11 @@ mod tests {
             None
         );
         assert_eq!(strip_repo_mount("/other/info/refs", "/My-Project"), None);
+        assert!(is_git_request_path("/My-Project/info/refs", "/My-Project"));
+        assert!(!is_git_request_path("/My-Project", "/My-Project"));
+        assert!(!is_git_request_path(
+            "/My-Project/api/session",
+            "/My-Project"
+        ));
     }
 }

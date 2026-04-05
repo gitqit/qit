@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use git2::{Oid, Repository, Signature};
 use ignore::WalkBuilder;
 use qit_domain::{
-    lock_workspace, ApplyOutcome, BranchRecord, RepoStore, RepositoryError, WorkspaceId,
-    WorkspaceSpec,
+    lock_workspace, ApplyOutcome, BlobContent, BranchRecord, CommitDetail, CommitFileChange,
+    CommitHistory, CommitHistoryNode, CommitSummary, RefComparison, RefDiffFile, RepoReadStore,
+    RepoStore, RepositoryError, TreeEntry, TreeEntryKind, WorkspaceId, WorkspaceSpec,
 };
 use qit_http_backend::{
     BoxAsyncRead, GitHttpBackend, GitHttpBackendError, GitHttpBackendRequest,
@@ -220,6 +221,218 @@ impl ManagedWorkspace {
             .peel_to_commit()?)
     }
 
+    fn resolve_commitish<'repo>(
+        &self,
+        repo: &'repo Repository,
+        commitish: &str,
+    ) -> Result<git2::Commit<'repo>, GitStoreError> {
+        repo.revparse_single(commitish)
+            .map_err(|_| GitStoreError::RefNotFound(commitish.to_string()))?
+            .peel_to_commit()
+            .map_err(|_| GitStoreError::RefNotFound(commitish.to_string()))
+    }
+
+    fn commit_summary(commit: &git2::Commit<'_>) -> CommitSummary {
+        CommitSummary {
+            id: commit.id().to_string(),
+            summary: commit.summary().unwrap_or("").to_string(),
+            author: commit.author().name().unwrap_or("unknown").to_string(),
+            authored_at: commit.time().seconds(),
+        }
+    }
+
+    fn commit_history_node(commit: &git2::Commit<'_>) -> CommitHistoryNode {
+        CommitHistoryNode {
+            id: commit.id().to_string(),
+            summary: commit.summary().unwrap_or("").to_string(),
+            author: commit.author().name().unwrap_or("unknown").to_string(),
+            authored_at: commit.time().seconds(),
+            parents: commit
+                .parents()
+                .map(|parent| parent.id().to_string())
+                .collect(),
+            refs: Vec::new(),
+        }
+    }
+
+    fn commit_changes(
+        repo: &Repository,
+        commit: &git2::Commit<'_>,
+    ) -> Result<Vec<CommitFileChange>, GitStoreError> {
+        let current_tree = commit.tree()?;
+        let parent_tree = if commit.parent_count() > 0 {
+            Some(commit.parent(0)?.tree()?)
+        } else {
+            None
+        };
+        let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&current_tree), None)?;
+        let mut changes = Vec::new();
+        for (index, delta) in diff.deltas().enumerate() {
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let status = match delta.status() {
+                git2::Delta::Added => "added",
+                git2::Delta::Deleted => "deleted",
+                git2::Delta::Modified => "modified",
+                git2::Delta::Renamed => "renamed",
+                git2::Delta::Copied => "copied",
+                git2::Delta::Typechange => "typechange",
+                git2::Delta::Untracked => "untracked",
+                git2::Delta::Ignored => "ignored",
+                _ => "modified",
+            }
+            .to_string();
+            let (additions, deletions) = match git2::Patch::from_diff(&diff, index)? {
+                Some(patch) => {
+                    let (_, additions, deletions) = patch.line_stats()?;
+                    (additions, deletions)
+                }
+                None => (0, 0),
+            };
+            changes.push(CommitFileChange {
+                path,
+                status,
+                additions,
+                deletions,
+            });
+        }
+        Ok(changes)
+    }
+
+    fn read_blob_from_tree(
+        repo: &Repository,
+        tree: &git2::Tree<'_>,
+        path: &Path,
+    ) -> Result<BlobContent, GitStoreError> {
+        let entry = tree
+            .get_path(path)
+            .map_err(|_| GitStoreError::RefNotFound(path.display().to_string()))?;
+        let blob = entry
+            .to_object(repo)?
+            .peel_to_blob()
+            .map_err(|_| GitStoreError::RefNotFound(path.display().to_string()))?;
+        Ok(BlobContent {
+            path: path.to_string_lossy().to_string(),
+            text: if blob.is_binary() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(blob.content()).to_string())
+            },
+            is_binary: blob.is_binary(),
+            size: blob.size(),
+        })
+    }
+
+    fn maybe_read_blob_from_tree(
+        repo: &Repository,
+        tree: &git2::Tree<'_>,
+        path: Option<&Path>,
+    ) -> Result<Option<BlobContent>, GitStoreError> {
+        path.map(|path| Self::read_blob_from_tree(repo, tree, path))
+            .transpose()
+    }
+
+    fn maybe_read_diff_blob_from_tree(
+        repo: &Repository,
+        tree: &git2::Tree<'_>,
+        path: Option<&Path>,
+    ) -> Result<Option<BlobContent>, GitStoreError> {
+        match Self::maybe_read_blob_from_tree(repo, tree, path) {
+            Ok(blob) => Ok(blob),
+            Err(GitStoreError::RefNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn diff_status(delta: git2::Delta) -> &'static str {
+        match delta {
+            git2::Delta::Added => "added",
+            git2::Delta::Deleted => "deleted",
+            git2::Delta::Modified => "modified",
+            git2::Delta::Renamed => "renamed",
+            git2::Delta::Copied => "copied",
+            git2::Delta::Typechange => "typechange",
+            git2::Delta::Untracked => "untracked",
+            git2::Delta::Ignored => "ignored",
+            _ => "modified",
+        }
+    }
+
+    fn ref_diff_files(
+        repo: &Repository,
+        base: &git2::Commit<'_>,
+        head: &git2::Commit<'_>,
+    ) -> Result<Vec<RefDiffFile>, GitStoreError> {
+        let base_tree = base.tree()?;
+        let head_tree = head.tree()?;
+        let mut diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?;
+        diff.find_similar(None)?;
+        let mut files = Vec::new();
+        for (index, delta) in diff.deltas().enumerate() {
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let previous_path = match (delta.old_file().path(), delta.new_file().path()) {
+                (Some(old_path), Some(new_path)) if old_path != new_path => {
+                    Some(old_path.to_string_lossy().to_string())
+                }
+                _ => None,
+            };
+            let (additions, deletions) = match git2::Patch::from_diff(&diff, index)? {
+                Some(patch) => {
+                    let (_, additions, deletions) = patch.line_stats()?;
+                    (additions, deletions)
+                }
+                None => (0, 0),
+            };
+            files.push(RefDiffFile {
+                path,
+                previous_path,
+                status: Self::diff_status(delta.status()).to_string(),
+                additions,
+                deletions,
+                original: Self::maybe_read_diff_blob_from_tree(
+                    repo,
+                    &base_tree,
+                    delta.old_file().path(),
+                )?,
+                modified: Self::maybe_read_diff_blob_from_tree(
+                    repo,
+                    &head_tree,
+                    delta.new_file().path(),
+                )?,
+            });
+        }
+        Ok(files)
+    }
+
+    fn resolve_tree<'repo>(
+        &self,
+        repo: &'repo Repository,
+        reference: &str,
+        path: Option<&Path>,
+    ) -> Result<git2::Tree<'repo>, GitStoreError> {
+        let commit = self.resolve_commitish(repo, reference)?;
+        let tree = commit.tree()?;
+        let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
+            return Ok(tree);
+        };
+        let entry = tree
+            .get_path(path)
+            .map_err(|_| GitStoreError::RefNotFound(path.display().to_string()))?;
+        entry
+            .to_object(repo)?
+            .peel_to_tree()
+            .map_err(|_| GitStoreError::RefNotFound(path.display().to_string()))
+    }
+
     fn sync_applied_to_current(&self, repo: &Repository) -> Result<(), GitStoreError> {
         let current_ref = repo.find_reference(&self.host_refname())?;
         let current_commit = current_ref.peel_to_commit()?;
@@ -250,14 +463,22 @@ impl ManagedWorkspace {
             if entry.depth() == 0 {
                 continue;
             }
-            if entry.file_type().map(|file| file.is_dir()).unwrap_or(false) {
-                continue;
-            }
             let rel = entry
                 .path()
                 .strip_prefix(&self.worktree)
                 .map_err(|_| GitStoreError::InvalidPath)?;
             if rel.as_os_str().is_empty() {
+                continue;
+            }
+            if rel
+                .components()
+                .next()
+                .map(|component| component.as_os_str() == ".git")
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if entry.file_type().map(|file| file.is_dir()).unwrap_or(false) {
                 continue;
             }
             index.add_path(rel)?;
@@ -521,6 +742,44 @@ impl ManagedWorkspace {
         }
         Ok(target_commit.id().to_string())
     }
+
+    fn merge_branch(
+        &self,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> Result<String, GitStoreError> {
+        let repo = self.open_repo()?;
+        let source_refname = Self::branch_refname(source_branch);
+        let target_refname = Self::branch_refname(target_branch);
+        let source_commit = repo
+            .find_reference(&source_refname)
+            .map_err(|_| GitStoreError::RefNotFound(source_refname.clone()))?
+            .peel_to_commit()?;
+        let target_commit = repo
+            .find_reference(&target_refname)
+            .map_err(|_| GitStoreError::RefNotFound(target_refname.clone()))?
+            .peel_to_commit()?;
+        let is_ff = source_commit.id() == target_commit.id()
+            || repo.graph_descendant_of(source_commit.id(), target_commit.id())?;
+        if !is_ff {
+            return Err(GitStoreError::NotFastForward(format!(
+                "cannot fast-forward `{target_branch}` to `{source_branch}`"
+            )));
+        }
+        Self::set_ref_target(
+            &repo,
+            &target_refname,
+            source_commit.id(),
+            "qit merge branch",
+        )?;
+        if target_branch == self.exported_branch {
+            repo.set_head(&target_refname)?;
+        }
+        if target_branch == self.checked_out_branch {
+            self.apply_fast_forward(&target_refname)?;
+        }
+        Ok(source_commit.id().to_string())
+    }
 }
 
 #[async_trait]
@@ -692,6 +951,266 @@ impl RepoStore for GitRepoStore {
         .await
         .map_err(|err| RepositoryError::Io {
             operation: "join branch checkout task",
+            message: err.to_string(),
+        })?
+        .map_err(RepositoryError::from)
+    }
+
+    async fn merge_branch(
+        &self,
+        workspace: &WorkspaceSpec,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> Result<String, RepositoryError> {
+        let source_branch = source_branch.to_string();
+        let target_branch = target_branch.to_string();
+        tokio::task::spawn_blocking({
+            let workspace = workspace.clone();
+            move || {
+                ManagedWorkspace::reopen(&workspace).merge_branch(&source_branch, &target_branch)
+            }
+        })
+        .await
+        .map_err(|err| RepositoryError::Io {
+            operation: "join branch merge task",
+            message: err.to_string(),
+        })?
+        .map_err(RepositoryError::from)
+    }
+}
+
+#[async_trait]
+impl RepoReadStore for GitRepoStore {
+    async fn list_commits(
+        &self,
+        workspace: &WorkspaceSpec,
+        reference: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<CommitHistory, RepositoryError> {
+        let reference = reference.map(ToString::to_string);
+        tokio::task::spawn_blocking({
+            let workspace = workspace.clone();
+            move || -> Result<CommitHistory, GitStoreError> {
+                let managed = ManagedWorkspace::reopen(&workspace);
+                let repo = managed.open_repo()?;
+                let reference = reference.unwrap_or_else(|| managed.host_refname());
+                let commit = managed.resolve_commitish(&repo, &reference)?;
+                let mut revwalk = repo.revwalk()?;
+                revwalk.push(commit.id())?;
+                revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+                let mut commits = Vec::new();
+                for oid in revwalk.skip(offset).take(limit.saturating_add(1)) {
+                    let oid = oid?;
+                    commits.push(ManagedWorkspace::commit_history_node(
+                        &repo.find_commit(oid)?,
+                    ));
+                }
+                let has_more = commits.len() > limit;
+                commits.truncate(limit);
+                Ok(CommitHistory {
+                    reference,
+                    offset,
+                    limit,
+                    has_more,
+                    commits,
+                })
+            }
+        })
+        .await
+        .map_err(|err| RepositoryError::Io {
+            operation: "join commit listing task",
+            message: err.to_string(),
+        })?
+        .map_err(RepositoryError::from)
+    }
+
+    async fn read_commit(
+        &self,
+        workspace: &WorkspaceSpec,
+        commitish: &str,
+    ) -> Result<CommitDetail, RepositoryError> {
+        let commitish = commitish.to_string();
+        tokio::task::spawn_blocking({
+            let workspace = workspace.clone();
+            move || -> Result<CommitDetail, GitStoreError> {
+                let managed = ManagedWorkspace::reopen(&workspace);
+                let repo = managed.open_repo()?;
+                let commit = managed.resolve_commitish(&repo, &commitish)?;
+                let author = commit.author().name().unwrap_or("unknown").to_string();
+                let detail = CommitDetail {
+                    id: commit.id().to_string(),
+                    summary: commit.summary().unwrap_or("").to_string(),
+                    message: commit.message().unwrap_or("").to_string(),
+                    author,
+                    authored_at: commit.time().seconds(),
+                    parents: commit
+                        .parents()
+                        .map(|parent| parent.id().to_string())
+                        .collect(),
+                    changes: ManagedWorkspace::commit_changes(&repo, &commit)?,
+                };
+                Ok(detail)
+            }
+        })
+        .await
+        .map_err(|err| RepositoryError::Io {
+            operation: "join commit detail task",
+            message: err.to_string(),
+        })?
+        .map_err(RepositoryError::from)
+    }
+
+    async fn list_tree(
+        &self,
+        workspace: &WorkspaceSpec,
+        reference: &str,
+        path: Option<&Path>,
+    ) -> Result<Vec<TreeEntry>, RepositoryError> {
+        let reference = reference.to_string();
+        let path = path.map(PathBuf::from);
+        tokio::task::spawn_blocking({
+            let workspace = workspace.clone();
+            move || -> Result<Vec<TreeEntry>, GitStoreError> {
+                let managed = ManagedWorkspace::reopen(&workspace);
+                let repo = managed.open_repo()?;
+                let tree = managed.resolve_tree(&repo, &reference, path.as_deref())?;
+                let base_path = path.unwrap_or_default();
+                let mut entries = tree
+                    .iter()
+                    .filter_map(|entry| {
+                        let name = entry.name()?.to_string();
+                        let full_path = if base_path.as_os_str().is_empty() {
+                            PathBuf::from(&name)
+                        } else {
+                            base_path.join(&name)
+                        };
+                        let kind = match entry.kind() {
+                            Some(git2::ObjectType::Tree) => TreeEntryKind::Tree,
+                            Some(git2::ObjectType::Blob) => TreeEntryKind::Blob,
+                            _ => return None,
+                        };
+                        let size = if matches!(kind, TreeEntryKind::Blob) {
+                            entry
+                                .to_object(&repo)
+                                .ok()?
+                                .peel_to_blob()
+                                .ok()
+                                .map(|blob| blob.size())
+                        } else {
+                            None
+                        };
+                        Some(TreeEntry {
+                            name,
+                            path: full_path.to_string_lossy().to_string(),
+                            oid: entry.id().to_string(),
+                            kind,
+                            size,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_by(|left, right| left.path.cmp(&right.path));
+                Ok(entries)
+            }
+        })
+        .await
+        .map_err(|err| RepositoryError::Io {
+            operation: "join tree listing task",
+            message: err.to_string(),
+        })?
+        .map_err(RepositoryError::from)
+    }
+
+    async fn read_blob(
+        &self,
+        workspace: &WorkspaceSpec,
+        reference: &str,
+        path: &Path,
+    ) -> Result<BlobContent, RepositoryError> {
+        let reference = reference.to_string();
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking({
+            let workspace = workspace.clone();
+            move || -> Result<BlobContent, GitStoreError> {
+                let managed = ManagedWorkspace::reopen(&workspace);
+                let repo = managed.open_repo()?;
+                let tree = managed.resolve_tree(&repo, &reference, None)?;
+                ManagedWorkspace::read_blob_from_tree(&repo, &tree, &path)
+            }
+        })
+        .await
+        .map_err(|err| RepositoryError::Io {
+            operation: "join blob read task",
+            message: err.to_string(),
+        })?
+        .map_err(RepositoryError::from)
+    }
+
+    async fn compare_refs(
+        &self,
+        workspace: &WorkspaceSpec,
+        base_ref: &str,
+        head_ref: &str,
+        limit: usize,
+    ) -> Result<RefComparison, RepositoryError> {
+        let base_ref = base_ref.to_string();
+        let head_ref = head_ref.to_string();
+        tokio::task::spawn_blocking({
+            let workspace = workspace.clone();
+            move || -> Result<RefComparison, GitStoreError> {
+                let managed = ManagedWorkspace::reopen(&workspace);
+                let repo = managed.open_repo()?;
+                let base = managed.resolve_commitish(&repo, &base_ref)?;
+                let head = managed.resolve_commitish(&repo, &head_ref)?;
+                let merge_base = repo.merge_base(base.id(), head.id()).ok();
+                let (ahead_by, behind_by) = repo.graph_ahead_behind(head.id(), base.id())?;
+                let mut revwalk = repo.revwalk()?;
+                revwalk.push(head.id())?;
+                revwalk.hide(base.id())?;
+                let mut commits = Vec::new();
+                for oid in revwalk.take(limit) {
+                    let oid = oid?;
+                    commits.push(ManagedWorkspace::commit_summary(&repo.find_commit(oid)?));
+                }
+                Ok(RefComparison {
+                    base_ref,
+                    head_ref,
+                    merge_base: merge_base.map(|oid| oid.to_string()),
+                    ahead_by,
+                    behind_by,
+                    commits,
+                })
+            }
+        })
+        .await
+        .map_err(|err| RepositoryError::Io {
+            operation: "join ref comparison task",
+            message: err.to_string(),
+        })?
+        .map_err(RepositoryError::from)
+    }
+
+    async fn diff_refs(
+        &self,
+        workspace: &WorkspaceSpec,
+        base_ref: &str,
+        head_ref: &str,
+    ) -> Result<Vec<RefDiffFile>, RepositoryError> {
+        let base_ref = base_ref.to_string();
+        let head_ref = head_ref.to_string();
+        tokio::task::spawn_blocking({
+            let workspace = workspace.clone();
+            move || -> Result<Vec<RefDiffFile>, GitStoreError> {
+                let managed = ManagedWorkspace::reopen(&workspace);
+                let repo = managed.open_repo()?;
+                let base = managed.resolve_commitish(&repo, &base_ref)?;
+                let head = managed.resolve_commitish(&repo, &head_ref)?;
+                ManagedWorkspace::ref_diff_files(&repo, &base, &head)
+            }
+        })
+        .await
+        .map_err(|err| RepositoryError::Io {
+            operation: "join ref diff task",
             message: err.to_string(),
         })?
         .map_err(RepositoryError::from)
@@ -1045,6 +1564,41 @@ mod tests {
         assert!(names.contains(&"visible.txt".to_string()));
         assert!(!names.iter().any(|name| name.ends_with(".ignored")));
         assert_eq!(workspace.id, WorkspaceId(Uuid::nil()));
+    }
+
+    #[test]
+    fn snapshot_skips_dot_git_directory_contents() {
+        let base = tempfile::tempdir().unwrap();
+        let worktree = base.path().join("wt");
+        let sidecar = base.path().join("side.git");
+        fs::create_dir_all(worktree.join(".git/hooks")).unwrap();
+        fs::write(
+            worktree.join(".git/config"),
+            "[core]\nrepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        fs::write(worktree.join(".git/hooks/pre-commit"), "#!/bin/sh\n").unwrap();
+        fs::write(worktree.join("visible.txt"), "v").unwrap();
+
+        let workspace = WorkspaceSpec {
+            id: WorkspaceId(Uuid::nil()),
+            worktree: worktree.clone(),
+            sidecar,
+            exported_branch: "main".into(),
+            checked_out_branch: "main".into(),
+        };
+        let managed = ManagedWorkspace::init(&workspace).unwrap();
+        let repo = managed.open_repo().unwrap();
+        let head = repo.find_reference("refs/heads/main").unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        let tree = commit.tree().unwrap();
+        let names: Vec<String> = tree
+            .iter()
+            .map(|entry| entry.name().unwrap().to_string())
+            .collect();
+
+        assert!(names.contains(&"visible.txt".to_string()));
+        assert!(!names.contains(&".git".to_string()));
     }
 
     #[test]
@@ -1571,5 +2125,66 @@ mod tests {
             .unwrap();
 
         assert_eq!(release_commit.id(), feature_commit);
+    }
+
+    #[test]
+    fn ref_diff_files_allows_deleted_paths_missing_from_head_tree() {
+        let base = tempfile::tempdir().unwrap();
+        let worktree = base.path().join("wt");
+        let remote_worktree = base.path().join("remote");
+        let sidecar = base.path().join("side.git");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&remote_worktree).unwrap();
+        std::fs::write(worktree.join("removed.md"), "present on main\n").unwrap();
+
+        let workspace = WorkspaceSpec {
+            id: WorkspaceId(Uuid::nil()),
+            worktree: worktree.clone(),
+            sidecar: sidecar.clone(),
+            exported_branch: "main".into(),
+            checked_out_branch: "main".into(),
+        };
+        let managed = ManagedWorkspace::init(&workspace).unwrap();
+        managed.create_branch("feature", None, false).unwrap();
+
+        let repo = Repository::open_bare(&sidecar).unwrap();
+        repo.set_workdir(&remote_worktree, false).unwrap();
+        let mut index = repo.index().unwrap();
+        index.clear().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let sig = Signature::now("tester", "tester@example.com").unwrap();
+        repo.commit(
+            Some("refs/heads/feature"),
+            &sig,
+            &sig,
+            "delete removed.md",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+
+        let main_commit = repo
+            .find_reference("refs/heads/main")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let feature_commit = repo
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+
+        let diffs = ManagedWorkspace::ref_diff_files(&repo, &main_commit, &feature_commit).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, "removed.md");
+        assert_eq!(diffs[0].status, "deleted");
+        assert_eq!(diffs[0].original.as_ref().and_then(|blob| blob.text.as_deref()), Some("present on main\n"));
+        assert!(diffs[0].modified.is_none());
     }
 }
