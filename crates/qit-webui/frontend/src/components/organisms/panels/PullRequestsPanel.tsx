@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from 'react'
 import {
   ArrowLeft,
   FileDiff,
@@ -27,8 +27,12 @@ import type {
   UiRole,
 } from '../../../lib/types'
 import { Badge, Button, EmptyState, Panel, Spinner } from '../../atoms/Controls'
-import { MonacoDiffSurface } from '../MonacoCodeSurface'
 import { shortSha } from './panelUtils'
+
+const MonacoDiffSurface = lazy(async () => {
+  const module = await import('../MonacoCodeSurface')
+  return { default: module.MonacoDiffSurface }
+})
 
 const STATUS_OPTIONS: Array<{ id: 'all' | PullRequestStatus; label: string }> = [
   { id: 'all', label: 'All' },
@@ -862,12 +866,21 @@ function PullRequestDetail({
                         Binary file diff preview is not available.
                       </div>
                     ) : (
-                      <MonacoDiffSurface
-                        height={diffHeight(file)}
-                        modified={file.modified?.text ?? ''}
-                        original={file.original?.text ?? ''}
-                        path={file.path}
-                      />
+                      <Suspense
+                        fallback={
+                          <div className="flex min-h-56 items-center justify-center gap-3 px-4 py-5 text-sm text-fg-muted">
+                            <Spinner />
+                            <span>Loading diff viewer…</span>
+                          </div>
+                        }
+                      >
+                        <MonacoDiffSurface
+                          height={diffHeight(file)}
+                          modified={file.modified?.text ?? ''}
+                          original={file.original?.text ?? ''}
+                          path={file.path}
+                        />
+                      </Suspense>
                     )}
                   </div>
                 </section>

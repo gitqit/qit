@@ -21,16 +21,35 @@ export interface BootstrapResponse {
   worktree: string
   exported_branch: string
   checked_out_branch: string
+  description: string
+  homepage_url: string
   local_only_owner_mode: boolean
   shared_remote_identity: boolean
+  git_credentials_visible: boolean
   git_username: string | null
   git_password: string | null
   public_repo_url: string | null
 }
 
+export interface BranchRule {
+  pattern: string
+  require_pull_request: boolean
+  required_approvals: number
+  dismiss_stale_approvals: boolean
+  block_force_push: boolean
+  block_delete: boolean
+}
+
+export interface RepositorySettings {
+  description: string
+  homepage_url: string
+  branch_rules: BranchRule[]
+}
+
 export interface SettingsResponse {
   local_only_owner_mode: boolean
   shared_remote_identity: boolean
+  repository: RepositorySettings
 }
 
 export interface BranchInfo {

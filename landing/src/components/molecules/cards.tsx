@@ -1,6 +1,7 @@
 import { Disclosure, DisclosureButton, DisclosurePanel } from '@headlessui/react'
 import { ChevronDown } from 'lucide-react'
 import { classNames } from '../../lib/classNames'
+import { isExternalHref } from '../../lib/hrefs'
 import { ButtonLink, Pill, SectionEyebrow, Surface } from '../atoms/primitives'
 
 export function SectionIntro({
@@ -36,12 +37,20 @@ export function HeroActions({
   secondaryHref: string
   secondaryLabel: string
 }) {
+  const primaryIsExternal = isExternalHref(primaryHref)
+  const secondaryIsExternal = isExternalHref(secondaryHref)
+
   return (
     <div className="flex flex-col gap-3 sm:flex-row">
-      <ButtonLink href={primaryHref} rel="noreferrer" target="_blank">
+      <ButtonLink href={primaryHref} rel={primaryIsExternal ? 'noreferrer' : undefined} target={primaryIsExternal ? '_blank' : undefined}>
         {primaryLabel}
       </ButtonLink>
-      <ButtonLink href={secondaryHref} rel="noreferrer" target="_blank" tone="secondary">
+      <ButtonLink
+        href={secondaryHref}
+        rel={secondaryIsExternal ? 'noreferrer' : undefined}
+        target={secondaryIsExternal ? '_blank' : undefined}
+        tone="secondary"
+      >
         {secondaryLabel}
       </ButtonLink>
     </div>
@@ -110,8 +119,8 @@ export function LinkCluster({
           className="px-4 py-2.5 text-sm"
           href={link.href}
           key={link.href}
-          rel="noreferrer"
-          target="_blank"
+          rel={isExternalHref(link.href) ? 'noreferrer' : undefined}
+          target={isExternalHref(link.href) ? '_blank' : undefined}
           tone="secondary"
         >
           {link.label}

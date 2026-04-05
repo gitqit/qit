@@ -1,6 +1,6 @@
 export const repoUrl = 'https://github.com/flynnemon/qit'
 export const releasesUrl = `${repoUrl}/releases`
-export const docsUrl = `${repoUrl}#quick-start`
+export const docsUrl = '/docs/install'
 
 export const heroContent = {
   eyebrow: 'Qit',
@@ -60,11 +60,21 @@ export const previewContent = {
   terminalTitle: 'Example startup output',
   terminalLines: [
     '$ qit ./my-app',
-    'Serving ./my-app as an authenticated Git repository',
-    'Web UI: http://127.0.0.1:8080/my-app',
-    'Username: session-owner',
-    'Password: hidden by default (use --show-pass to print it)',
-    'Clone: git clone http://127.0.0.1:8080/my-app',
+    'Serving',
+    '  path: ./my-app',
+    '  branch: main',
+    '  transport: local',
+    '',
+    'Web UI',
+    '  local: http://127.0.0.1:8080/my-app',
+    '',
+    'Git',
+    '  repo: http://127.0.0.1:8080/my-app/',
+    '  clone: git clone http://session-owner:session-pass-7k2m@127.0.0.1:8080/my-app/',
+    '',
+    'Session',
+    '  username: session-owner',
+    '  password: session-pass-7k2m',
   ],
   flowSteps: [
     'Snapshot the folder into a hidden sidecar repository.',
@@ -86,7 +96,7 @@ export const previewContent = {
     },
     {
       label: 'Password output',
-      value: 'Hidden by default',
+      value: 'Shown by default',
     },
   ],
 } as const

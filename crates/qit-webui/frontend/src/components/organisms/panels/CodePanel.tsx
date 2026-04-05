@@ -1,12 +1,12 @@
-import { useMemo, useState, type ReactNode } from 'react'
-import { ArrowUp, Copy, Download, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { Suspense, lazy, useMemo, useState, type ReactNode } from 'react'
+import { ArrowUp, Download, ExternalLink, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Badge, EmptyState, IconButton } from '../../atoms/Controls'
+import { Badge, EmptyState, IconButton, Spinner } from '../../atoms/Controls'
 import { RepoEntryIcon } from '../../../lib/fileIcons'
-import { MonacoCodeSurface } from '../MonacoCodeSurface'
 import { RepoFileTree } from '../RepoFileTree'
-import type { BlobContent, CommitHistoryNode, TreeEntry } from '../../../lib/types'
+import type { BlobContent, CommitHistoryNode, RefDiffFile, TreeEntry } from '../../../lib/types'
+import { api } from '../../../lib/api'
 import { AuthorBadge, RepoPathBreadcrumbs } from './shared'
 import {
   formatBytes,
@@ -16,6 +16,16 @@ import {
   shortSha,
   sortTreeEntries,
 } from './panelUtils'
+
+const MonacoCodeSurface = lazy(async () => {
+  const module = await import('../MonacoCodeSurface')
+  return { default: module.MonacoCodeSurface }
+})
+
+const MonacoDiffSurface = lazy(async () => {
+  const module = await import('../MonacoCodeSurface')
+  return { default: module.MonacoDiffSurface }
+})
 
 function LatestCommitBar({ commit }: { commit: CommitHistoryNode | null }) {
   if (!commit) {
@@ -91,7 +101,7 @@ function RepoTreeCard({
   const sortedEntries = useMemo(() => sortTreeEntries(entries), [entries])
 
   return (
-    <section className="overflow-hidden rounded-[var(--radius-lg)] border border-border bg-panel">
+    <section className="overflow-hidden rounded-lg border border-border bg-panel">
       <div className="flex flex-col gap-3 border-b border-border bg-canvas-raised/65 px-4 py-4 lg:flex-row lg:items-center lg:justify-between">
         <RepoPathBreadcrumbs onBrowse={onBrowse} path={currentPath} />
         <div className="flex flex-col gap-2 lg:items-end">
@@ -192,7 +202,7 @@ function BlobPreview({
   }
 
   return (
-    <pre className="max-h-[70vh] overflow-auto rounded-[var(--radius-sm)] bg-canvas px-4 py-4 text-[13px] leading-6 text-fg">
+    <pre className="max-h-[70vh] overflow-auto rounded-sm bg-canvas px-4 py-4 text-[13px] leading-6 text-fg">
       {blob.text}
     </pre>
   )
@@ -207,16 +217,22 @@ function lineStats(text: string) {
 }
 
 function BlobCodeView({
+  activePath,
   blob,
+  diff,
   latestCommit,
+  rawReference,
   treeCache,
   currentPath,
   onBrowse,
   onLoadTreePath,
   onOpen,
 }: {
-  blob: BlobContent
+  activePath: string | null
+  blob: BlobContent | null
+  diff?: RefDiffFile | null
   latestCommit: CommitHistoryNode | null
+  rawReference?: string
   treeCache: Record<string, TreeEntry[]>
   currentPath: string
   onBrowse: (path: string) => Promise<void>
@@ -224,10 +240,13 @@ function BlobCodeView({
   onOpen: (entry: TreeEntry) => Promise<void>
 }) {
   const [treeOpen, setTreeOpen] = useState(true)
-  const stats = blob.text ? lineStats(blob.text) : null
+  const stats = blob?.text ? lineStats(blob.text) : null
+  const previewPath = activePath ?? blob?.path ?? ''
+  const isDiffBinary = Boolean(diff && (diff.original?.is_binary || diff.modified?.is_binary))
+  const previewLabel = diff ? 'Diff' : 'Code'
 
   const downloadBlob = () => {
-    if (!blob.text) return
+    if (!blob?.text) return
 
     const anchor = document.createElement('a')
     const url = URL.createObjectURL(new Blob([blob.text], { type: 'text/plain;charset=utf-8' }))
@@ -253,7 +272,7 @@ function BlobCodeView({
           tone="muted"
         />
         <div className="min-w-0 flex-1">
-          <RepoPathBreadcrumbs onBrowse={onBrowse} path={blob.path} />
+          <RepoPathBreadcrumbs onBrowse={onBrowse} path={previewPath} />
         </div>
       </div>
 
@@ -261,7 +280,7 @@ function BlobCodeView({
         {treeOpen ? (
           <aside className="min-w-0">
             <RepoFileTree
-              activePath={blob.path}
+              activePath={activePath}
               currentPath={currentPath}
               onLoadPath={async (path) => {
                 await onLoadTreePath(path)
@@ -280,12 +299,14 @@ function BlobCodeView({
           </aside>
         ) : null}
 
-        <section className="flex min-h-[24rem] flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-panel lg:h-[44rem]">
+        <section className="flex min-h-96 flex-col overflow-hidden rounded-lg border border-border bg-panel lg:h-176">
           <div className="flex flex-col gap-3 border-b border-border bg-panel-subtle px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="min-w-0 space-y-1">
               <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <h3 className="truncate text-base font-semibold text-fg">{blob.path}</h3>
-                <Badge tone="accent">Code</Badge>
+                <h3 className="truncate text-base font-semibold text-fg">
+                  {previewPath || 'Choose a file'}
+                </h3>
+                <Badge tone="accent">{previewLabel}</Badge>
               </div>
               {latestCommit ? (
                 <div className="flex flex-wrap items-center gap-2 text-xs text-fg-muted">
@@ -299,17 +320,17 @@ function BlobCodeView({
               ) : null}
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {blob.text ? (
+              {blob?.text ? (
                 <IconButton
-                  icon={<Copy className="h-4 w-4" strokeWidth={1.9} />}
-                  label="Copy raw file contents"
+                  icon={<ExternalLink className="h-4 w-4" strokeWidth={1.9} />}
+                  label="View raw file in a new tab"
                   onClick={() => {
-                    void navigator.clipboard.writeText(blob.text ?? '')
+                    window.open(api.rawBlobUrl(rawReference, blob.path), '_blank', 'noopener,noreferrer')
                   }}
                   tone="muted"
                 />
               ) : null}
-              {blob.text ? (
+              {blob?.text ? (
                 <IconButton
                   icon={<Download className="h-4 w-4" strokeWidth={1.9} />}
                   label="Download file"
@@ -320,15 +341,58 @@ function BlobCodeView({
             </div>
           </div>
           <div className="border-b border-border bg-canvas px-4 py-2 text-xs text-fg-muted">
-            {stats ? `${stats.lines} lines (${stats.loc} loc) · ${formatBytes(blob.size)}` : formatBytes(blob.size)}
+            {diff
+              ? `${diff.status} · +${diff.additions} / -${diff.deletions}`
+              : blob
+                ? stats
+                  ? `${stats.lines} lines (${stats.loc} loc) · ${formatBytes(blob.size)}`
+                  : formatBytes(blob.size)
+                : 'Select a file from the tree or changed files list.'}
           </div>
-          {blob.is_binary || !blob.text ? (
+          {diff ? (
+            isDiffBinary ? (
+              <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+                <EmptyState title="Binary diff" message="This file is binary, so Qit does not render a diff preview inline." />
+              </div>
+            ) : (
+              <div className="min-h-0 flex-1 bg-canvas">
+                <Suspense
+                  fallback={
+                    <div className="flex h-full min-h-72 items-center justify-center gap-3 text-sm text-fg-muted">
+                      <Spinner />
+                      <span>Loading diff viewer…</span>
+                    </div>
+                  }
+                >
+                  <MonacoDiffSurface
+                    height="100%"
+                    modified={diff.modified?.text ?? ''}
+                    original={diff.original?.text ?? ''}
+                    path={diff.path}
+                  />
+                </Suspense>
+              </div>
+            )
+          ) : !blob ? (
+            <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+              <EmptyState title="No file selected" message="Choose a file from the tree to inspect this snapshot in the editor." />
+            </div>
+          ) : blob.is_binary || !blob.text ? (
             <div className="flex min-h-0 flex-1 items-center justify-center p-6">
               <EmptyState title="Binary file" message="This file is binary, so Qit does not render it inline." />
             </div>
           ) : (
             <div className="min-h-0 flex-1 bg-canvas">
-              <MonacoCodeSurface height="100%" path={blob.path} value={blob.text} />
+              <Suspense
+                fallback={
+                  <div className="flex h-full min-h-72 items-center justify-center gap-3 text-sm text-fg-muted">
+                    <Spinner />
+                    <span>Loading editor…</span>
+                  </div>
+                }
+              >
+                <MonacoCodeSurface height="100%" path={blob.path} value={blob.text} />
+              </Suspense>
             </div>
           )}
         </section>
@@ -342,8 +406,11 @@ export function CodePanel({
   currentPath,
   activePath,
   blob,
+  diff,
+  displayMode = 'browser',
   headerAction,
   latestCommit,
+  rawReference,
   onBrowse,
   onLoadTreePath,
   onOpen,
@@ -354,20 +421,26 @@ export function CodePanel({
   currentPath: string
   activePath: string | null
   blob: BlobContent | null
+  diff?: RefDiffFile | null
+  displayMode?: 'browser' | 'editor'
   headerAction?: ReactNode
   latestCommit: CommitHistoryNode | null
+  rawReference?: string
   onBrowse: (path: string) => Promise<void>
   onLoadTreePath: (path: string) => Promise<TreeEntry[]>
   onOpen: (entry: TreeEntry) => Promise<void>
   readme: BlobContent | null
   treeCache: Record<string, TreeEntry[]>
 }) {
-  if (blob) {
+  if (displayMode === 'editor' || blob || diff) {
     return (
       <BlobCodeView
+        activePath={activePath}
         blob={blob}
         currentPath={currentPath}
+        diff={diff}
         latestCommit={latestCommit}
+        rawReference={rawReference}
         onBrowse={onBrowse}
         onLoadTreePath={onLoadTreePath}
         onOpen={onOpen}
@@ -389,7 +462,7 @@ export function CodePanel({
       />
 
       {readme ? (
-        <section className="overflow-hidden rounded-[var(--radius-lg)] border border-border bg-panel">
+        <section className="overflow-hidden rounded-lg border border-border bg-panel">
           <div className="flex flex-col gap-2 border-b border-border bg-canvas-raised/65 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-2">
               <span className="rounded-full border border-border bg-panel-subtle px-2.5 py-1 text-xs font-semibold text-fg">

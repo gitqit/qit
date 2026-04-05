@@ -16,7 +16,15 @@ import { LandingShell } from '../templates/LandingShell'
 
 export function LandingPage() {
   return (
-    <LandingShell ctaHref={heroContent.primaryCta.href}>
+    <LandingShell
+      ctaHref={heroContent.primaryCta.href}
+      navItems={[
+        { href: '#features', label: 'Features' },
+        { href: '#preview', label: 'Preview' },
+        { href: '#faq', label: 'FAQ' },
+        { href: '/docs/install', label: 'Docs' },
+      ]}
+    >
       <LandingHero content={heroContent} />
       <FeatureGrid content={featureContent} />
       <PreviewStrip content={previewContent} />

@@ -6,6 +6,7 @@ export interface CommitGraphRow {
   activeBefore: number[]
   activeAfter: number[]
   parentLanes: number[]
+  secondaryParentLanes: number[]
 }
 
 export interface CommitGraphLayout {
@@ -24,6 +25,10 @@ function trimTrailingEmptyLanes(lanes: Array<string | null>) {
   }
 }
 
+function laneIndices(lanes: Array<string | null>) {
+  return lanes.flatMap((value, index) => (value ? [index] : []))
+}
+
 export function buildCommitGraph(commits: CommitHistoryNode[]): CommitGraphLayout {
   const rows: CommitGraphRow[] = []
   let lanes: Array<string | null> = []
@@ -36,7 +41,7 @@ export function buildCommitGraph(commits: CommitHistoryNode[]): CommitGraphLayou
       lanes[lane] = commit.id
     }
 
-    const activeBefore = lanes.flatMap((value, index) => (value ? [index] : []))
+    const activeBefore = laneIndices(lanes)
     const nextLanes = [...lanes]
     const parentLanes: number[] = []
 
@@ -63,7 +68,8 @@ export function buildCommitGraph(commits: CommitHistoryNode[]): CommitGraphLayou
       }
     }
 
-    const activeAfter = nextLanes.flatMap((value, index) => (value ? [index] : []))
+    const activeAfter = laneIndices(nextLanes)
+    const secondaryParentLanes = parentLanes.filter((value, index) => index > 0 && value !== lane)
     laneCount = Math.max(
       laneCount,
       lane + 1,
@@ -78,6 +84,7 @@ export function buildCommitGraph(commits: CommitHistoryNode[]): CommitGraphLayou
       activeBefore,
       activeAfter,
       parentLanes,
+      secondaryParentLanes,
     })
 
     trimTrailingEmptyLanes(nextLanes)

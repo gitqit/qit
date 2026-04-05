@@ -1,0 +1,29 @@
+---
+title: FAQ
+description: Common questions about how Qit serves folders, handles auth, and applies incoming changes.
+slug: /faq
+sidebar_label: FAQ
+sidebar_position: 4
+---
+
+# FAQ
+
+## Do I need to turn my folder into a Git repository first?
+
+No. Qit is built for normal folders. It snapshots the folder into a hidden sidecar repository and serves that Git view without dropping `.git` into the host tree.
+
+## How do collaborators connect to a session?
+
+They use standard Git tooling against the served URL. For shared sessions, hand over the temporary username and password that Qit prints at startup.
+
+## Where do pushes land?
+
+Pushes update the sidecar repository first. That keeps the host folder safe until you explicitly apply the changes or enable auto-apply for a clean working tree.
+
+## Can I expose Qit beyond localhost?
+
+Yes. Qit supports local, ngrok, and Tailscale-oriented transport flows so you can choose between local-only collaboration and a broader share link.
+
+## Is Qit trying to replace GitHub?
+
+No. Qit is a lightweight sharing and review layer for a live folder. It focuses on serving, cloning, reviewing, and applying changes, not on replacing a hosted forge.

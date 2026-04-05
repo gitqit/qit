@@ -1,10 +1,13 @@
+mod serve_output;
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use qit_domain::{
     resolve_pull_request_refs, BranchInfo, CreatePullRequest, CreatePullRequestComment,
     CreatePullRequestReview, CredentialIssuer, PullRequestRecord, PullRequestReviewState,
-    PullRequestStatus, RefComparison, RefDiffFile, RepoReadStore, SessionCredentials, UiRole,
-    UpdatePullRequest, WorkspaceService, WorkspaceSpec, DEFAULT_BRANCH,
+    PullRequestStatus, RefComparison, RefDiffFile, RepoReadStore, RepositorySettings,
+    SessionCredentials, UiRole, UpdatePullRequest, UpdateRepositorySettings, UpsertBranchRule,
+    WorkspaceService, WorkspaceSpec, DEFAULT_BRANCH,
 };
 use qit_git::{GitHttpBackendAdapter, GitRepoStore};
 use qit_http::{repo_mount_path, GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
@@ -12,10 +15,14 @@ use qit_storage::FilesystemRegistry;
 use qit_transports::{expose, PublicTransport};
 use qit_webui::{WebUiConfig, WebUiServer};
 use rand::distributions::{Alphanumeric, DistString};
+use serve_output::{
+    clone_command, print_serve_summary, repo_name_from_worktree, repo_url,
+    repo_url_with_credentials, say, write_credentials_file,
+};
 use similar::TextDiff;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -62,13 +69,13 @@ struct Cli {
     #[arg(long)]
     auto_apply: bool,
 
-    /// Show the password in stdout and embed it in the suggested clone command.
-    #[arg(long)]
-    show_pass: bool,
-
-    /// Backward-compatible no-op alias; credentials are hidden by default.
-    #[arg(long, hide = true, conflicts_with = "show_pass")]
+    /// Hide the password from stdout and keep it in a local credentials file instead.
+    #[arg(long, conflicts_with = "show_pass")]
     hidden_pass: bool,
+
+    /// Backward-compatible alias; passwords are shown by default.
+    #[arg(long, hide = true)]
+    show_pass: bool,
 
     /// Local port for Git Smart HTTP.
     #[arg(long, default_value_t = 8080, hide = true)]
@@ -215,6 +222,11 @@ enum Commands {
     Pr {
         #[command(subcommand)]
         command: PrCommands,
+    },
+    /// View and edit repository settings.
+    Settings {
+        #[command(subcommand)]
+        command: SettingsCommands,
     },
 }
 
@@ -381,6 +393,65 @@ enum PrCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum SettingsCommands {
+    /// Show repository metadata, default branch, and branch rules.
+    View {
+        /// Folder previously published with qit.
+        path: PathBuf,
+    },
+    /// Update repository metadata or the default branch.
+    Set {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Replace the repository description.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Replace the homepage URL.
+        #[arg(long)]
+        homepage: Option<String>,
+
+        /// Change the served/default branch.
+        #[arg(long)]
+        default_branch: Option<String>,
+    },
+    /// List, add, or remove branch rules.
+    Rule {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Branch pattern for the rule to add or update.
+        #[arg(long)]
+        pattern: Option<String>,
+
+        /// Delete a branch rule by pattern.
+        #[arg(long, conflicts_with = "pattern")]
+        delete: Option<String>,
+
+        /// Require pull requests before merge.
+        #[arg(long)]
+        require_pr: bool,
+
+        /// Minimum approvals required before merge.
+        #[arg(long)]
+        approvals: Option<u8>,
+
+        /// Ignore approvals after new commits land on the source branch.
+        #[arg(long)]
+        dismiss_stale: bool,
+
+        /// Reject non-fast-forward pushes.
+        #[arg(long)]
+        block_force_push: bool,
+
+        /// Reject branch deletion.
+        #[arg(long)]
+        block_delete: bool,
+    },
+}
+
 struct RandomCredentialIssuer;
 
 impl CredentialIssuer for RandomCredentialIssuer {
@@ -394,109 +465,6 @@ impl CredentialIssuer for RandomCredentialIssuer {
             password: Alphanumeric.sample_string(&mut rng, 24),
         }
     }
-}
-
-fn say(message: &str) {
-    println!("{message}");
-    let _ = std::io::stdout().flush();
-}
-
-fn repo_name_from_worktree(worktree: &std::path::Path) -> String {
-    worktree
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("repo")
-        .to_string()
-}
-
-fn repo_url(base: &Url, repo_mount_path: &str) -> Result<Url> {
-    let mut url = base.clone();
-    url.set_path(repo_mount_path);
-    Ok(url)
-}
-
-fn clone_command(public_url: &Url, transport: PublicTransport) -> String {
-    let repo_url = public_url.as_str().trim_end_matches('/').to_string();
-    match transport {
-        PublicTransport::Ngrok => {
-            format!("git -c http.extraHeader=\"ngrok-skip-browser-warning: 1\" clone {repo_url}/")
-        }
-        _ => format!("git clone {repo_url}/"),
-    }
-}
-
-fn repo_url_with_credentials(
-    public_url: &Url,
-    credentials: &SessionCredentials,
-    show_pass: bool,
-) -> Result<Url> {
-    let mut url = public_url.clone();
-    if !show_pass {
-        return Ok(url);
-    }
-    url.set_username(&credentials.username)
-        .map_err(|_| anyhow!("failed to encode username in clone URL"))?;
-    url.set_password(Some(&credentials.password))
-        .map_err(|_| anyhow!("failed to encode password in clone URL"))?;
-    Ok(url)
-}
-
-fn write_credentials_file(credentials: &SessionCredentials) -> Result<PathBuf> {
-    let mut file = tempfile::Builder::new()
-        .prefix("qit-credentials-")
-        .suffix(".txt")
-        .tempfile()
-        .context("create credentials file")?;
-    writeln!(file, "username: {}", credentials.username)?;
-    writeln!(file, "password: {}", credentials.password)?;
-    file.flush()?;
-    let (_persisted, path) = file
-        .keep()
-        .map_err(|error| anyhow::Error::new(error.error))?;
-    Ok(path)
-}
-
-fn print_serve_summary(
-    worktree: &Path,
-    exported_branch: &str,
-    label: &str,
-    public_url: &Url,
-    local_browser_url: &Url,
-    browser_url: &Url,
-    credentials: &SessionCredentials,
-    credentials_path: &Path,
-    show_pass: bool,
-    clone_cmd: &str,
-    auto_apply: bool,
-) {
-    println!();
-    println!("Serving");
-    println!("  path: {}", worktree.display());
-    println!("  branch: {exported_branch}");
-    println!("  transport: {}", label.to_ascii_lowercase());
-    if auto_apply {
-        println!("  auto-apply: on");
-    }
-    println!();
-    println!("Web UI");
-    println!("  local: {}", local_browser_url.as_str().trim_end_matches('/'));
-    if local_browser_url != browser_url {
-        println!("  public: {}", browser_url.as_str().trim_end_matches('/'));
-    }
-    println!();
-    println!("Git");
-    println!("  repo: {}/", public_url.as_str().trim_end_matches('/'));
-    println!("  clone: {clone_cmd}");
-    println!();
-    println!("Session");
-    println!("  username: {}", credentials.username);
-    if show_pass {
-        println!("  password: {}", credentials.password);
-    } else {
-        println!("  password: hidden (see file)");
-    }
-    println!("  file: {}", credentials_path.display());
 }
 
 fn print_branch_list(branches: &[BranchInfo], verbose: u8) {
@@ -521,6 +489,77 @@ fn print_branch_list(branches: &[BranchInfo], verbose: u8) {
                 branch.name, branch.summary
             ));
         }
+    }
+}
+
+fn format_branch_rule_summary(
+    pattern: &str,
+    require_pull_request: bool,
+    required_approvals: u8,
+    dismiss_stale_approvals: bool,
+    block_force_push: bool,
+    block_delete: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if require_pull_request || required_approvals > 0 {
+        parts.push("require PR".to_string());
+    }
+    if required_approvals > 0 {
+        parts.push(format!("{required_approvals} approval(s)"));
+    }
+    if dismiss_stale_approvals {
+        parts.push("dismiss stale approvals".to_string());
+    }
+    if block_force_push {
+        parts.push("block force-push".to_string());
+    }
+    if block_delete {
+        parts.push("block delete".to_string());
+    }
+    let summary = if parts.is_empty() {
+        "no protections".to_string()
+    } else {
+        parts.join(", ")
+    };
+    format!("{pattern}: {summary}")
+}
+
+fn print_repository_settings(workspace: &WorkspaceSpec, settings: &RepositorySettings) {
+    say(&format!("settings for {}:", workspace.worktree.display()));
+    say(&format!("  default branch: {}", workspace.exported_branch));
+    say(&format!(
+        "  description: {}",
+        if settings.description.is_empty() {
+            "not set"
+        } else {
+            &settings.description
+        }
+    ));
+    say(&format!(
+        "  homepage: {}",
+        if settings.homepage_url.is_empty() {
+            "not set"
+        } else {
+            &settings.homepage_url
+        }
+    ));
+    say("  branch rules:");
+    if settings.branch_rules.is_empty() {
+        say("    none");
+        return;
+    }
+    for rule in &settings.branch_rules {
+        say(&format!(
+            "    - {}",
+            format_branch_rule_summary(
+                &rule.pattern,
+                rule.require_pull_request,
+                rule.required_approvals,
+                rule.dismiss_stale_approvals,
+                rule.block_force_push,
+                rule.block_delete,
+            )
+        ));
     }
 }
 
@@ -973,6 +1012,100 @@ async fn main() -> Result<()> {
                 ));
                 return Ok(());
             }
+            Commands::Settings { command } => match command {
+                SettingsCommands::View { path } => {
+                    let (workspace, settings) =
+                        service.read_repository_settings(path, default_branch)?;
+                    print_repository_settings(&workspace, &settings);
+                    return Ok(());
+                }
+                SettingsCommands::Set {
+                    path,
+                    description,
+                    homepage,
+                    default_branch: next_default_branch,
+                } => {
+                    let mut final_workspace = service.resolve_workspace(path.clone(), default_branch)?;
+                    if description.is_some() || homepage.is_some() {
+                        let (workspace, settings) = service.update_repository_settings(
+                            path.clone(),
+                            default_branch,
+                            UpdateRepositorySettings {
+                                description,
+                                homepage_url: homepage,
+                            },
+                        )?;
+                        final_workspace = workspace;
+                        say("updated repository metadata");
+                        print_repository_settings(&final_workspace, &settings);
+                    }
+                    if let Some(branch_name) = next_default_branch {
+                        let (workspace, outcome) =
+                            service.switch_branch(path, default_branch, &branch_name).await?;
+                        final_workspace = workspace;
+                        say(&format!(
+                            "switched default branch from `{}` to `{}` at `{}`",
+                            outcome.previous_branch, outcome.current_branch, outcome.commit
+                        ));
+                    }
+                    let (_, settings) = service.read_repository_settings(
+                        final_workspace.worktree.clone(),
+                        &final_workspace.exported_branch,
+                    )?;
+                    print_repository_settings(&final_workspace, &settings);
+                    return Ok(());
+                }
+                SettingsCommands::Rule {
+                    path,
+                    pattern,
+                    delete,
+                    require_pr,
+                    approvals,
+                    dismiss_stale,
+                    block_force_push,
+                    block_delete,
+                } => {
+                    if let Some(pattern) = delete {
+                        let (workspace, settings) =
+                            service.delete_branch_rule(path, default_branch, &pattern)?;
+                        say(&format!("deleted branch rule `{pattern}`"));
+                        print_repository_settings(&workspace, &settings);
+                        return Ok(());
+                    }
+                    if let Some(pattern) = pattern {
+                        let approvals = approvals.unwrap_or(0);
+                        let (workspace, settings) = service.upsert_branch_rule(
+                            path,
+                            default_branch,
+                            UpsertBranchRule {
+                                pattern: pattern.clone(),
+                                require_pull_request: require_pr,
+                                required_approvals: approvals,
+                                dismiss_stale_approvals: dismiss_stale,
+                                block_force_push,
+                                block_delete,
+                            },
+                        )?;
+                        say(&format!(
+                            "saved branch rule `{}`",
+                            format_branch_rule_summary(
+                                &pattern,
+                                require_pr,
+                                approvals,
+                                dismiss_stale,
+                                block_force_push,
+                                block_delete,
+                            )
+                        ));
+                        print_repository_settings(&workspace, &settings);
+                        return Ok(());
+                    }
+                    let (workspace, settings) =
+                        service.read_repository_settings(path, default_branch)?;
+                    print_repository_settings(&workspace, &settings);
+                    return Ok(());
+                }
+            },
             Commands::Pr { command } => {
                 match command {
                     PrCommands::List { path, state } => {
@@ -1311,7 +1444,8 @@ async fn main() -> Result<()> {
         .await?;
     let workspace = prepared.workspace.clone();
     let credentials = prepared.credentials.clone();
-    let credentials_path = write_credentials_file(&credentials)?;
+    let reveal_password = !cli.hidden_pass;
+    let credentials_path = write_credentials_file(&credentials, !reveal_password)?;
     let repo_mount_path = repo_mount_path(&repo_name_from_worktree(&workspace.worktree));
 
     let addr = SocketAddr::from_str(&format!("127.0.0.1:{}", cli.port)).expect("valid socket addr");
@@ -1331,8 +1465,6 @@ async fn main() -> Result<()> {
     } else {
         "https".to_string()
     };
-    let show_pass = cli.show_pass;
-
     let git_router = GitHttpServer::new(
         Arc::new(GitHttpBackendAdapter),
         registry_store,
@@ -1350,7 +1482,7 @@ async fn main() -> Result<()> {
     let local_browser_url = repo_url(&local_url, &repo_mount_path)?;
     let endpoint = expose(transport, &local_url).await?;
     let public_repo_url = repo_url(&endpoint.public_url, &repo_mount_path)?;
-    let clone_url = repo_url_with_credentials(&public_repo_url, &credentials, show_pass)?;
+    let clone_url = repo_url_with_credentials(&public_repo_url, &credentials, reveal_password)?;
     let clone_cmd = clone_command(&clone_url, transport);
     let web_router = WebUiServer::new(
         repo_store.clone(),
@@ -1386,8 +1518,8 @@ async fn main() -> Result<()> {
         &local_browser_url,
         &public_repo_url,
         &credentials,
-        &credentials_path,
-        show_pass,
+        credentials_path.as_deref(),
+        reveal_password,
         &clone_cmd,
         cli.auto_apply,
     );

@@ -16,6 +16,8 @@ export interface ShellTab {
 export function AppShell({
   actor,
   repoName,
+  repoDescription,
+  repoHomepageUrl,
   checkedOutBranch,
   exportedBranch,
   branchCount,
@@ -26,6 +28,8 @@ export function AppShell({
 }: {
   actor: string
   repoName: string
+  repoDescription?: string
+  repoHomepageUrl?: string | null
   checkedOutBranch: string
   exportedBranch: string
   branchCount: number
@@ -42,6 +46,9 @@ export function AppShell({
 
   return (
     <div className="min-h-screen bg-canvas text-fg">
+      <a className="skip-link" href="#qit-main">
+        Skip to content
+      </a>
       <header className="border-b border-border/80 bg-canvas-raised/90 backdrop-blur">
         <div className="mx-auto max-w-7xl px-5 sm:px-6">
           <div className="flex flex-col gap-6 py-5">
@@ -49,11 +56,9 @@ export function AppShell({
               <div className="flex min-w-0 items-center gap-3 sm:gap-4">
                 <BrandLogo className="h-11 sm:h-12" />
                 <div className="hidden h-8 w-px shrink-0 bg-border sm:block" />
-                <div className="min-w-0 flex-wrap items-center gap-2 text-sm sm:flex">
-                  <span className="hidden font-medium text-fg sm:inline">Repository</span>
-                  <span className="hidden text-fg-subtle sm:inline">/</span>
-                  <span className="block truncate font-medium text-fg-muted">{repoName}</span>
-                </div>
+                <span className="block min-w-0 truncate text-sm font-medium text-fg-muted">
+                  {repoName}
+                </span>
               </div>
               <span className="rounded-full border border-border bg-panel px-2.5 py-1 text-xs font-semibold text-fg-muted">
                 {actor === 'owner' ? 'Owner session' : 'Shared session'}
@@ -62,19 +67,22 @@ export function AppShell({
 
             <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
               <div className="space-y-2">
-                <div className="flex flex-wrap items-center gap-2 text-sm text-fg-muted">
-                  <span>Repository</span>
-                  <span className="text-fg-subtle">/</span>
-                  <span className="font-medium text-fg">{repoName}</span>
-                </div>
                 <h1 className="text-4xl font-semibold tracking-tight text-fg sm:text-5xl">{repoName}</h1>
                 <p className="max-w-2xl text-sm leading-6 text-fg-muted sm:text-base">
-                  Browse the published snapshot, inspect branch and pull-request state, and copy the exact clone credentials for this session.
+                  {repoDescription || 'Browse the published snapshot, inspect branch and pull-request state, and hand off the served clone details when collaborators need them.'}
                 </p>
                 <div className="flex flex-wrap items-center gap-2 text-sm text-fg-muted">
                   <span>{branchCount} branches</span>
                   <span className="text-fg-subtle">•</span>
                   <span>{pullRequestCount} pull requests</span>
+                  {repoHomepageUrl ? (
+                    <>
+                      <span className="text-fg-subtle">•</span>
+                      <a className="text-accent hover:text-accent-strong" href={repoHomepageUrl} rel="noreferrer" target="_blank">
+                        Homepage
+                      </a>
+                    </>
+                  ) : null}
                 </div>
               </div>
 
@@ -91,7 +99,7 @@ export function AppShell({
         </div>
       </header>
 
-      <main className="mx-auto max-w-7xl px-5 py-6 sm:px-6 sm:py-8">
+      <main className="mx-auto max-w-7xl px-5 py-6 sm:px-6 sm:py-8" id="qit-main">
         <TabGroup
           onChange={(index) => {
             const nextTab = tabs[index]

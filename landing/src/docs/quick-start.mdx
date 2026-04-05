@@ -1,0 +1,60 @@
+---
+title: Quick Start
+description: Start a Qit session for any folder and hand collaborators a standard Git clone command.
+slug: /quick-start
+sidebar_label: Quick start
+sidebar_position: 2
+---
+
+# Quick Start
+
+Qit serves a folder without converting the host tree into a normal Git working copy. It snapshots the folder into a hidden sidecar repository, exposes that snapshot over authenticated Git Smart HTTP, and keeps the host files unchanged until you decide to apply incoming work.
+
+## Serve a folder
+
+Run Qit with the path you want to share:
+
+```bash
+qit ./my-app
+```
+
+Typical startup output includes:
+
+```text
+Serving
+  path: ./my-app
+  branch: main
+  transport: local
+
+Web UI
+  local: http://127.0.0.1:8080/my-app
+
+Git
+  repo: http://127.0.0.1:8080/my-app/
+  clone: git clone http://session-owner:temporary-pass@127.0.0.1:8080/my-app/
+
+Session
+  username: session-owner
+  password: temporary-pass
+```
+
+## Share the session
+
+Give collaborators the clone URL plus the temporary username and password printed for the session:
+
+```bash
+git clone http://127.0.0.1:8080/my-app
+```
+
+If you prefer not to print the password in the terminal, start Qit with `--hidden-pass`. That keeps the password in a local credentials file and leaves the suggested clone command uncredentialed.
+
+They can then use normal Git commands such as `git fetch`, `git pull`, and `git push`.
+
+## Review before applying
+
+Pushes land in the sidecar repository first. That means you can inspect changes in the Web UI or CLI flow before applying them back to the host folder.
+
+## Keep reading
+
+- [Sharing and auth](/docs/sharing-and-auth)
+- [FAQ](/docs/faq)

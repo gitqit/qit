@@ -73,6 +73,23 @@ pre {
   outline-offset: 2px;
 }
 
+.skip-link {
+  position: absolute;
+  left: 1rem;
+  top: 1rem;
+  z-index: 50;
+  transform: translateY(-140%);
+  border-radius: var(--radius-token);
+  background: var(--color-accent);
+  color: var(--color-canvas);
+  padding: 0.75rem 1rem;
+  transition: transform 160ms ease;
+}
+
+.skip-link:focus-visible {
+  transform: translateY(0);
+}
+
 .markdown-body {
   color: var(--color-fg);
   font-size: 0.975rem;
@@ -174,4 +191,15 @@ pre {
 
 .markdown-body th {
   background: var(--color-panel-subtle);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }

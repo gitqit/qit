@@ -53,6 +53,27 @@ export const api = {
     await requestJson<void>('/api/session/logout', { method: 'POST' })
   },
   settings: () => requestJson<SettingsResponse>('/api/settings'),
+  updateSettings: (payload: { description?: string; homepage_url?: string }) =>
+    requestJson<SettingsResponse>('/api/settings', {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+  upsertBranchRule: (payload: {
+    pattern: string
+    require_pull_request: boolean
+    required_approvals: number
+    dismiss_stale_approvals: boolean
+    block_force_push: boolean
+    block_delete: boolean
+  }) =>
+    requestJson<SettingsResponse>('/api/settings/branch-rules', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  deleteBranchRule: (pattern: string) =>
+    requestJson<SettingsResponse>(`/api/settings/branch-rules/${encodeURIComponent(pattern)}`, {
+      method: 'DELETE',
+    }),
   branches: async () => (await requestJson<BranchesResponse>('/api/branches')).branches,
   createBranch: (name: string, startPoint: string, force: boolean) =>
     requestJson('/api/branches', {
@@ -102,6 +123,11 @@ export const api = {
     return requestJson<BlobResponse>(`/api/code/blob?${query.toString()}`).then(
       (response) => response.blob,
     )
+  },
+  rawBlobUrl: (reference: string | undefined, path: string) => {
+    const query = new URLSearchParams({ path })
+    if (reference) query.set('reference', reference)
+    return `${baseUrl}/api/code/raw?${query.toString()}`
   },
   compare: (base: string, head: string) =>
     requestJson<CompareResponse>(

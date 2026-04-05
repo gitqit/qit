@@ -52,7 +52,7 @@ cargo run --manifest-path Cargo.toml -p qit -- --transport local ./my-app
 3. snapshot the folder into the host folder's checked-out branch
 4. start Git Smart HTTP
 5. generate a fresh session username and password
-6. print the repo URL, a local credentials file path, and a clone command
+6. print the repo URL, session username and password, and a clone command
 
 Clone from another machine or terminal:
 
@@ -60,7 +60,7 @@ Clone from another machine or terminal:
 git clone http://127.0.0.1:8080/my-app
 ```
 
-`qit` hides the password from stdout and omits it from the suggested clone command by default. Pass `--show-pass` if you explicitly want stdout to print the password and embed credentials in the clone command.
+`qit` shows the session username and password in stdout and embeds them in the suggested clone command by default. Pass `--hidden-pass` if you want stdout to hide the password and keep it only in a local credentials file.
 
 ## Commands
 
@@ -123,8 +123,10 @@ Unlike the current LocalCollab build, `qit` does not default to anonymous access
 - every server session generates a fresh username and password
 - authentication uses HTTP Basic Auth so standard Git clients can use normal clone and push commands
 - credentials live only for the lifetime of the serving process
-- credentials are written to a local file; stdout hides the password by default and the suggested clone command is uncredentialed unless you pass `--show-pass`
+- by default the startup summary prints the session username and password and includes them in the suggested clone command
+- `--hidden-pass` switches the CLI to a safer local-only mode that hides the password from stdout and writes it to a local credentials file with restricted permissions when supported
 - the Web UI enters as owner automatically only in local-only mode; exposed sessions must authenticate explicitly
+- exposed Web UI sessions do not echo Git credentials back to non-owner browser sessions after login; the operator remains the source of truth for handing those credentials out
 - pushes still land in the sidecar repository first
 - host-folder writes still require `apply` or `--auto-apply`
 

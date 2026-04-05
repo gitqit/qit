@@ -128,12 +128,7 @@ async fn wait_for_ngrok_url(
         ));
     }
 
-    let trimmed = public.trim_end_matches('/').to_string();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        Ok(trimmed)
-    } else {
-        Ok(format!("https://{trimmed}"))
-    }
+    Ok(normalize_public_url(&public))
 }
 
 fn run_tailscale(args: &[&str]) -> anyhow::Result<Output> {
@@ -168,13 +163,57 @@ fn tailscale_public_url() -> anyhow::Result<String> {
     let output = run_tailscale(&["status", "--json"])?;
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("parse `tailscale status --json`")?;
-    let dns_name = value
+    let dns_name = parse_tailscale_dns_name(&value)
+        .context("could not determine this machine's Tailscale DNS name")?;
+
+    Ok(format!("https://{dns_name}"))
+}
+
+fn normalize_public_url(public: &str) -> String {
+    let trimmed = public.trim().trim_end_matches('/').to_string();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
+fn parse_tailscale_dns_name(value: &serde_json::Value) -> Option<String> {
+    value
         .get("Self")
         .and_then(|self_obj| self_obj.get("DNSName"))
         .and_then(|dns_name| dns_name.as_str())
         .map(|name| name.trim_end_matches('.').to_string())
         .filter(|name| !name.is_empty())
-        .context("could not determine this machine's Tailscale DNS name")?;
+}
 
-    Ok(format!("https://{dns_name}"))
+#[cfg(test)]
+mod tests {
+    use super::{normalize_public_url, parse_tailscale_dns_name};
+    use serde_json::json;
+
+    #[test]
+    fn normalize_public_url_adds_https_and_trims_slashes() {
+        assert_eq!(
+            normalize_public_url("demo.ngrok.app/"),
+            "https://demo.ngrok.app"
+        );
+        assert_eq!(
+            normalize_public_url("https://demo.ngrok.app/"),
+            "https://demo.ngrok.app"
+        );
+    }
+
+    #[test]
+    fn parse_tailscale_dns_name_reads_self_dns_name() {
+        let payload = json!({
+            "Self": {
+                "DNSName": "host.tailnet.ts.net."
+            }
+        });
+        assert_eq!(
+            parse_tailscale_dns_name(&payload).as_deref(),
+            Some("host.tailnet.ts.net")
+        );
+    }
 }

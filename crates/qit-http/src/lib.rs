@@ -11,6 +11,7 @@ use qit_domain::{RegistryStore, SessionCredentials, WorkspaceService, WorkspaceS
 use qit_http_backend::{
     GitHttpBackend, GitHttpBackendError, GitHttpBackendRequest, GitHttpBackendResponse,
 };
+use std::fs;
 use std::io;
 use std::sync::Arc;
 use tokio_stream::StreamExt;
@@ -18,6 +19,51 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{info, warn};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+fn update_hook_script() -> &'static str {
+    r#"#!/bin/sh
+refname="$1"
+oldrev="$2"
+newrev="$3"
+
+case "$refname" in
+  refs/heads/*) ;;
+  *) exit 0 ;;
+esac
+
+rules_file="${GIT_DIR:-.}/qit-branch-rules"
+[ -f "$rules_file" ] || exit 0
+
+branch="${refname#refs/heads/}"
+zeros="0000000000000000000000000000000000000000"
+matched_force=0
+matched_delete=0
+
+while IFS="$(printf '\t')" read -r pattern block_force_push block_delete; do
+  [ -n "$pattern" ] || continue
+  case "$branch" in
+    $pattern)
+      [ "$block_force_push" = "1" ] && matched_force=1
+      [ "$block_delete" = "1" ] && matched_delete=1
+      ;;
+  esac
+done < "$rules_file"
+
+if [ "$newrev" = "$zeros" ] && [ "$matched_delete" = "1" ]; then
+  echo "qit: deleting protected branch '$branch' is not allowed" >&2
+  exit 1
+fi
+
+if [ "$matched_force" = "1" ] && [ "$oldrev" != "$zeros" ] && [ "$newrev" != "$zeros" ]; then
+  if ! git merge-base --is-ancestor "$oldrev" "$newrev" >/dev/null 2>&1; then
+    echo "qit: force-pushing protected branch '$branch' is not allowed" >&2
+    exit 1
+  fi
+fi
+
+exit 0
+"#
+}
 
 pub struct GitHttpServerConfig {
     pub workspace: WorkspaceSpec,
@@ -72,6 +118,38 @@ impl GitHttpServer {
             });
         }
         Ok(self.workspace.clone())
+    }
+
+    fn sync_push_rules(&self, workspace: &WorkspaceSpec) -> Result<(), io::Error> {
+        let (_, settings) = self
+            .workspace_service
+            .read_repository_settings(workspace.worktree.clone(), &workspace.exported_branch)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        let hooks_dir = workspace.sidecar.join("hooks");
+        fs::create_dir_all(&hooks_dir)?;
+        let rules_path = workspace.sidecar.join("qit-branch-rules");
+        let hook_path = hooks_dir.join("update");
+        let mut rules = String::new();
+        for rule in settings.branch_rules {
+            if rule.block_delete || rule.block_force_push {
+                rules.push_str(&format!(
+                    "{}\t{}\t{}\n",
+                    rule.pattern,
+                    if rule.block_force_push { "1" } else { "0" },
+                    if rule.block_delete { "1" } else { "0" }
+                ));
+            }
+        }
+        fs::write(&rules_path, rules)?;
+        fs::write(&hook_path, update_hook_script())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&hook_path)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&hook_path, permissions)?;
+        }
+        Ok(())
     }
 
     pub fn git_router(self) -> Router {
@@ -200,6 +278,18 @@ impl GitHttpServer {
         let query = uri.query().map(ToString::to_string);
         let is_receive_pack =
             method == axum::http::Method::POST && path_info.ends_with("git-receive-pack");
+        if is_receive_pack {
+            self.sync_push_rules(&workspace).map_err(|error| {
+                warn!(
+                    method = %method,
+                    path = %uri.path(),
+                    worktree = %workspace.worktree.display(),
+                    %error,
+                    "failed to sync branch protection hooks before push"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
         let request_scheme = request_scheme(&self.request_scheme);
         let content_length = req
             .headers()

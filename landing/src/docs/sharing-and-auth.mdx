@@ -1,0 +1,39 @@
+---
+title: Sharing and Auth
+description: Understand how Qit session URLs, temporary credentials, and sidecar-first review work when you share a folder.
+slug: /sharing-and-auth
+sidebar_label: Sharing and auth
+sidebar_position: 3
+---
+
+# Sharing and Auth
+
+Qit keeps the collaboration model intentionally small: standard Git clients, session-scoped credentials, and a sidecar-first apply flow.
+
+## Session credentials
+
+Every shared session starts with fresh credentials. Qit prints the username and password in the terminal so you can hand them off with the clone command.
+
+## Localhost versus exposed sessions
+
+The local Web UI is intended to be easy to open on `localhost`, but exposed transports still require Web UI authentication. If you share Qit through LAN, ngrok, or Tailscale, expect the browser experience to stay behind the session login gate.
+
+## Standard Git transport
+
+Collaborators do not need a custom sync client. They connect with plain Git Smart HTTP:
+
+```bash
+git clone http://host-or-tunnel/example-project
+git fetch
+git push
+```
+
+## Sidecar-first review flow
+
+Qit separates the published Git view from the folder you are editing:
+
+1. Snapshot the host folder into a hidden sidecar repository.
+2. Accept remote pushes into the sidecar first.
+3. Apply those changes back to the host folder when you are ready.
+
+That separation keeps the host tree readable and makes the collaboration surface easier to reason about.

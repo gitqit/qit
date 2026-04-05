@@ -1,0 +1,44 @@
+---
+title: Install Qit
+description: Download a release binary or build Qit from source so you can share a folder in one command.
+slug: /install
+sidebar_label: Install
+sidebar_position: 1
+---
+
+# Install Qit
+
+Qit is designed to be fast to try: download a release, point it at a folder, and get a temporary authenticated Git remote plus a local Web UI.
+
+## Download a release
+
+The default path is to use a published binary from the [Qit releases](https://github.com/flynnemon/qit/releases) page.
+
+1. Download the archive for your platform.
+2. Extract the `qit` binary somewhere on your `PATH`.
+3. Confirm the binary is available:
+
+```bash
+qit --help
+```
+
+## Build from source
+
+If you prefer to build locally, clone the repo and compile the CLI:
+
+```bash
+git clone https://github.com/flynnemon/qit.git
+cd qit
+cargo build --release
+./target/release/qit --help
+```
+
+## What you need
+
+- A normal project folder you want to share.
+- Git installed on the host machine.
+- A recent browser if you want to use the local Web UI.
+
+## Next step
+
+Once Qit is installed, continue to the [quick start](/docs/quick-start).

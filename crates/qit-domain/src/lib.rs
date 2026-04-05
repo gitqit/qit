@@ -1,3 +1,5 @@
+mod branch_rules;
+
 use async_trait::async_trait;
 use fs2::FileExt;
 use git2::Repository;
@@ -10,6 +12,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const DEFAULT_BRANCH: &str = "main";
+pub use branch_rules::{BranchProtection, BranchRule};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -54,6 +57,16 @@ pub struct WorkspaceLockGuard {
 pub struct SessionCredentials {
     pub username: String,
     pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RepositorySettings {
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub homepage_url: String,
+    #[serde(default)]
+    pub branch_rules: Vec<BranchRule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +168,10 @@ pub struct PullRequestActivityRecord {
     pub title: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub source_commit: Option<String>,
+    #[serde(default)]
+    pub target_commit: Option<String>,
     pub created_at_ms: u64,
 }
 
@@ -242,10 +259,28 @@ pub struct CreatePullRequestReview {
     pub state: PullRequestReviewState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdateRepositorySettings {
+    pub description: Option<String>,
+    pub homepage_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsertBranchRule {
+    pub pattern: String,
+    pub require_pull_request: bool,
+    pub required_approvals: u8,
+    pub dismiss_stale_approvals: bool,
+    pub block_force_push: bool,
+    pub block_delete: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct WorkspaceWebUiState {
     #[serde(default)]
     pub pull_requests: Vec<PullRequestRecord>,
+    #[serde(default)]
+    pub repository: RepositorySettings,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -364,6 +399,10 @@ pub enum DomainError {
     Repository(#[source] RepositoryError),
     #[error("invalid pull request state: {0}")]
     InvalidPullRequest(String),
+    #[error("invalid repository settings: {0}")]
+    InvalidSettings(String),
+    #[error("branch rule blocked the operation: {0}")]
+    BranchRuleViolation(String),
     #[error(
         "refusing to serve existing Git worktree {0}; rerun with --allow-existing-git to opt in"
     )]
@@ -591,6 +630,10 @@ impl WorkspaceService {
         Ok(normalized.to_string())
     }
 
+    fn normalize_optional(value: &str) -> String {
+        value.trim().to_string()
+    }
+
     fn push_activity(
         pull_request: &mut PullRequestRecord,
         kind: PullRequestActivityKind,
@@ -600,6 +643,8 @@ impl WorkspaceService {
         review_state: Option<PullRequestReviewState>,
         title: Option<String>,
         description: Option<String>,
+        source_commit: Option<String>,
+        target_commit: Option<String>,
         created_at_ms: u64,
     ) {
         pull_request.activities.push(PullRequestActivityRecord {
@@ -611,8 +656,57 @@ impl WorkspaceService {
             review_state,
             title,
             description,
+            source_commit,
+            target_commit,
             created_at_ms,
         });
+    }
+
+    fn normalize_branch_rule(rule: UpsertBranchRule) -> Result<BranchRule, DomainError> {
+        let pattern = branch_rules::normalize_branch_rule_pattern(&rule.pattern)?;
+        Ok(BranchRule {
+            pattern,
+            require_pull_request: rule.require_pull_request || rule.required_approvals > 0,
+            required_approvals: rule.required_approvals,
+            dismiss_stale_approvals: rule.dismiss_stale_approvals,
+            block_force_push: rule.block_force_push,
+            block_delete: rule.block_delete,
+        })
+    }
+
+    fn normalize_repository_settings(
+        settings: RepositorySettings,
+    ) -> Result<RepositorySettings, DomainError> {
+        let description = Self::normalize_optional(&settings.description);
+        if description.len() > 280 {
+            return Err(DomainError::InvalidSettings(
+                "repository description must be 280 characters or fewer".into(),
+            ));
+        }
+        let homepage_url = Self::normalize_optional(&settings.homepage_url);
+        if homepage_url.len() > 512 {
+            return Err(DomainError::InvalidSettings(
+                "homepage URL must be 512 characters or fewer".into(),
+            ));
+        }
+        let mut branch_rules = Vec::with_capacity(settings.branch_rules.len());
+        for rule in settings.branch_rules {
+            branch_rules.push(Self::normalize_branch_rule(UpsertBranchRule {
+                pattern: rule.pattern,
+                require_pull_request: rule.require_pull_request,
+                required_approvals: rule.required_approvals,
+                dismiss_stale_approvals: rule.dismiss_stale_approvals,
+                block_force_push: rule.block_force_push,
+                block_delete: rule.block_delete,
+            })?);
+        }
+        branch_rules.sort_by(|left, right| left.pattern.cmp(&right.pattern));
+        branch_rules.dedup_by(|left, right| left.pattern == right.pattern);
+        Ok(RepositorySettings {
+            description,
+            homepage_url,
+            branch_rules,
+        })
     }
 
     pub fn pull_request_comments(pull_request: &PullRequestRecord) -> Vec<PullRequestCommentRecord> {
@@ -669,8 +763,34 @@ impl WorkspaceService {
     pub fn pull_request_review_summary(
         pull_request: &PullRequestRecord,
     ) -> PullRequestReviewSummary {
+        Self::pull_request_review_summary_for_source(
+            pull_request,
+            pull_request.source_commit.as_deref(),
+            false,
+        )
+    }
+
+    pub fn pull_request_review_summary_for_source(
+        pull_request: &PullRequestRecord,
+        current_source_commit: Option<&str>,
+        dismiss_stale_approvals: bool,
+    ) -> PullRequestReviewSummary {
         let mut latest_by_reviewer: Vec<PullRequestReviewSummaryEntry> = Vec::new();
         for review in Self::pull_request_reviews(pull_request) {
+            if dismiss_stale_approvals {
+                let matching_review = pull_request.activities.iter().find(|activity| {
+                    activity.kind == PullRequestActivityKind::Reviewed
+                        && activity.id == review.id
+                });
+                if let Some(source_commit) = current_source_commit {
+                    if matching_review
+                        .and_then(|activity| activity.source_commit.as_deref())
+                        .is_some_and(|review_commit| review_commit != source_commit)
+                    {
+                        continue;
+                    }
+                }
+            }
             if let Some(existing) = latest_by_reviewer.iter_mut().find(|entry| {
                 entry.actor_role == review.actor_role && entry.display_name == review.display_name
             }) {
@@ -708,6 +828,13 @@ impl WorkspaceService {
         }
     }
 
+    fn branch_head_commit(branches: &[BranchInfo], name: &str) -> Option<String> {
+        branches
+            .iter()
+            .find(|branch| branch.name == name)
+            .map(|branch| branch.commit.clone())
+    }
+
     fn lock_resolved_workspace(
         &self,
         workspace: &WorkspaceSpec,
@@ -719,23 +846,28 @@ impl WorkspaceService {
         patterns.is_empty()
             || patterns
                 .iter()
-                .any(|pattern| Self::glob_match(pattern.as_bytes(), name.as_bytes()))
+                .any(|pattern| branch_rules::glob_match(pattern.as_bytes(), name.as_bytes()))
     }
 
-    fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
-        if pattern.is_empty() {
-            return text.is_empty();
+    pub fn branch_protection(settings: &RepositorySettings, name: &str) -> BranchProtection {
+        let mut protection = BranchProtection::default();
+        for rule in settings
+            .branch_rules
+            .iter()
+            .filter(|rule| branch_rules::glob_match(rule.pattern.as_bytes(), name.as_bytes()))
+        {
+            protection.patterns.push(rule.pattern.clone());
+            protection.require_pull_request |= rule.require_pull_request;
+            protection.required_approvals =
+                protection.required_approvals.max(rule.required_approvals);
+            protection.dismiss_stale_approvals |= rule.dismiss_stale_approvals;
+            protection.block_force_push |= rule.block_force_push;
+            protection.block_delete |= rule.block_delete;
         }
-        match pattern[0] {
-            b'*' => {
-                Self::glob_match(&pattern[1..], text)
-                    || (!text.is_empty() && Self::glob_match(pattern, &text[1..]))
-            }
-            b'?' => !text.is_empty() && Self::glob_match(&pattern[1..], &text[1..]),
-            byte => {
-                !text.is_empty() && byte == text[0] && Self::glob_match(&pattern[1..], &text[1..])
-            }
+        if protection.required_approvals > 0 {
+            protection.require_pull_request = true;
         }
+        protection
     }
 
     pub fn new(
@@ -924,19 +1056,22 @@ impl WorkspaceService {
         &self,
         workspace: &WorkspaceSpec,
     ) -> Result<WorkspaceWebUiState, DomainError> {
-        Ok(self
+        let mut state = self
             .registry_store
             .load(workspace.id)
             .map_err(DomainError::Registry)?
             .map(|record| record.web_ui)
-            .unwrap_or_default())
+            .unwrap_or_default();
+        state.repository = Self::normalize_repository_settings(state.repository)?;
+        Ok(state)
     }
 
     fn save_workspace_with_web_ui(
         &self,
         workspace: &WorkspaceSpec,
-        web_ui: WorkspaceWebUiState,
+        mut web_ui: WorkspaceWebUiState,
     ) -> Result<(), DomainError> {
+        web_ui.repository = Self::normalize_repository_settings(web_ui.repository)?;
         self.registry_store
             .save(
                 workspace.id,
@@ -964,6 +1099,90 @@ impl WorkspaceService {
         let workspace = self.existing_workspace(path, fallback_branch)?;
         let web_ui = self.load_web_ui_state(&workspace)?;
         Ok((workspace, web_ui))
+    }
+
+    pub fn read_repository_settings(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+    ) -> Result<(WorkspaceSpec, RepositorySettings), DomainError> {
+        let (workspace, web_ui) = self.load_web_ui(path, fallback_branch)?;
+        Ok((workspace, web_ui.repository))
+    }
+
+    pub fn update_repository_settings(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        update: UpdateRepositorySettings,
+    ) -> Result<(WorkspaceSpec, RepositorySettings), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        if let Some(description) = update.description {
+            web_ui.repository.description = Self::normalize_optional(&description);
+        }
+        if let Some(homepage_url) = update.homepage_url {
+            web_ui.repository.homepage_url = Self::normalize_optional(&homepage_url);
+        }
+        web_ui.repository = Self::normalize_repository_settings(web_ui.repository)?;
+        let settings = web_ui.repository.clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, settings))
+    }
+
+    pub fn upsert_branch_rule(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        rule: UpsertBranchRule,
+    ) -> Result<(WorkspaceSpec, RepositorySettings), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let rule = Self::normalize_branch_rule(rule)?;
+        if let Some(existing) = web_ui
+            .repository
+            .branch_rules
+            .iter_mut()
+            .find(|existing| existing.pattern == rule.pattern)
+        {
+            *existing = rule;
+        } else {
+            web_ui.repository.branch_rules.push(rule);
+        }
+        web_ui.repository = Self::normalize_repository_settings(web_ui.repository)?;
+        let settings = web_ui.repository.clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, settings))
+    }
+
+    pub fn delete_branch_rule(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        pattern: &str,
+    ) -> Result<(WorkspaceSpec, RepositorySettings), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return Err(DomainError::InvalidSettings(
+                "branch rule pattern is required".into(),
+            ));
+        }
+        web_ui
+            .repository
+            .branch_rules
+            .retain(|rule| rule.pattern != pattern);
+        web_ui.repository = Self::normalize_repository_settings(web_ui.repository)?;
+        let settings = web_ui.repository.clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, settings))
     }
 
     pub async fn create_pull_request(
@@ -1016,6 +1235,8 @@ impl WorkspaceService {
             merged_commit: None,
             activities: Vec::new(),
         };
+        let opened_source_commit = pull_request.source_commit.clone();
+        let opened_target_commit = pull_request.target_commit.clone();
         Self::push_activity(
             &mut pull_request,
             PullRequestActivityKind::Opened,
@@ -1025,6 +1246,8 @@ impl WorkspaceService {
             None,
             None,
             None,
+            opened_source_commit,
+            opened_target_commit,
             timestamp,
         );
         web_ui.pull_requests.push(pull_request.clone());
@@ -1055,6 +1278,49 @@ impl WorkspaceService {
             return Ok((workspace, web_ui.pull_requests[index].clone()));
         }
 
+        let protection = Self::branch_protection(
+            &web_ui.repository,
+            &web_ui.pull_requests[index].target_branch,
+        );
+        let branches = self
+            .repo_store
+            .list_branches(&workspace)
+            .await
+            .map_err(DomainError::Repository)?
+            .into_iter()
+            .map(|record| BranchInfo {
+                is_current: record.name == workspace.checked_out_branch,
+                is_served: record.name == workspace.exported_branch,
+                commit: record.commit,
+                summary: record.summary,
+                name: record.name,
+            })
+            .collect::<Vec<_>>();
+        let current_source_commit = Self::branch_head_commit(
+            &branches,
+            &web_ui.pull_requests[index].source_branch,
+        );
+        if protection.required_approvals > 0 {
+            let summary = Self::pull_request_review_summary_for_source(
+                &web_ui.pull_requests[index],
+                current_source_commit.as_deref(),
+                protection.dismiss_stale_approvals,
+            );
+            if summary.changes_requested > 0 {
+                return Err(DomainError::BranchRuleViolation(format!(
+                    "`{}` still has requested changes",
+                    web_ui.pull_requests[index].target_branch
+                )));
+            }
+            if summary.approvals < protection.required_approvals as usize {
+                return Err(DomainError::BranchRuleViolation(format!(
+                    "`{}` requires {} approval(s) before merge",
+                    web_ui.pull_requests[index].target_branch,
+                    protection.required_approvals
+                )));
+            }
+        }
+
         let merged_commit = self
             .repo_store
             .merge_branch(
@@ -1073,6 +1339,8 @@ impl WorkspaceService {
             &mut web_ui.pull_requests[index],
             PullRequestActivityKind::Merged,
             UiRole::Owner,
+            None,
+            None,
             None,
             None,
             None,
@@ -1142,6 +1410,8 @@ impl WorkspaceService {
                 None,
                 Some(next_title),
                 Some(next_description),
+                None,
+                None,
                 timestamp,
             );
         }
@@ -1161,6 +1431,8 @@ impl WorkspaceService {
                         None,
                         None,
                         None,
+                        None,
+                        None,
                         timestamp,
                     );
                 }
@@ -1171,6 +1443,8 @@ impl WorkspaceService {
                         pull_request,
                         PullRequestActivityKind::Reopened,
                         actor_role,
+                        None,
+                        None,
                         None,
                         None,
                         None,
@@ -1236,6 +1510,8 @@ impl WorkspaceService {
             None,
             None,
             None,
+            None,
+            None,
             timestamp,
         );
         let pull_request = web_ui.pull_requests[index].clone();
@@ -1267,6 +1543,24 @@ impl WorkspaceService {
 
         let display_name = Self::normalize_required(&review.display_name, "display name")?;
         let body = review.body.trim().to_string();
+        let branches = self
+            .repo_store
+            .list_branches(&workspace)
+            .await
+            .map_err(DomainError::Repository)?
+            .into_iter()
+            .map(|record| BranchInfo {
+                is_current: record.name == workspace.checked_out_branch,
+                is_served: record.name == workspace.exported_branch,
+                commit: record.commit,
+                summary: record.summary,
+                name: record.name,
+            })
+            .collect::<Vec<_>>();
+        let source_commit =
+            Self::branch_head_commit(&branches, &web_ui.pull_requests[index].source_branch);
+        let target_commit =
+            Self::branch_head_commit(&branches, &web_ui.pull_requests[index].target_branch);
         let timestamp = Self::now_ms();
         web_ui.pull_requests[index].updated_at_ms = timestamp;
         Self::push_activity(
@@ -1278,6 +1572,8 @@ impl WorkspaceService {
             Some(review.state),
             None,
             None,
+            source_commit,
+            target_commit,
             timestamp,
         );
         let pull_request = web_ui.pull_requests[index].clone();
@@ -1422,6 +1718,14 @@ impl WorkspaceService {
         let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
         let _lock = self.lock_resolved_workspace(&initial_workspace)?;
         let workspace = self.existing_workspace(path, fallback_branch)?;
+        let web_ui = self.load_web_ui_state(&workspace)?;
+        let protection = Self::branch_protection(&web_ui.repository, name);
+        if protection.block_delete {
+            return Err(DomainError::BranchRuleViolation(format!(
+                "`{name}` cannot be deleted because it matches protected rule(s): {}",
+                protection.patterns.join(", ")
+            )));
+        }
         self.repo_store
             .delete_branch(&workspace, name, force)
             .await
@@ -1438,6 +1742,8 @@ impl WorkspaceService {
         let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
         let _lock = self.lock_resolved_workspace(&initial_workspace)?;
         let workspace = self.existing_workspace(path, fallback_branch)?;
+        let web_ui = self.load_web_ui_state(&workspace)?;
+        let _protection = Self::branch_protection(&web_ui.repository, name);
         let commit = self
             .repo_store
             .switch_branch(&workspace, name)
@@ -1660,18 +1966,26 @@ mod tests {
             &self,
             workspace: &WorkspaceSpec,
         ) -> Result<Vec<BranchRecord>, RepositoryError> {
-            Ok(vec![
-                BranchRecord {
-                    name: workspace.checked_out_branch.clone(),
-                    commit: "def456".into(),
-                    summary: "checked out".into(),
-                },
-                BranchRecord {
+            let mut branches = vec![BranchRecord {
+                name: workspace.checked_out_branch.clone(),
+                commit: "def456".into(),
+                summary: "checked out".into(),
+            }];
+            if workspace.exported_branch != workspace.checked_out_branch {
+                branches.push(BranchRecord {
                     name: workspace.exported_branch.clone(),
                     commit: "abc123".into(),
                     summary: "served".into(),
-                },
-            ])
+                });
+            }
+            if workspace.checked_out_branch != "feature" && workspace.exported_branch != "feature" {
+                branches.push(BranchRecord {
+                    name: "feature".into(),
+                    commit: "222222222222".into(),
+                    summary: "feature".into(),
+                });
+            }
+            Ok(branches)
         }
 
         async fn create_branch(
@@ -2266,5 +2580,154 @@ mod tests {
             .web_ui
             .pull_requests
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn repository_settings_round_trip_and_branch_rules_persist() {
+        let (_temp, registry, service) = service_with_workspace("main", "main");
+
+        let (_, settings) = service
+            .update_repository_settings(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                UpdateRepositorySettings {
+                    description: Some("Friendly repo".into()),
+                    homepage_url: Some("https://example.com/docs".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(settings.description, "Friendly repo");
+        assert_eq!(settings.homepage_url, "https://example.com/docs");
+
+        let (_, settings) = service
+            .upsert_branch_rule(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                UpsertBranchRule {
+                    pattern: "main".into(),
+                    require_pull_request: true,
+                    required_approvals: 2,
+                    dismiss_stale_approvals: true,
+                    block_force_push: true,
+                    block_delete: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(settings.branch_rules.len(), 1);
+        assert_eq!(settings.branch_rules[0].pattern, "main");
+
+        let stored = registry.records.lock().unwrap();
+        let record = stored.values().next().unwrap();
+        assert_eq!(record.web_ui.repository.description, "Friendly repo");
+        assert_eq!(
+            record.web_ui.repository.homepage_url,
+            "https://example.com/docs"
+        );
+        assert_eq!(record.web_ui.repository.branch_rules[0].required_approvals, 2);
+    }
+
+    #[tokio::test]
+    async fn protected_branch_delete_is_rejected() {
+        let (_temp, _registry, service) = service_with_workspace("main", "main");
+        service
+            .upsert_branch_rule(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                UpsertBranchRule {
+                    pattern: "main".into(),
+                    require_pull_request: false,
+                    required_approvals: 0,
+                    dismiss_stale_approvals: false,
+                    block_force_push: false,
+                    block_delete: true,
+                },
+            )
+            .unwrap();
+
+        let error = service
+            .delete_branch(PathBuf::from("."), DEFAULT_BRANCH, "main", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DomainError::BranchRuleViolation(_)));
+    }
+
+    #[tokio::test]
+    async fn branch_rules_reject_shell_sensitive_patterns() {
+        let (_temp, _registry, service) = service_with_workspace("main", "main");
+        let error = service
+            .upsert_branch_rule(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                UpsertBranchRule {
+                    pattern: "main; rm -rf /".into(),
+                    require_pull_request: false,
+                    required_approvals: 0,
+                    dismiss_stale_approvals: false,
+                    block_force_push: true,
+                    block_delete: true,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, DomainError::InvalidSettings(_)));
+    }
+
+    #[tokio::test]
+    async fn merge_requires_fresh_approvals_when_branch_rule_demands_it() {
+        let (_temp, _registry, service) = service_with_workspace("main", "feature");
+        service
+            .upsert_branch_rule(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                UpsertBranchRule {
+                    pattern: "main".into(),
+                    require_pull_request: true,
+                    required_approvals: 1,
+                    dismiss_stale_approvals: true,
+                    block_force_push: false,
+                    block_delete: false,
+                },
+            )
+            .unwrap();
+
+        let (_, created) = service
+            .create_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreatePullRequest {
+                    title: "Protected".into(),
+                    description: String::new(),
+                    source_branch: "feature".into(),
+                    target_branch: "main".into(),
+                },
+                UiRole::Owner,
+            )
+            .await
+            .unwrap();
+
+        service
+            .review_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &created.id,
+                CreatePullRequestReview {
+                    display_name: "Casey".into(),
+                    body: "Looks good".into(),
+                    state: PullRequestReviewState::Approved,
+                },
+                UiRole::Owner,
+            )
+            .await
+            .unwrap();
+
+        service
+            .checkout_branch(PathBuf::from("."), DEFAULT_BRANCH, "main")
+            .await
+            .unwrap();
+
+        let error = service
+            .merge_pull_request(PathBuf::from("."), DEFAULT_BRANCH, &created.id)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DomainError::BranchRuleViolation(_)));
     }
 }

@@ -1,31 +1,51 @@
+mod auth;
+
 use axum::extract::{Json, Path as AxumPath, Query, State};
-use axum::http::header::{CONTENT_TYPE, HOST, SET_COOKIE};
+use axum::http::header::{CONTENT_TYPE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use axum::response::{Html, IntoResponse};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{body::Body, Router};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use qit_domain::{
-    BlobContent, BranchInfo, CommitDetail, CommitHistory, CommitRefDecoration, CommitRefKind,
-    CreatePullRequest, CreatePullRequestComment, CreatePullRequestReview, PullRequestActivityRecord,
-    PullRequestRecord, PullRequestReviewRecord, PullRequestReviewState, PullRequestReviewSummary,
-    PullRequestStatus, RefComparison, RefDiffFile, RepoReadStore, SessionCredentials, UiRole,
-    UpdatePullRequest, WorkspaceService, WorkspaceSpec, WorkspaceWebUiState,
+    BlobContent, BranchInfo, CommitDetail, CommitHistory, CommitRefDecoration,
+    CommitRefKind, CreatePullRequest, CreatePullRequestComment, CreatePullRequestReview,
+    DomainError, PullRequestActivityRecord, PullRequestRecord, PullRequestReviewRecord,
+    PullRequestReviewState, PullRequestReviewSummary, PullRequestStatus, RefComparison, RefDiffFile,
+    RepoReadStore, RepositorySettings, SessionCredentials, UiRole, UpdatePullRequest,
+    UpdateRepositorySettings, UpsertBranchRule, WorkspaceService, WorkspaceSpec, WorkspaceWebUiState,
 };
 use rand::distributions::{Alphanumeric, DistString};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
-const APP_JS: &str = include_str!("../frontend/dist/assets/app.js");
-const APP_CSS: &str = include_str!("../frontend/dist/assets/index.css");
+#[cfg(test)]
+use axum::http::header::HOST;
+
+const APP_JS: &[u8] = include_bytes!("../frontend/dist/assets/app.js");
+const APP_CSS: &[u8] = include_bytes!("../frontend/dist/assets/index.css");
+const CHUNK_ROLLDOWN_RUNTIME_JS: &[u8] =
+    include_bytes!("../frontend/dist/assets/chunk-rolldown-runtime.js");
+const CHUNK_VENDOR_JS: &[u8] = include_bytes!("../frontend/dist/assets/chunk-vendor.js");
+const CHUNK_VENDOR_UI_JS: &[u8] = include_bytes!("../frontend/dist/assets/chunk-vendor-ui.js");
+const CHUNK_VENDOR_MARKDOWN_JS: &[u8] =
+    include_bytes!("../frontend/dist/assets/chunk-vendor-markdown.js");
+const CHUNK_VENDOR_TREE_JS: &[u8] =
+    include_bytes!("../frontend/dist/assets/chunk-vendor-tree.js");
+const CHUNK_VENDOR_MONACO_JS: &[u8] =
+    include_bytes!("../frontend/dist/assets/chunk-vendor-monaco.js");
+const CHUNK_MONACO_CODE_SURFACE_JS: &[u8] =
+    include_bytes!("../frontend/dist/assets/chunk-MonacoCodeSurface.js");
 const QIT_LOGO_ON_DARK: &[u8] = include_bytes!("../frontend/dist/assets/qit-logo-on-dark.png");
 const QIT_LOGO_ON_LIGHT: &[u8] = include_bytes!("../frontend/dist/assets/qit-logo-on-light.png");
 const SESSION_TTL_MS: u64 = 12 * 60 * 60 * 1000;
+const LOGIN_WINDOW_MS: u64 = 60 * 1000;
+const LOGIN_LOCKOUT_MS: u64 = 60 * 1000;
+const LOGIN_FAILURE_LIMIT: u8 = 5;
 
 pub struct WebUiConfig {
     pub workspace: WorkspaceSpec,
@@ -42,6 +62,13 @@ struct SessionRecord {
     expires_at_ms: u64,
 }
 
+#[derive(Clone, Default)]
+struct LoginAttemptRecord {
+    failures: u8,
+    window_started_at_ms: u64,
+    locked_until_ms: u64,
+}
+
 #[derive(Clone)]
 pub struct WebUiServer {
     repo_read_store: Arc<dyn RepoReadStore>,
@@ -53,6 +80,7 @@ pub struct WebUiServer {
     secure_cookies: bool,
     public_repo_url: Option<String>,
     sessions: Arc<RwLock<HashMap<String, SessionRecord>>>,
+    login_attempts: Arc<RwLock<HashMap<String, LoginAttemptRecord>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -62,8 +90,11 @@ struct BootstrapResponse {
     worktree: String,
     exported_branch: String,
     checked_out_branch: String,
+    description: String,
+    homepage_url: String,
     local_only_owner_mode: bool,
     shared_remote_identity: bool,
+    git_credentials_visible: bool,
     git_username: Option<String>,
     git_password: Option<String>,
     public_repo_url: Option<String>,
@@ -73,6 +104,7 @@ struct BootstrapResponse {
 struct SettingsResponse {
     local_only_owner_mode: bool,
     shared_remote_identity: bool,
+    repository: RepositorySettings,
 }
 
 #[derive(Serialize)]
@@ -179,6 +211,27 @@ struct PullRequestReviewRequest {
 }
 
 #[derive(Deserialize)]
+struct SettingsUpdateRequest {
+    description: Option<String>,
+    homepage_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BranchRuleRequest {
+    pattern: String,
+    #[serde(default)]
+    require_pull_request: bool,
+    #[serde(default)]
+    required_approvals: u8,
+    #[serde(default)]
+    dismiss_stale_approvals: bool,
+    #[serde(default)]
+    block_force_push: bool,
+    #[serde(default)]
+    block_delete: bool,
+}
+
+#[derive(Deserialize)]
 struct TreeQuery {
     reference: Option<String>,
     path: Option<String>,
@@ -257,6 +310,7 @@ impl WebUiServer {
             secure_cookies: config.secure_cookies,
             public_repo_url: config.public_repo_url,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            login_attempts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -266,21 +320,23 @@ impl WebUiServer {
         Router::new()
             .route(&mount, get(index))
             .route(&format!("{mount}/"), get(index))
-            .route(&format!("{mount}/assets/app.js"), get(app_js))
-            .route(&format!("{mount}/assets/app.css"), get(app_css))
-            .route(
-                &format!("{mount}/assets/qit-logo-on-dark.png"),
-                get(qit_logo_on_dark),
-            )
-            .route(
-                &format!("{mount}/assets/qit-logo-on-light.png"),
-                get(qit_logo_on_light),
-            )
+            .route(&format!("{mount}/assets/{{*asset_path}}"), get(asset))
             .route(&format!("{mount}/assets/qit-og.svg"), get(qit_og_image))
             .route(&format!("{mount}/api/bootstrap"), get(bootstrap))
             .route(&format!("{mount}/api/session/login"), post(login))
             .route(&format!("{mount}/api/session/logout"), post(logout))
-            .route(&format!("{mount}/api/settings"), get(get_settings))
+            .route(
+                &format!("{mount}/api/settings"),
+                get(get_settings).patch(update_settings),
+            )
+            .route(
+                &format!("{mount}/api/settings/branch-rules"),
+                put(upsert_branch_rule),
+            )
+            .route(
+                &format!("{mount}/api/settings/branch-rules/{{pattern}}"),
+                delete(delete_branch_rule),
+            )
             .route(
                 &format!("{mount}/api/branches"),
                 get(list_branches).post(create_branch),
@@ -298,6 +354,7 @@ impl WebUiServer {
             .route(&format!("{mount}/api/commits/{{commit}}"), get(read_commit))
             .route(&format!("{mount}/api/code/tree"), get(list_tree))
             .route(&format!("{mount}/api/code/blob"), get(read_blob))
+            .route(&format!("{mount}/api/code/raw"), get(read_blob_raw))
             .route(&format!("{mount}/api/compare"), get(compare_refs))
             .route(
                 &format!("{mount}/api/pull-requests"),
@@ -333,39 +390,6 @@ impl WebUiServer {
 
     fn cookie_name() -> &'static str {
         "qit_ui_session"
-    }
-
-    fn session_cookie(&self, token: &str) -> HeaderValue {
-        let secure = if self.secure_cookies { "; Secure" } else { "" };
-        HeaderValue::from_str(&format!(
-            "{}={token}; Path={}; HttpOnly; SameSite=Lax{}",
-            Self::cookie_name(),
-            self.repo_mount_path,
-            secure
-        ))
-        .expect("valid session cookie")
-    }
-
-    fn clear_cookie(&self) -> HeaderValue {
-        let secure = if self.secure_cookies { "; Secure" } else { "" };
-        HeaderValue::from_str(&format!(
-            "{}=; Path={}; Max-Age=0; HttpOnly; SameSite=Lax{}",
-            Self::cookie_name(),
-            self.repo_mount_path,
-            secure
-        ))
-        .expect("valid clear cookie")
-    }
-
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    fn default_actor(&self, headers: &HeaderMap) -> Option<UiRole> {
-        (self.implicit_owner_mode && host_is_loopback(headers)).then_some(UiRole::Owner)
     }
 
     fn repo_og_svg(&self) -> String {
@@ -476,34 +500,24 @@ impl WebUiServer {
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     }
 
-    async fn current_actor(
-        &self,
-        headers: &HeaderMap,
-    ) -> Result<Option<UiRole>, StatusCode> {
-        if let Some(actor) = self.default_actor(headers) {
-            return Ok(Some(actor));
-        }
-        let Some(token) = cookie_value(headers, Self::cookie_name()) else {
-            return Ok(None);
-        };
-        let now_ms = Self::now_ms();
-        let mut sessions = self.sessions.write().await;
-        sessions.retain(|_, session| session.expires_at_ms > now_ms);
-        Ok(sessions.get(token).map(|session| session.role.clone()))
-    }
+}
 
-    async fn require_actor(
-        &self,
-        headers: &HeaderMap,
-    ) -> Result<UiRole, StatusCode> {
-        self.current_actor(headers).await?.ok_or(StatusCode::UNAUTHORIZED)
+fn settings_response(state: &WebUiServer, repository: RepositorySettings) -> SettingsResponse {
+    SettingsResponse {
+        local_only_owner_mode: state.implicit_owner_mode,
+        shared_remote_identity: true,
+        repository,
     }
+}
 
-    async fn require_owner(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
-        match self.require_actor(headers).await? {
-            UiRole::Owner => Ok(()),
-            UiRole::User => Err(StatusCode::FORBIDDEN),
-        }
+fn domain_status(error: &DomainError) -> StatusCode {
+    match error {
+        DomainError::InvalidPullRequest(_)
+        | DomainError::InvalidSettings(_)
+        | DomainError::BranchRuleViolation(_)
+        | DomainError::ExportedBranchConflict { .. } => StatusCode::BAD_REQUEST,
+        DomainError::MissingSidecar(_) => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -517,19 +531,6 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
             None
         }
     })
-}
-
-fn host_is_loopback(headers: &HeaderMap) -> bool {
-    let Some(host) = headers.get(HOST).and_then(|value| value.to_str().ok()) else {
-        return false;
-    };
-    let host = host.trim();
-    let host = if let Some(stripped) = host.strip_prefix('[') {
-        stripped.split(']').next().unwrap_or(stripped)
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn escape_html(value: &str) -> String {
@@ -599,38 +600,32 @@ async fn index(State(state): State<Arc<WebUiServer>>) -> Html<String> {
     Html(state.index_html())
 }
 
-async fn app_js() -> impl IntoResponse {
-    (
-        [(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/javascript; charset=utf-8"),
-        )],
-        APP_JS,
-    )
+fn static_asset(asset_path: &str) -> Option<(&'static str, &'static [u8])> {
+    match asset_path {
+        "app.js" => Some(("text/javascript; charset=utf-8", APP_JS)),
+        "app.css" => Some(("text/css; charset=utf-8", APP_CSS)),
+        "chunk-rolldown-runtime.js" => Some(("text/javascript; charset=utf-8", CHUNK_ROLLDOWN_RUNTIME_JS)),
+        "chunk-vendor.js" => Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_JS)),
+        "chunk-vendor-ui.js" => Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_UI_JS)),
+        "chunk-vendor-markdown.js" => {
+            Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_MARKDOWN_JS))
+        }
+        "chunk-vendor-tree.js" => Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_TREE_JS)),
+        "chunk-vendor-monaco.js" => Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_MONACO_JS)),
+        "chunk-MonacoCodeSurface.js" => {
+            Some(("text/javascript; charset=utf-8", CHUNK_MONACO_CODE_SURFACE_JS))
+        }
+        "qit-logo-on-dark.png" => Some(("image/png", QIT_LOGO_ON_DARK)),
+        "qit-logo-on-light.png" => Some(("image/png", QIT_LOGO_ON_LIGHT)),
+        _ => None,
+    }
 }
 
-async fn app_css() -> impl IntoResponse {
-    (
-        [(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/css; charset=utf-8"),
-        )],
-        APP_CSS,
-    )
-}
-
-async fn qit_logo_on_dark() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, HeaderValue::from_static("image/png"))],
-        QIT_LOGO_ON_DARK,
-    )
-}
-
-async fn qit_logo_on_light() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, HeaderValue::from_static("image/png"))],
-        QIT_LOGO_ON_LIGHT,
-    )
+async fn asset(AxumPath(asset_path): AxumPath<String>) -> Result<impl IntoResponse, StatusCode> {
+    let Some((content_type, body)) = static_asset(&asset_path) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(([(CONTENT_TYPE, HeaderValue::from_static(content_type))], body))
 }
 
 async fn qit_og_image(State(state): State<Arc<WebUiServer>>) -> impl IntoResponse {
@@ -647,19 +642,22 @@ async fn bootstrap(
     State(state): State<Arc<WebUiServer>>,
     headers: HeaderMap,
 ) -> Result<Json<BootstrapResponse>, StatusCode> {
-    let (workspace, _) = state.latest_workspace()?;
+    let (workspace, web_ui) = state.latest_workspace()?;
     let actor = state.current_actor(&headers).await?;
-    let is_authenticated = actor.is_some();
+    let git_credentials_visible = state.can_view_git_credentials(actor.as_ref());
     Ok(Json(BootstrapResponse {
         actor,
         repo_name: state.repo_name(),
         worktree: workspace.worktree.display().to_string(),
         exported_branch: workspace.exported_branch,
         checked_out_branch: workspace.checked_out_branch,
+        description: web_ui.repository.description,
+        homepage_url: web_ui.repository.homepage_url,
         local_only_owner_mode: state.implicit_owner_mode,
         shared_remote_identity: true,
-        git_username: is_authenticated.then(|| state.credentials.username.clone()),
-        git_password: is_authenticated.then(|| state.credentials.password.clone()),
+        git_credentials_visible,
+        git_username: git_credentials_visible.then(|| state.credentials.username.clone()),
+        git_password: git_credentials_visible.then(|| state.credentials.password.clone()),
         public_repo_url: state.public_repo_url.clone(),
     }))
 }
@@ -678,9 +676,12 @@ async fn login(
             .body(Body::from(payload))
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
+    state.allow_login_attempt(&headers).await?;
     if !credentials_match(&body.username, &body.password, &state.credentials) {
+        state.record_login_failure(&headers).await;
         return Err(StatusCode::UNAUTHORIZED);
     }
+    state.clear_login_attempts(&headers).await;
     let token = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
     state
         .sessions
@@ -722,10 +723,72 @@ async fn get_settings(
     headers: HeaderMap,
 ) -> Result<Json<SettingsResponse>, StatusCode> {
     state.require_actor(&headers).await?;
-    Ok(Json(SettingsResponse {
-        local_only_owner_mode: state.implicit_owner_mode,
-        shared_remote_identity: true,
-    }))
+    let (_, repository) = state
+        .workspace_service
+        .read_repository_settings(state.workspace.worktree.clone(), &state.workspace.exported_branch)
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(settings_response(&state, repository)))
+}
+
+async fn update_settings(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    Json(body): Json<SettingsUpdateRequest>,
+) -> Result<Json<SettingsResponse>, StatusCode> {
+    state.require_owner(&headers).await?;
+    let (_, repository) = state
+        .workspace_service
+        .update_repository_settings(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            UpdateRepositorySettings {
+                description: body.description,
+                homepage_url: body.homepage_url,
+            },
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(settings_response(&state, repository)))
+}
+
+async fn upsert_branch_rule(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    Json(body): Json<BranchRuleRequest>,
+) -> Result<Json<SettingsResponse>, StatusCode> {
+    state.require_owner(&headers).await?;
+    let (_, repository) = state
+        .workspace_service
+        .upsert_branch_rule(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            UpsertBranchRule {
+                pattern: body.pattern,
+                require_pull_request: body.require_pull_request,
+                required_approvals: body.required_approvals,
+                dismiss_stale_approvals: body.dismiss_stale_approvals,
+                block_force_push: body.block_force_push,
+                block_delete: body.block_delete,
+            },
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(settings_response(&state, repository)))
+}
+
+async fn delete_branch_rule(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(pattern): AxumPath<String>,
+) -> Result<Json<SettingsResponse>, StatusCode> {
+    state.require_owner(&headers).await?;
+    let (_, repository) = state
+        .workspace_service
+        .delete_branch_rule(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &pattern,
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(settings_response(&state, repository)))
 }
 
 async fn list_branches(
@@ -906,6 +969,33 @@ async fn read_blob(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok(Json(BlobResponse { blob }))
+}
+
+async fn read_blob_raw(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    Query(query): Query<BlobQuery>,
+) -> Result<Response<Body>, StatusCode> {
+    state.require_actor(&headers).await?;
+    let workspace = state.latest_workspace()?.0;
+    let reference = query
+        .reference
+        .unwrap_or_else(|| workspace.checked_out_branch.clone());
+    let blob = state
+        .repo_read_store
+        .read_blob(&workspace, &reference, PathBuf::from(query.path).as_path())
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if blob.is_binary {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(blob.text.unwrap_or_default()))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn compare_refs(
@@ -1582,6 +1672,9 @@ mod tests {
         let payload: BootstrapResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.actor, Some(UiRole::Owner));
         assert!(payload.local_only_owner_mode);
+        assert!(payload.git_credentials_visible);
+        assert_eq!(payload.git_username.as_deref(), Some("tester"));
+        assert_eq!(payload.git_password.as_deref(), Some("secret"));
 
         let git_response = app
             .oneshot(request_with_remote(
@@ -1637,6 +1730,32 @@ mod tests {
             .next()
             .unwrap()
             .to_string();
+
+        let authenticated_bootstrap = Request::builder()
+            .uri("/repo/api/bootstrap")
+            .header(HOST, "demo.ngrok.app")
+            .header("cookie", cookie.clone())
+            .body(Body::empty())
+            .unwrap();
+        let mut authenticated_bootstrap = authenticated_bootstrap;
+        authenticated_bootstrap
+            .extensions_mut()
+            .insert(ConnectInfo(remote));
+        let authenticated_bootstrap_response = app.clone().oneshot(authenticated_bootstrap).await.unwrap();
+        assert_eq!(authenticated_bootstrap_response.status(), StatusCode::OK);
+        let authenticated_bootstrap: BootstrapResponse = serde_json::from_slice(
+            &authenticated_bootstrap_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(authenticated_bootstrap.actor, Some(UiRole::User));
+        assert!(!authenticated_bootstrap.git_credentials_visible);
+        assert_eq!(authenticated_bootstrap.git_username, None);
+        assert_eq!(authenticated_bootstrap.git_password, None);
 
         let create_pr = Request::builder()
             .method("POST")
@@ -1749,6 +1868,23 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(!body.is_empty());
 
+        let chunk_response = app
+            .clone()
+            .oneshot(request_with_remote(
+                "/repo/assets/chunk-vendor-ui.js",
+                remote,
+                "127.0.0.1:8080",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(chunk_response.status(), StatusCode::OK);
+        assert_eq!(
+            chunk_response.headers().get(CONTENT_TYPE).unwrap(),
+            HeaderValue::from_static("text/javascript; charset=utf-8")
+        );
+        let chunk_body = chunk_response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!chunk_body.is_empty());
+
         let og_response = app
             .oneshot(request_with_remote(
                 "/repo/assets/qit-og.svg",
@@ -1819,6 +1955,7 @@ mod tests {
                     merged_commit: Some("feature-current".into()),
                     activities: Vec::new(),
                 }],
+                repository: RepositorySettings::default(),
             },
         );
         let remote = SocketAddr::from(([10, 0, 0, 2], 3000));
@@ -1866,6 +2003,110 @@ mod tests {
         .unwrap();
         assert_eq!(detail["comparison"]["base_ref"], "111111111111");
         assert_eq!(detail["comparison"]["head_ref"], "222222222222");
+    }
+
+    #[tokio::test]
+    async fn owner_settings_endpoints_round_trip_metadata_and_branch_rules() {
+        let app = app_with_web_ui(
+            true,
+            false,
+            WorkspaceWebUiState {
+                pull_requests: Vec::new(),
+                repository: RepositorySettings::default(),
+            },
+        );
+        let localhost = SocketAddr::from(([127, 0, 0, 1], 3000));
+
+        let settings = app
+            .clone()
+            .oneshot(request_with_remote("/repo/api/settings", localhost, "127.0.0.1:8080"))
+            .await
+            .unwrap();
+        assert_eq!(settings.status(), StatusCode::OK);
+        let settings: serde_json::Value =
+            serde_json::from_slice(&settings.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(settings["repository"]["description"], "");
+
+        let update = Request::builder()
+            .method("PATCH")
+            .uri("/repo/api/settings")
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"description":"Demo repo","homepage_url":"https://example.com"}"#,
+            ))
+            .unwrap();
+        let mut update = update;
+        update.extensions_mut().insert(ConnectInfo(localhost));
+        let updated = app.clone().oneshot(update).await.unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated: serde_json::Value =
+            serde_json::from_slice(&updated.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(updated["repository"]["description"], "Demo repo");
+        assert_eq!(updated["repository"]["homepage_url"], "https://example.com");
+
+        let add_rule = Request::builder()
+            .method("PUT")
+            .uri("/repo/api/settings/branch-rules")
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"pattern":"main","require_pull_request":true,"required_approvals":1,"dismiss_stale_approvals":true,"block_force_push":true,"block_delete":true}"#,
+            ))
+            .unwrap();
+        let mut add_rule = add_rule;
+        add_rule.extensions_mut().insert(ConnectInfo(localhost));
+        let added = app.clone().oneshot(add_rule).await.unwrap();
+        assert_eq!(added.status(), StatusCode::OK);
+        let added: serde_json::Value =
+            serde_json::from_slice(&added.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(added["repository"]["branch_rules"][0]["pattern"], "main");
+        assert_eq!(
+            added["repository"]["branch_rules"][0]["required_approvals"],
+            1
+        );
+
+        let delete_rule = Request::builder()
+            .method("DELETE")
+            .uri("/repo/api/settings/branch-rules/main")
+            .header(HOST, "127.0.0.1:8080")
+            .body(Body::empty())
+            .unwrap();
+        let mut delete_rule = delete_rule;
+        delete_rule.extensions_mut().insert(ConnectInfo(localhost));
+        let deleted = app.clone().oneshot(delete_rule).await.unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted: serde_json::Value =
+            serde_json::from_slice(&deleted.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(deleted["repository"]["branch_rules"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn raw_blob_endpoint_serves_plain_text() {
+        let app = app(true, false);
+        let remote = SocketAddr::from(([127, 0, 0, 1], 3000));
+        let response = app
+            .oneshot(request_with_remote(
+                "/repo/api/code/raw?path=README.md&reference=main",
+                remote,
+                "127.0.0.1:8080",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            HeaderValue::from_static("text/plain; charset=utf-8")
+        );
+        let body = String::from_utf8(
+            response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(body, "hello");
     }
 
     #[tokio::test]
@@ -2060,5 +2301,37 @@ mod tests {
         let payload: BootstrapResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.actor, None);
         assert!(payload.local_only_owner_mode);
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_logins_are_rate_limited() {
+        let app = app(false, true);
+        let remote = SocketAddr::from(([10, 0, 0, 2], 3000));
+
+        for _ in 0..5 {
+            let login = Request::builder()
+                .method("POST")
+                .uri("/repo/api/session/login")
+                .header(HOST, "demo.ngrok.app")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"tester","password":"wrong"}"#))
+                .unwrap();
+            let mut login = login;
+            login.extensions_mut().insert(ConnectInfo(remote));
+            let response = app.clone().oneshot(login).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let login = Request::builder()
+            .method("POST")
+            .uri("/repo/api/session/login")
+            .header(HOST, "demo.ngrok.app")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"username":"tester","password":"secret"}"#))
+            .unwrap();
+        let mut login = login;
+        login.extensions_mut().insert(ConnectInfo(remote));
+        let response = app.oneshot(login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

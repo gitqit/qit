@@ -98,7 +98,10 @@ export function MonacoDiffSurface({
       modified={modified}
       options={{
         ...baseOptions,
-        renderSideBySide: true,
+        renderSideBySide: false,
+        experimental: {
+          useTrueInlineView: true,
+        },
       }}
       original={original}
       theme="vs-dark"

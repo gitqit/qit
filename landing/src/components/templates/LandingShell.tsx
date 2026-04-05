@@ -1,23 +1,44 @@
 import { useState, type PropsWithChildren } from 'react'
 import { Menu, X } from 'lucide-react'
 import { classNames } from '../../lib/classNames'
+import { isExternalHref } from '../../lib/hrefs'
+import { SiteLink } from '../../lib/siteLinks'
 import { BrandLogo, ButtonLink } from '../atoms/primitives'
 
-const navItems = [
+const defaultNavItems = [
   { href: '#features', label: 'Features' },
   { href: '#preview', label: 'Preview' },
   { href: '#faq', label: 'FAQ' },
 ] as const
 
+type ShellNavItem = {
+  href: string
+  label: string
+}
+
 export function LandingShell({
   children,
   className,
+  contentSpacingClass = 'space-y-24',
+  ctaLabel = 'Download binaries',
   ctaHref,
-}: PropsWithChildren<{ className?: string; ctaHref: string }>) {
+  brandHref = '#top',
+  headerClassName,
+  navItems = defaultNavItems,
+}: PropsWithChildren<{
+  className?: string
+  contentSpacingClass?: string
+  ctaHref: string
+  ctaLabel?: string
+  brandHref?: string
+  headerClassName?: string
+  navItems?: ReadonlyArray<ShellNavItem>
+}>) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const ctaIsExternal = isExternalHref(ctaHref)
 
   return (
-    <div className="relative overflow-hidden">
+    <div className="relative overflow-x-hidden">
       <a className="skip-link" href="#main-content">
         Skip to content
       </a>
@@ -29,27 +50,27 @@ export function LandingShell({
       </div>
 
       <div className="relative mx-auto flex min-h-screen w-full max-w-7xl flex-col px-5 pb-12 pt-5 sm:px-6 lg:px-8">
-        <header className="sticky top-3 z-20 mb-10">
+        <header className={classNames('sticky top-3 z-20 mb-10', headerClassName)}>
           <div className="shell-header px-4 py-3">
             <div className="flex items-center gap-3 sm:gap-4">
-              <a
+              <SiteLink
                 className="inline-flex min-w-0 flex-1 items-center gap-3"
-                href="#top"
+                href={brandHref}
                 onClick={() => setMobileMenuOpen(false)}
               >
                 <BrandLogo className="h-9 sm:h-10" />
                 <span className="min-w-0 text-sm text-ink-muted sm:hidden">Quick Git for normal folders</span>
-              </a>
+              </SiteLink>
               <nav aria-label="Primary" className="hidden items-center gap-5 text-sm font-medium lg:flex">
                 {navItems.map((item) => (
-                  <a className="site-nav-link" href={item.href} key={item.href}>
+                  <SiteLink className="site-nav-link" href={item.href} key={item.href}>
                     {item.label}
-                  </a>
+                  </SiteLink>
                 ))}
               </nav>
               <div className="hidden lg:block">
-                <ButtonLink href={ctaHref} rel="noreferrer" target="_blank">
-                  Download binaries
+                <ButtonLink href={ctaHref} rel={ctaIsExternal ? 'noreferrer' : undefined} target={ctaIsExternal ? '_blank' : undefined}>
+                  {ctaLabel}
                 </ButtonLink>
               </div>
               <button
@@ -68,30 +89,30 @@ export function LandingShell({
               <div className="mt-4 border-t border-slate-900/6 pt-4 lg:hidden" id="mobile-nav">
                 <nav aria-label="Mobile" className="grid gap-2">
                   {navItems.map((item) => (
-                    <a
+                    <SiteLink
                       className="site-nav-link rounded-token px-3 py-2 text-sm font-medium"
                       href={item.href}
                       key={item.href}
                       onClick={() => setMobileMenuOpen(false)}
                     >
                       {item.label}
-                    </a>
+                    </SiteLink>
                   ))}
                 </nav>
                 <ButtonLink
                   className="mt-4 w-full sm:hidden"
                   href={ctaHref}
-                  rel="noreferrer"
-                  target="_blank"
+                  rel={ctaIsExternal ? 'noreferrer' : undefined}
+                  target={ctaIsExternal ? '_blank' : undefined}
                 >
-                  Download binaries
+                  {ctaLabel}
                 </ButtonLink>
               </div>
             ) : null}
           </div>
         </header>
 
-        <main className={classNames('flex-1 space-y-24 pb-8', className)} id="main-content" tabIndex={-1}>
+        <main className={classNames('flex-1 pb-8', contentSpacingClass, className)} id="main-content" tabIndex={-1}>
           <div id="top" />
           {children}
         </main>

@@ -1,6 +1,7 @@
 import type { AnchorHTMLAttributes, PropsWithChildren } from 'react'
 import { ArrowUpRight, FoldVertical, Terminal } from 'lucide-react'
 import { classNames } from '../../lib/classNames'
+import { SiteLink } from '../../lib/siteLinks'
 import logoOnDark from '../../assets/branding/qit-logo-on-dark.png'
 import logoOnLight from '../../assets/branding/qit-logo-on-light.png'
 
@@ -28,7 +29,8 @@ export function ButtonLink({
   tone = 'primary',
   ...props
 }: PropsWithChildren<
-  AnchorHTMLAttributes<HTMLAnchorElement> & {
+  Omit<AnchorHTMLAttributes<HTMLAnchorElement>, 'href'> & {
+    href: string
     tone?: 'primary' | 'secondary' | 'ghost'
   }
 >) {
@@ -39,7 +41,7 @@ export function ButtonLink({
   } as const
 
   return (
-    <a
+    <SiteLink
       className={classNames(
         'button-link inline-flex items-center justify-center gap-2 rounded-token border px-5 py-3 text-sm font-semibold focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent',
         tones[tone],
@@ -50,7 +52,7 @@ export function ButtonLink({
     >
       <span>{children}</span>
       {tone !== 'ghost' ? <ArrowUpRight aria-hidden="true" className="h-4 w-4" strokeWidth={2} /> : null}
-    </a>
+    </SiteLink>
   )
 }
 

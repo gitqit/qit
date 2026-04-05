@@ -108,8 +108,8 @@ fn spawn_qit_serve_with_options(
         .arg("local")
         .arg("--port")
         .arg(port.to_string());
-    if show_pass {
-        command.arg("--show-pass");
+    if !show_pass {
+        command.arg("--hidden-pass");
     }
     if auto_apply {
         command.arg("--auto-apply");
@@ -447,7 +447,7 @@ fn qit_cli_hides_password_and_clone_credentials_by_default() -> Result<()> {
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(line) if line.trim_start().starts_with("password: ") => {
-                saw_hidden_password = line.contains("hidden (see file)");
+                saw_hidden_password = line.contains("hidden (--hidden-pass enabled)");
             }
             Ok(line) if line.trim_start().starts_with("file: ") => {
                 saw_credentials_file = true;
@@ -500,7 +500,7 @@ fn qit_cli_shows_password_with_show_pass() -> Result<()> {
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(line) if line.trim_start().starts_with("password: ") => {
-                saw_password = !line.contains("hidden from stdout");
+                saw_password = !line.contains("hidden");
             }
             Ok(line) if line.contains("git clone http://") && line.contains('@') => {
                 saw_credentialed_clone = true;
@@ -914,6 +914,80 @@ fn auto_apply_skips_when_checked_out_branch_differs_from_served_branch() -> Resu
         std::fs::read_to_string(worktree.join("README.md"))?.replace("\r\n", "\n"),
         "feature branch\n"
     );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+#[test]
+fn settings_commands_manage_metadata_and_branch_rules() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("qit-data");
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "initial\n")?;
+
+    let port = free_port()?;
+    let (mut child, _rx) = spawn_qit_serve_with_env(&worktree, port, false, Some(&data_dir))?;
+    std::thread::sleep(Duration::from_secs(2));
+
+    let updated = run_qit_with_env(
+        &[
+            "settings",
+            "set",
+            worktree.to_str().unwrap(),
+            "--description",
+            "Demo repo",
+            "--homepage",
+            "https://example.com/docs",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(updated.contains("Demo repo"));
+    assert!(updated.contains("https://example.com/docs"));
+
+    let rules = run_qit_with_env(
+        &[
+            "settings",
+            "rule",
+            worktree.to_str().unwrap(),
+            "--pattern",
+            "main",
+            "--require-pr",
+            "--approvals",
+            "1",
+            "--dismiss-stale",
+            "--block-force-push",
+            "--block-delete",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(rules.contains("main: require PR"));
+    assert!(rules.contains("1 approval(s)"));
+    assert!(rules.contains("block force-push"));
+    assert!(rules.contains("block delete"));
+
+    let listed = run_qit_with_env(
+        &["settings", "view", worktree.to_str().unwrap()],
+        Some(&data_dir),
+    )?;
+    assert!(listed.contains("description: Demo repo"));
+    assert!(listed.contains("homepage: https://example.com/docs"));
+    assert!(listed.contains("main: require PR"));
+
+    let deleted = run_qit_with_env(
+        &[
+            "settings",
+            "rule",
+            worktree.to_str().unwrap(),
+            "--delete",
+            "main",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(deleted.contains("deleted branch rule `main`"));
+    assert!(deleted.contains("branch rules:"));
 
     let _ = child.kill();
     let _ = child.wait();
