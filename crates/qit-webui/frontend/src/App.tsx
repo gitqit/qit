@@ -356,9 +356,23 @@ function App() {
           await api.deleteBranch(name)
           await refresh()
         }}
+        onDeletePullRequest={async (id) => {
+          const deletedPullRequest = await api.deletePullRequest(id)
+          if (selectedPullRequestId === id) {
+            setSelectedPullRequestId(null)
+          }
+          setToastMessage(`Pull request "${deletedPullRequest.title}" deleted.`)
+          await refresh()
+          return deletedPullRequest
+        }}
         onMergePullRequest={async (id) => {
           await api.mergePullRequest(id)
           await refresh()
+        }}
+        onReviewPullRequest={async (id, payload) => {
+          const updatedPullRequest = await api.reviewPullRequest(id, payload)
+          await refresh()
+          return updatedPullRequest
         }}
         onLoadMoreCommits={async () => {
           if (!currentRef || !history || !history.has_more) {
@@ -410,9 +424,19 @@ function App() {
         onClearSelectedPullRequest={() => {
           setSelectedPullRequestId(null)
         }}
+        onCommentPullRequest={async (id, payload) => {
+          const updatedPullRequest = await api.commentPullRequest(id, payload)
+          await refresh()
+          return updatedPullRequest
+        }}
         onSwitchBranch={async (name) => {
           await api.switchBranch(name)
           await refresh()
+        }}
+        onUpdatePullRequest={async (id, payload) => {
+          const updatedPullRequest = await api.updatePullRequest(id, payload)
+          await refresh()
+          return updatedPullRequest
         }}
         pullRequests={pullRequests}
         readme={readme}

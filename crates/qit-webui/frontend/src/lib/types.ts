@@ -2,6 +2,17 @@ export type UiRole = 'owner' | 'user'
 
 export type PullRequestStatus = 'open' | 'merged' | 'closed'
 
+export type PullRequestReviewState = 'commented' | 'approved' | 'changes_requested'
+
+export type PullRequestActivityKind =
+  | 'opened'
+  | 'commented'
+  | 'reviewed'
+  | 'edited'
+  | 'closed'
+  | 'reopened'
+  | 'merged'
+
 export type TreeEntryKind = 'tree' | 'blob'
 
 export interface BootstrapResponse {
@@ -124,6 +135,50 @@ export interface PullRequestRecord {
   created_at_ms: number
   updated_at_ms: number
   merged_commit: string | null
+  activities: PullRequestActivity[]
+}
+
+export interface PullRequestActivity {
+  id: string
+  kind: PullRequestActivityKind
+  actor_role: UiRole
+  display_name: string | null
+  body: string | null
+  review_state: PullRequestReviewState | null
+  title: string | null
+  description: string | null
+  created_at_ms: number
+}
+
+export interface PullRequestComment {
+  id: string
+  actor_role: UiRole
+  display_name: string
+  body: string
+  created_at_ms: number
+}
+
+export interface PullRequestReview {
+  id: string
+  actor_role: UiRole
+  display_name: string
+  body: string
+  state: PullRequestReviewState
+  created_at_ms: number
+}
+
+export interface PullRequestReviewSummaryEntry {
+  actor_role: UiRole
+  display_name: string
+  state: PullRequestReviewState
+  reviewed_at_ms: number
+}
+
+export interface PullRequestReviewSummary {
+  approvals: number
+  changes_requested: number
+  comments: number
+  latest_reviews: PullRequestReviewSummaryEntry[]
 }
 
 export interface PullRequestsResponse {
@@ -157,4 +212,8 @@ export interface PullRequestDetailResponse {
   pull_request: PullRequestRecord
   comparison: RefComparison | null
   diffs: RefDiffFile[] | null
+  comments: PullRequestComment[]
+  reviews: PullRequestReview[]
+  review_summary: PullRequestReviewSummary
+  activity: PullRequestActivity[]
 }

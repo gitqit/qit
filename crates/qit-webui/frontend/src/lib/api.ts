@@ -125,4 +125,37 @@ export const api = {
     requestJson<PullRequestRecord>(`/api/pull-requests/${encodeURIComponent(id)}/merge`, {
       method: 'POST',
     }),
+  updatePullRequest: (
+    id: string,
+    payload: {
+      title?: string
+      description?: string
+      status?: 'open' | 'closed'
+    },
+  ) =>
+    requestJson<PullRequestRecord>(`/api/pull-requests/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+  deletePullRequest: (id: string) =>
+    requestJson<PullRequestRecord>(`/api/pull-requests/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  commentPullRequest: (id: string, payload: { display_name: string; body: string }) =>
+    requestJson<PullRequestRecord>(`/api/pull-requests/${encodeURIComponent(id)}/comments`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  reviewPullRequest: (
+    id: string,
+    payload: {
+      display_name: string
+      body: string
+      state: 'commented' | 'approved' | 'changes_requested'
+    },
+  ) =>
+    requestJson<PullRequestRecord>(`/api/pull-requests/${encodeURIComponent(id)}/reviews`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 }

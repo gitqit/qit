@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import { Tab, TabGroup, TabList, TabPanel, TabPanels } from '@headlessui/react'
 import { GitBranch, Globe } from 'lucide-react'
 import { Badge } from '../atoms/Controls'
+import { BrandLogo } from '../atoms/BrandLogo'
 
 export interface ShellTab {
   id: string
@@ -10,29 +11,6 @@ export interface ShellTab {
   icon?: ReactNode
   action?: ReactNode
   content: ReactNode
-}
-
-function BrandMark() {
-  return (
-    <div className="flex h-10 w-10 items-center justify-center rounded-token border border-border bg-panel text-fg shadow-[var(--shadow-panel)]">
-      <svg aria-hidden="true" className="h-5 w-5" fill="none" viewBox="0 0 24 24">
-        <path
-          d="M7 5.75h6.9a4.35 4.35 0 0 1 0 8.7H10.2a1 1 0 0 0-.78.37l-2.55 3.18"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth="2"
-        />
-        <path
-          d="M14.9 14.45 18 18"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth="2"
-        />
-      </svg>
-    </div>
-  )
 }
 
 export function AppShell({
@@ -68,12 +46,13 @@ export function AppShell({
         <div className="mx-auto max-w-7xl px-5 sm:px-6">
           <div className="flex flex-col gap-6 py-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <BrandMark />
-                <div className="flex flex-wrap items-center gap-2 text-sm">
-                  <span className="font-medium text-fg">Qit</span>
-                  <span className="text-fg-subtle">/</span>
-                  <span className="truncate font-medium text-fg-muted">{repoName}</span>
+              <div className="flex min-w-0 items-center gap-3 sm:gap-4">
+                <BrandLogo className="h-11 sm:h-12" />
+                <div className="hidden h-8 w-px shrink-0 bg-border sm:block" />
+                <div className="min-w-0 flex-wrap items-center gap-2 text-sm sm:flex">
+                  <span className="hidden font-medium text-fg sm:inline">Repository</span>
+                  <span className="hidden text-fg-subtle sm:inline">/</span>
+                  <span className="block truncate font-medium text-fg-muted">{repoName}</span>
                 </div>
               </div>
               <span className="rounded-full border border-border bg-panel px-2.5 py-1 text-xs font-semibold text-fg-muted">

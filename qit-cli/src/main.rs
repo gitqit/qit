@@ -1,7 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use qit_domain::{
-    BranchInfo, CredentialIssuer, SessionCredentials, WorkspaceService, DEFAULT_BRANCH,
+    resolve_pull_request_refs, BranchInfo, CreatePullRequest, CreatePullRequestComment,
+    CreatePullRequestReview, CredentialIssuer, PullRequestRecord, PullRequestReviewState,
+    PullRequestStatus, RefComparison, RefDiffFile, RepoReadStore, SessionCredentials, UiRole,
+    UpdatePullRequest, WorkspaceService, WorkspaceSpec, DEFAULT_BRANCH,
 };
 use qit_git::{GitHttpBackendAdapter, GitRepoStore};
 use qit_http::{repo_mount_path, GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
@@ -9,6 +12,7 @@ use qit_storage::FilesystemRegistry;
 use qit_transports::{expose, PublicTransport};
 use qit_webui::{WebUiConfig, WebUiServer};
 use rand::distributions::{Alphanumeric, DistString};
+use similar::TextDiff;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -207,6 +211,174 @@ enum Commands {
         #[arg(last = true)]
         paths: Vec<String>,
     },
+    /// Manage pull requests using GitHub CLI-style subcommands.
+    Pr {
+        #[command(subcommand)]
+        command: PrCommands,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PrStateArg {
+    Open,
+    Closed,
+    Merged,
+    All,
+}
+
+#[derive(Subcommand)]
+enum PrCommands {
+    /// List pull requests for a served folder.
+    List {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Filter by pull request state.
+        #[arg(long, default_value = "open")]
+        state: PrStateArg,
+    },
+    /// Show a pull request summary, discussion, reviews, and diff stats.
+    View {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Pull request id or unique id prefix.
+        pull_request: String,
+    },
+    /// Show a patch-style diff for a pull request.
+    Diff {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Pull request id or unique id prefix.
+        pull_request: String,
+    },
+    /// Show pull request status for the current and served branches.
+    Status {
+        /// Folder previously published with qit.
+        path: PathBuf,
+    },
+    /// Create a pull request.
+    Create {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Pull request title.
+        #[arg(long)]
+        title: String,
+
+        /// Pull request body/description.
+        #[arg(long, default_value = "")]
+        body: String,
+
+        /// Source branch. Defaults to the checked out branch.
+        #[arg(long)]
+        head: Option<String>,
+
+        /// Target branch. Defaults to the served branch.
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// Edit pull request details.
+    Edit {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Pull request id or unique id prefix.
+        pull_request: String,
+
+        /// Replace the title.
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Replace the body/description.
+        #[arg(long)]
+        body: Option<String>,
+
+        /// Mark the pull request open.
+        #[arg(long, conflicts_with = "close")]
+        open: bool,
+
+        /// Mark the pull request closed.
+        #[arg(long, conflicts_with = "open")]
+        close: bool,
+    },
+    /// Add a top-level comment to a pull request.
+    Comment {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Pull request id or unique id prefix.
+        pull_request: String,
+
+        /// Comment body.
+        #[arg(long)]
+        body: String,
+
+        /// Display name to record with the comment.
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Submit a pull request review.
+    Review {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Pull request id or unique id prefix.
+        pull_request: String,
+
+        /// Approve the pull request.
+        #[arg(long, conflicts_with_all = ["request_changes", "comment"])]
+        approve: bool,
+
+        /// Request changes on the pull request.
+        #[arg(long, conflicts_with_all = ["approve", "comment"])]
+        request_changes: bool,
+
+        /// Leave a comment-only review.
+        #[arg(long, conflicts_with_all = ["approve", "request_changes"])]
+        comment: bool,
+
+        /// Review body.
+        #[arg(long, default_value = "")]
+        body: String,
+
+        /// Display name to record with the review.
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Merge a pull request.
+    Merge {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Pull request id or unique id prefix.
+        pull_request: String,
+    },
+    /// Close a pull request.
+    Close {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Pull request id or unique id prefix.
+        pull_request: String,
+    },
+    /// Reopen a pull request.
+    Reopen {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Pull request id or unique id prefix.
+        pull_request: String,
+    },
+    /// Delete a pull request.
+    Delete {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Pull request id or unique id prefix.
+        pull_request: String,
+    },
 }
 
 struct RandomCredentialIssuer;
@@ -348,6 +520,234 @@ fn print_branch_list(branches: &[BranchInfo], verbose: u8) {
                 "{marker} {} {commit} {}{served}",
                 branch.name, branch.summary
             ));
+        }
+    }
+}
+
+fn default_display_name() -> String {
+    std::env::var("QIT_DISPLAY_NAME")
+        .ok()
+        .or_else(|| std::env::var("GIT_AUTHOR_NAME").ok())
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("USERNAME").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Qit CLI".to_string())
+}
+
+fn pr_state_matches(pull_request: &PullRequestRecord, state: PrStateArg) -> bool {
+    match state {
+        PrStateArg::All => true,
+        PrStateArg::Open => pull_request.status == PullRequestStatus::Open,
+        PrStateArg::Closed => pull_request.status == PullRequestStatus::Closed,
+        PrStateArg::Merged => pull_request.status == PullRequestStatus::Merged,
+    }
+}
+
+fn sort_pull_requests(pull_requests: &mut [PullRequestRecord]) {
+    pull_requests.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| left.title.cmp(&right.title))
+    });
+}
+
+fn select_pull_request<'a>(
+    pull_requests: &'a [PullRequestRecord],
+    selector: &str,
+) -> Result<&'a PullRequestRecord> {
+    if let Some(exact) = pull_requests.iter().find(|pull_request| pull_request.id == selector) {
+        return Ok(exact);
+    }
+    let mut matches = pull_requests
+        .iter()
+        .filter(|pull_request| pull_request.id.starts_with(selector));
+    let first = matches
+        .next()
+        .ok_or_else(|| anyhow!("pull request `{selector}` was not found"))?;
+    if matches.next().is_some() {
+        bail!("pull request selector `{selector}` is ambiguous");
+    }
+    Ok(first)
+}
+
+async fn load_pull_requests(
+    service: &WorkspaceService,
+    path: PathBuf,
+    default_branch: &str,
+) -> Result<(WorkspaceSpec, Vec<PullRequestRecord>)> {
+    let (workspace, web_ui) = service.load_web_ui(path, default_branch)?;
+    let mut pull_requests = web_ui.pull_requests;
+    sort_pull_requests(&mut pull_requests);
+    Ok((workspace, pull_requests))
+}
+
+async fn load_pull_request_detail(
+    service: &WorkspaceService,
+    repo_read_store: &dyn RepoReadStore,
+    path: PathBuf,
+    default_branch: &str,
+    selector: &str,
+) -> Result<(WorkspaceSpec, PullRequestRecord, Option<RefComparison>, Option<Vec<RefDiffFile>>)> {
+    let (workspace, pull_requests) = load_pull_requests(service, path, default_branch).await?;
+    let pull_request = select_pull_request(&pull_requests, selector)?.clone();
+    let (base_ref, head_ref) =
+        resolve_pull_request_refs(repo_read_store, &workspace, &pull_request).await;
+    let comparison = repo_read_store
+        .compare_refs(&workspace, &base_ref, &head_ref, 25)
+        .await
+        .ok();
+    let diffs = repo_read_store
+        .diff_refs(&workspace, &base_ref, &head_ref)
+        .await
+        .ok();
+    Ok((workspace, pull_request, comparison, diffs))
+}
+
+fn print_pr_summary(pull_request: &PullRequestRecord, comparison: Option<&RefComparison>) {
+    say(&format!(
+        "{} [{}]",
+        pull_request.title, 
+        match pull_request.status {
+            PullRequestStatus::Open => "open",
+            PullRequestStatus::Closed => "closed",
+            PullRequestStatus::Merged => "merged",
+        }
+    ));
+    say(&format!(
+        "  id: {}",
+        pull_request.id.chars().take(12).collect::<String>()
+    ));
+    say(&format!(
+        "  branches: {} -> {}",
+        pull_request.source_branch, pull_request.target_branch
+    ));
+    if let Some(comparison) = comparison {
+        say(&format!(
+            "  commits: {} ahead, {} behind",
+            comparison.ahead_by, comparison.behind_by
+        ));
+    }
+    if let Some(merged_commit) = &pull_request.merged_commit {
+        say(&format!(
+            "  merged: {}",
+            merged_commit.chars().take(12).collect::<String>()
+        ));
+    }
+    if !pull_request.description.is_empty() {
+        say("");
+        say(&pull_request.description);
+    }
+}
+
+fn print_pr_discussion(pull_request: &PullRequestRecord) {
+    let comments = WorkspaceService::pull_request_comments(pull_request);
+    let reviews = WorkspaceService::pull_request_reviews(pull_request);
+    let summary = WorkspaceService::pull_request_review_summary(pull_request);
+    say("");
+    say("Reviews");
+    say(&format!(
+        "  approvals: {}  changes_requested: {}  comment_only: {}",
+        summary.approvals, summary.changes_requested, summary.comments
+    ));
+    for review in reviews.iter().rev() {
+        say(&format!(
+            "  - {} [{}] {}",
+            review.display_name,
+            match review.state {
+                PullRequestReviewState::Approved => "approved",
+                PullRequestReviewState::ChangesRequested => "changes_requested",
+                PullRequestReviewState::Commented => "commented",
+            },
+            review.body
+        ));
+    }
+    if !comments.is_empty() {
+        say("");
+        say("Comments");
+        for comment in comments {
+            say(&format!("  - {}: {}", comment.display_name, comment.body));
+        }
+    }
+}
+
+fn print_pr_activity(pull_request: &PullRequestRecord) {
+    if pull_request.activities.is_empty() {
+        return;
+    }
+    say("");
+    say("Activity");
+    for activity in pull_request.activities.iter().rev() {
+        let actor = activity
+            .display_name
+            .clone()
+            .unwrap_or_else(|| default_display_name());
+        say(&format!("  - {} {}", actor, format_activity(activity)));
+    }
+}
+
+fn format_activity(activity: &qit_domain::PullRequestActivityRecord) -> String {
+    match activity.kind {
+        qit_domain::PullRequestActivityKind::Opened => "opened the pull request".into(),
+        qit_domain::PullRequestActivityKind::Commented => {
+            format!("commented: {}", activity.body.clone().unwrap_or_default())
+        }
+        qit_domain::PullRequestActivityKind::Reviewed => format!(
+            "reviewed ({}){}",
+            match activity
+                .review_state
+                .clone()
+                .unwrap_or(PullRequestReviewState::Commented)
+            {
+                PullRequestReviewState::Approved => "approved",
+                PullRequestReviewState::ChangesRequested => "changes_requested",
+                PullRequestReviewState::Commented => "commented",
+            },
+            activity
+                .body
+                .as_ref()
+                .map(|body| format!(": {body}"))
+                .unwrap_or_default()
+        ),
+        qit_domain::PullRequestActivityKind::Edited => "edited the pull request".into(),
+        qit_domain::PullRequestActivityKind::Closed => "closed the pull request".into(),
+        qit_domain::PullRequestActivityKind::Reopened => "reopened the pull request".into(),
+        qit_domain::PullRequestActivityKind::Merged => "merged the pull request".into(),
+    }
+}
+
+fn print_pr_diff(diffs: &[RefDiffFile]) {
+    for file in diffs {
+        say("");
+        say(&format!(
+            "{} [{}] +{} -{}",
+            file.path, file.status, file.additions, file.deletions
+        ));
+        if file.original.as_ref().is_some_and(|blob| blob.is_binary)
+            || file.modified.as_ref().is_some_and(|blob| blob.is_binary)
+        {
+            say("  binary diff not shown");
+            continue;
+        }
+        let patch = TextDiff::from_lines(
+            file.original
+                .as_ref()
+                .and_then(|blob| blob.text.as_deref())
+                .unwrap_or(""),
+            file.modified
+                .as_ref()
+                .and_then(|blob| blob.text.as_deref())
+                .unwrap_or(""),
+        )
+        .unified_diff()
+        .context_radius(3)
+        .header(
+            &format!("a/{}", file.previous_path.as_deref().unwrap_or(&file.path)),
+            &format!("b/{}", file.path),
+        )
+        .to_string();
+        for line in patch.lines() {
+            say(line);
         }
     }
 }
@@ -572,6 +972,330 @@ async fn main() -> Result<()> {
                     workspace.exported_branch
                 ));
                 return Ok(());
+            }
+            Commands::Pr { command } => {
+                match command {
+                    PrCommands::List { path, state } => {
+                        let (workspace, pull_requests) =
+                            load_pull_requests(service.as_ref(), path, default_branch).await?;
+                        say(&format!("pull requests for {}:", workspace.worktree.display()));
+                        let mut count = 0usize;
+                        for pull_request in pull_requests
+                            .iter()
+                            .filter(|pull_request| pr_state_matches(pull_request, state))
+                        {
+                            count += 1;
+                            say(&format!(
+                                "  {} [{}] {} -> {} ({})",
+                                pull_request.id.chars().take(8).collect::<String>(),
+                                match pull_request.status {
+                                    PullRequestStatus::Open => "open",
+                                    PullRequestStatus::Closed => "closed",
+                                    PullRequestStatus::Merged => "merged",
+                                },
+                                pull_request.source_branch,
+                                pull_request.target_branch,
+                                pull_request.title
+                            ));
+                        }
+                        if count == 0 {
+                            say("  no matching pull requests");
+                        }
+                        return Ok(());
+                    }
+                    PrCommands::View { path, pull_request } => {
+                        let (_workspace, pull_request, comparison, diffs) = load_pull_request_detail(
+                            service.as_ref(),
+                            repo_store.as_ref(),
+                            path,
+                            default_branch,
+                            &pull_request,
+                        )
+                        .await?;
+                        print_pr_summary(&pull_request, comparison.as_ref());
+                        print_pr_discussion(&pull_request);
+                        print_pr_activity(&pull_request);
+                        if let Some(diffs) = diffs {
+                            say("");
+                            say("Files");
+                            for file in diffs {
+                                say(&format!(
+                                    "  - {} [{}] +{} -{}",
+                                    file.path, file.status, file.additions, file.deletions
+                                ));
+                            }
+                        }
+                        return Ok(());
+                    }
+                    PrCommands::Diff { path, pull_request } => {
+                        let (_workspace, pull_request, _comparison, diffs) = load_pull_request_detail(
+                            service.as_ref(),
+                            repo_store.as_ref(),
+                            path,
+                            default_branch,
+                            &pull_request,
+                        )
+                        .await?;
+                        say(&format!("diff for {}", pull_request.title));
+                        if let Some(diffs) = diffs {
+                            print_pr_diff(&diffs);
+                        } else {
+                            say("no diff available");
+                        }
+                        return Ok(());
+                    }
+                    PrCommands::Status { path } => {
+                        let (workspace, pull_requests) =
+                            load_pull_requests(service.as_ref(), path, default_branch).await?;
+                        let current_branch_prs = pull_requests
+                            .iter()
+                            .filter(|pull_request| {
+                                pull_request.status == PullRequestStatus::Open
+                                    && pull_request.source_branch == workspace.checked_out_branch
+                            })
+                            .collect::<Vec<_>>();
+                        let target_branch_prs = pull_requests
+                            .iter()
+                            .filter(|pull_request| {
+                                pull_request.status == PullRequestStatus::Open
+                                    && pull_request.target_branch == workspace.exported_branch
+                            })
+                            .collect::<Vec<_>>();
+                        say(&format!("current branch: {}", workspace.checked_out_branch));
+                        if current_branch_prs.is_empty() {
+                            say("  no open pull request for the current branch");
+                        } else {
+                            for pull_request in current_branch_prs {
+                                say(&format!(
+                                    "  {} -> {} {}",
+                                    pull_request.source_branch, pull_request.target_branch, pull_request.title
+                                ));
+                            }
+                        }
+                        say(&format!("served branch: {}", workspace.exported_branch));
+                        if target_branch_prs.is_empty() {
+                            say("  no open pull requests targeting the served branch");
+                        } else {
+                            for pull_request in target_branch_prs {
+                                say(&format!(
+                                    "  {} -> {} {}",
+                                    pull_request.source_branch, pull_request.target_branch, pull_request.title
+                                ));
+                            }
+                        }
+                        return Ok(());
+                    }
+                    PrCommands::Create {
+                        path,
+                        title,
+                        body,
+                        head,
+                        base,
+                    } => {
+                        let (workspace, _) =
+                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                        let pull_request = service
+                            .create_pull_request(
+                                path,
+                                default_branch,
+                                CreatePullRequest {
+                                    title,
+                                    description: body,
+                                    source_branch: head.unwrap_or_else(|| workspace.checked_out_branch.clone()),
+                                    target_branch: base.unwrap_or_else(|| workspace.exported_branch.clone()),
+                                },
+                                UiRole::Owner,
+                            )
+                            .await?
+                            .1;
+                        say(&format!(
+                            "created pull request {} {} -> {} ({})",
+                            pull_request.id.chars().take(8).collect::<String>(),
+                            pull_request.source_branch,
+                            pull_request.target_branch,
+                            pull_request.title
+                        ));
+                        return Ok(());
+                    }
+                    PrCommands::Edit {
+                        path,
+                        pull_request,
+                        title,
+                        body,
+                        open,
+                        close,
+                    } => {
+                        let (_, pull_requests) =
+                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                        let updated = service
+                            .update_pull_request(
+                                path,
+                                default_branch,
+                                &pull_request.id,
+                                UpdatePullRequest {
+                                    title,
+                                    description: body,
+                                    status: if open {
+                                        Some(PullRequestStatus::Open)
+                                    } else if close {
+                                        Some(PullRequestStatus::Closed)
+                                    } else {
+                                        None
+                                    },
+                                },
+                                UiRole::Owner,
+                            )
+                            .await?
+                            .1;
+                        say(&format!(
+                            "updated pull request {} [{}]",
+                            updated.id.chars().take(8).collect::<String>(),
+                            match updated.status {
+                                PullRequestStatus::Open => "open",
+                                PullRequestStatus::Closed => "closed",
+                                PullRequestStatus::Merged => "merged",
+                            }
+                        ));
+                        return Ok(());
+                    }
+                    PrCommands::Comment {
+                        path,
+                        pull_request,
+                        body,
+                        author,
+                    } => {
+                        let (_, pull_requests) =
+                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                        service
+                            .comment_pull_request(
+                                path,
+                                default_branch,
+                                &pull_request.id,
+                                CreatePullRequestComment {
+                                    display_name: author.unwrap_or_else(default_display_name),
+                                    body,
+                                },
+                                UiRole::Owner,
+                            )
+                            .await?;
+                        say("comment added");
+                        return Ok(());
+                    }
+                    PrCommands::Review {
+                        path,
+                        pull_request,
+                        approve,
+                        request_changes,
+                        comment: _comment,
+                        body,
+                        author,
+                    } => {
+                        let (_, pull_requests) =
+                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                        let state = if approve {
+                            PullRequestReviewState::Approved
+                        } else if request_changes {
+                            PullRequestReviewState::ChangesRequested
+                        } else {
+                            PullRequestReviewState::Commented
+                        };
+                        service
+                            .review_pull_request(
+                                path,
+                                default_branch,
+                                &pull_request.id,
+                                CreatePullRequestReview {
+                                    display_name: author.unwrap_or_else(default_display_name),
+                                    body,
+                                    state: state.clone(),
+                                },
+                                UiRole::Owner,
+                            )
+                            .await?;
+                        say(&format!(
+                            "submitted {} review",
+                            match state {
+                                PullRequestReviewState::Approved => "approved",
+                                PullRequestReviewState::ChangesRequested => "changes_requested",
+                                PullRequestReviewState::Commented => "comment",
+                            }
+                        ));
+                        return Ok(());
+                    }
+                    PrCommands::Merge { path, pull_request } => {
+                        let (_, pull_requests) =
+                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                        let merged = service
+                            .merge_pull_request(path, default_branch, &pull_request.id)
+                            .await?
+                            .1;
+                        say(&format!(
+                            "merged pull request {} at {}",
+                            merged.id.chars().take(8).collect::<String>(),
+                            merged
+                                .merged_commit
+                                .unwrap_or_else(|| "unknown".into())
+                                .chars()
+                                .take(12)
+                                .collect::<String>()
+                        ));
+                        return Ok(());
+                    }
+                    PrCommands::Close { path, pull_request } => {
+                        let (_, pull_requests) =
+                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                        service
+                            .update_pull_request(
+                                path,
+                                default_branch,
+                                &pull_request.id,
+                                UpdatePullRequest {
+                                    title: None,
+                                    description: None,
+                                    status: Some(PullRequestStatus::Closed),
+                                },
+                                UiRole::Owner,
+                            )
+                            .await?;
+                        say("closed pull request");
+                        return Ok(());
+                    }
+                    PrCommands::Reopen { path, pull_request } => {
+                        let (_, pull_requests) =
+                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                        service
+                            .update_pull_request(
+                                path,
+                                default_branch,
+                                &pull_request.id,
+                                UpdatePullRequest {
+                                    title: None,
+                                    description: None,
+                                    status: Some(PullRequestStatus::Open),
+                                },
+                                UiRole::Owner,
+                            )
+                            .await?;
+                        say("reopened pull request");
+                        return Ok(());
+                    }
+                    PrCommands::Delete { path, pull_request } => {
+                        let (_, pull_requests) =
+                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                        service
+                            .delete_pull_request(path, default_branch, &pull_request.id)
+                            .await?;
+                        say("deleted pull request");
+                        return Ok(());
+                    }
+                }
             }
         }
     }

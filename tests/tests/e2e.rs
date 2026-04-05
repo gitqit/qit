@@ -169,6 +169,19 @@ fn run_qit_with_env(args: &[&str], data_dir: Option<&Path>) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn first_pr_selector(output: &str) -> Result<String> {
+    output
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("pull requests for ") {
+                return None;
+            }
+            trimmed.split_whitespace().next().map(ToString::to_string)
+        })
+        .ok_or_else(|| anyhow!("failed to parse pull request selector from output"))
+}
+
 fn wait_for_clone_url(rx: &std::sync::mpsc::Receiver<String>) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut clone_url = None;
@@ -670,6 +683,186 @@ fn qit_cli_git_parity_options_cover_branch_and_checkout() -> Result<()> {
     ])?;
     assert!(!path_checkout.status.success());
     assert!(String::from_utf8_lossy(&path_checkout.stderr).contains("path checkout"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+#[test]
+fn qit_cli_pr_commands_cover_core_workflow() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("qit-data");
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "initial\n")?;
+
+    let port = free_port()?;
+    let (mut child, rx) = spawn_qit_serve_with_env(&worktree, port, false, Some(&data_dir))?;
+    let clone_url = wait_for_clone_url(&rx)?;
+
+    let clone_dir = root.path().join("clone");
+    run_git(None, &["clone", &clone_url, clone_dir.to_str().unwrap()])?;
+    run_git(Some(&clone_dir), &["config", "user.name", "Qit Tester"])?;
+    run_git(
+        Some(&clone_dir),
+        &["config", "user.email", "qit@example.com"],
+    )?;
+
+    run_git(Some(&clone_dir), &["checkout", "-b", "feature"])?;
+    std::fs::write(clone_dir.join("README.md"), "feature branch\n")?;
+    run_git(Some(&clone_dir), &["commit", "-am", "feature readme"])?;
+    run_git(Some(&clone_dir), &["push", "origin", "HEAD:feature"])?;
+
+    run_qit_with_env(
+        &["checkout", worktree.to_str().unwrap(), "feature"],
+        Some(&data_dir),
+    )?;
+
+    let status = run_qit_with_env(&["pr", "status", worktree.to_str().unwrap()], Some(&data_dir))?;
+    assert!(status.contains("current branch: feature"));
+
+    let created = run_qit_with_env(
+        &[
+            "pr",
+            "create",
+            worktree.to_str().unwrap(),
+            "--title",
+            "Feature PR",
+            "--body",
+            "Adds the feature branch",
+            "--head",
+            "feature",
+            "--base",
+            "main",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(created.contains("created pull request"));
+
+    let listed = run_qit_with_env(
+        &["pr", "list", worktree.to_str().unwrap(), "--state", "open"],
+        Some(&data_dir),
+    )?;
+    assert!(listed.contains("Feature PR"));
+    let selector = first_pr_selector(&listed)?;
+
+    let diff = run_qit_with_env(
+        &["pr", "diff", worktree.to_str().unwrap(), &selector],
+        Some(&data_dir),
+    )?;
+    assert!(diff.contains("--- a/README.md"));
+    assert!(diff.contains("+++ b/README.md"));
+
+    run_qit_with_env(
+        &[
+            "pr",
+            "comment",
+            worktree.to_str().unwrap(),
+            &selector,
+            "--body",
+            "Please double check the copy.",
+            "--author",
+            "Alice",
+        ],
+        Some(&data_dir),
+    )?;
+    run_qit_with_env(
+        &[
+            "pr",
+            "review",
+            worktree.to_str().unwrap(),
+            &selector,
+            "--approve",
+            "--body",
+            "Looks good to me.",
+            "--author",
+            "Alice",
+        ],
+        Some(&data_dir),
+    )?;
+    run_qit_with_env(
+        &[
+            "pr",
+            "edit",
+            worktree.to_str().unwrap(),
+            &selector,
+            "--title",
+            "Updated Feature PR",
+            "--body",
+            "Updated body",
+            "--close",
+        ],
+        Some(&data_dir),
+    )?;
+
+    let viewed = run_qit_with_env(
+        &["pr", "view", worktree.to_str().unwrap(), &selector],
+        Some(&data_dir),
+    )?;
+    assert!(viewed.contains("Updated Feature PR"));
+    assert!(viewed.contains("Alice"));
+    assert!(viewed.contains("approved"));
+    assert!(viewed.contains("closed the pull request"));
+
+    run_qit_with_env(
+        &["pr", "reopen", worktree.to_str().unwrap(), &selector],
+        Some(&data_dir),
+    )?;
+    run_qit_with_env(
+        &["pr", "merge", worktree.to_str().unwrap(), &selector],
+        Some(&data_dir),
+    )?;
+
+    let merged = run_qit_with_env(
+        &["pr", "list", worktree.to_str().unwrap(), "--state", "merged"],
+        Some(&data_dir),
+    )?;
+    assert!(merged.contains("Updated Feature PR"));
+
+    run_git(Some(&clone_dir), &["checkout", "main"])?;
+    run_git(Some(&clone_dir), &["checkout", "-b", "cleanup"])?;
+    std::fs::write(clone_dir.join("cleanup.txt"), "cleanup\n")?;
+    run_git(Some(&clone_dir), &["add", "cleanup.txt"])?;
+    run_git(Some(&clone_dir), &["commit", "-m", "cleanup change"])?;
+    run_git(Some(&clone_dir), &["push", "origin", "HEAD:cleanup"])?;
+
+    run_qit_with_env(
+        &[
+            "pr",
+            "create",
+            worktree.to_str().unwrap(),
+            "--title",
+            "Cleanup PR",
+            "--body",
+            "Temporary cleanup",
+            "--head",
+            "cleanup",
+            "--base",
+            "main",
+        ],
+        Some(&data_dir),
+    )?;
+    let listed = run_qit_with_env(
+        &["pr", "list", worktree.to_str().unwrap(), "--state", "open"],
+        Some(&data_dir),
+    )?;
+    assert!(listed.contains("Cleanup PR"));
+    let cleanup_selector = listed
+        .lines()
+        .find(|line| line.contains("Cleanup PR"))
+        .and_then(|line| line.split_whitespace().next())
+        .map(ToString::to_string)
+        .context("parse cleanup selector")?;
+    run_qit_with_env(
+        &["pr", "delete", worktree.to_str().unwrap(), &cleanup_selector],
+        Some(&data_dir),
+    )?;
+    let listed = run_qit_with_env(
+        &["pr", "list", worktree.to_str().unwrap(), "--state", "all"],
+        Some(&data_dir),
+    )?;
+    assert!(!listed.contains("Cleanup PR"));
 
     let _ = child.kill();
     let _ = child.wait();

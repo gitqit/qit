@@ -1577,6 +1577,7 @@ dependencies = [
  "qit-transports",
  "qit-webui",
  "rand 0.8.5",
+ "similar",
  "tempfile",
  "tokio",
  "tracing-subscriber",
@@ -1692,6 +1693,7 @@ version = "0.1.5"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "http-body-util",
  "qit-domain",
  "qit-http",
@@ -2221,6 +2223,15 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "similar"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26d0b06eba54f0ca0770f970a3e89823e766ca638dd940f8469fa0fa50c75396"
+dependencies = [
+ "bstr",
 ]
 
 [[package]]

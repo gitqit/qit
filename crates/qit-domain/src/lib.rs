@@ -121,6 +121,79 @@ pub enum PullRequestStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestReviewState {
+    Commented,
+    Approved,
+    ChangesRequested,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestActivityKind {
+    Opened,
+    Commented,
+    Reviewed,
+    Edited,
+    Closed,
+    Reopened,
+    Merged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestActivityRecord {
+    pub id: String,
+    pub kind: PullRequestActivityKind,
+    pub actor_role: UiRole,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub review_state: Option<PullRequestReviewState>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestCommentRecord {
+    pub id: String,
+    pub actor_role: UiRole,
+    pub display_name: String,
+    pub body: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestReviewRecord {
+    pub id: String,
+    pub actor_role: UiRole,
+    pub display_name: String,
+    pub body: String,
+    pub state: PullRequestReviewState,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestReviewSummaryEntry {
+    pub actor_role: UiRole,
+    pub display_name: String,
+    pub state: PullRequestReviewState,
+    pub reviewed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestReviewSummary {
+    pub approvals: usize,
+    pub changes_requested: usize,
+    pub comments: usize,
+    pub latest_reviews: Vec<PullRequestReviewSummaryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PullRequestRecord {
     pub id: String,
     pub title: String,
@@ -137,6 +210,8 @@ pub struct PullRequestRecord {
     pub updated_at_ms: u64,
     #[serde(default)]
     pub merged_commit: Option<String>,
+    #[serde(default)]
+    pub activities: Vec<PullRequestActivityRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +220,26 @@ pub struct CreatePullRequest {
     pub description: String,
     pub source_branch: String,
     pub target_branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdatePullRequest {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<PullRequestStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePullRequestComment {
+    pub display_name: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePullRequestReview {
+    pub display_name: String,
+    pub body: String,
+    pub state: PullRequestReviewState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -267,6 +362,8 @@ pub enum DomainError {
     Registry(#[source] RegistryError),
     #[error("repository operation failed: {0}")]
     Repository(#[source] RepositoryError),
+    #[error("invalid pull request state: {0}")]
+    InvalidPullRequest(String),
     #[error(
         "refusing to serve existing Git worktree {0}; rerun with --allow-existing-git to opt in"
     )]
@@ -484,6 +581,131 @@ impl WorkspaceService {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    fn normalize_required(value: &str, field: &str) -> Result<String, DomainError> {
+        let normalized = value.trim();
+        if normalized.is_empty() {
+            return Err(DomainError::InvalidPullRequest(format!("{field} is required")));
+        }
+        Ok(normalized.to_string())
+    }
+
+    fn push_activity(
+        pull_request: &mut PullRequestRecord,
+        kind: PullRequestActivityKind,
+        actor_role: UiRole,
+        display_name: Option<String>,
+        body: Option<String>,
+        review_state: Option<PullRequestReviewState>,
+        title: Option<String>,
+        description: Option<String>,
+        created_at_ms: u64,
+    ) {
+        pull_request.activities.push(PullRequestActivityRecord {
+            id: Uuid::new_v4().to_string(),
+            kind,
+            actor_role,
+            display_name,
+            body,
+            review_state,
+            title,
+            description,
+            created_at_ms,
+        });
+    }
+
+    pub fn pull_request_comments(pull_request: &PullRequestRecord) -> Vec<PullRequestCommentRecord> {
+        pull_request
+            .activities
+            .iter()
+            .filter_map(|activity| {
+                if activity.kind != PullRequestActivityKind::Commented {
+                    return None;
+                }
+                Some(PullRequestCommentRecord {
+                    id: activity.id.clone(),
+                    actor_role: activity.actor_role.clone(),
+                    display_name: activity
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| match activity.actor_role {
+                            UiRole::Owner => "Owner".into(),
+                            UiRole::User => "Viewer".into(),
+                        }),
+                    body: activity.body.clone().unwrap_or_default(),
+                    created_at_ms: activity.created_at_ms,
+                })
+            })
+            .collect()
+    }
+
+    pub fn pull_request_reviews(pull_request: &PullRequestRecord) -> Vec<PullRequestReviewRecord> {
+        pull_request
+            .activities
+            .iter()
+            .filter_map(|activity| {
+                if activity.kind != PullRequestActivityKind::Reviewed {
+                    return None;
+                }
+                Some(PullRequestReviewRecord {
+                    id: activity.id.clone(),
+                    actor_role: activity.actor_role.clone(),
+                    display_name: activity
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| match activity.actor_role {
+                            UiRole::Owner => "Owner".into(),
+                            UiRole::User => "Viewer".into(),
+                        }),
+                    body: activity.body.clone().unwrap_or_default(),
+                    state: activity.review_state.clone().unwrap_or(PullRequestReviewState::Commented),
+                    created_at_ms: activity.created_at_ms,
+                })
+            })
+            .collect()
+    }
+
+    pub fn pull_request_review_summary(
+        pull_request: &PullRequestRecord,
+    ) -> PullRequestReviewSummary {
+        let mut latest_by_reviewer: Vec<PullRequestReviewSummaryEntry> = Vec::new();
+        for review in Self::pull_request_reviews(pull_request) {
+            if let Some(existing) = latest_by_reviewer.iter_mut().find(|entry| {
+                entry.actor_role == review.actor_role && entry.display_name == review.display_name
+            }) {
+                if existing.reviewed_at_ms <= review.created_at_ms {
+                    existing.state = review.state;
+                    existing.reviewed_at_ms = review.created_at_ms;
+                }
+            } else {
+                latest_by_reviewer.push(PullRequestReviewSummaryEntry {
+                    actor_role: review.actor_role,
+                    display_name: review.display_name,
+                    state: review.state,
+                    reviewed_at_ms: review.created_at_ms,
+                });
+            }
+        }
+        latest_by_reviewer.sort_by(|left, right| right.reviewed_at_ms.cmp(&left.reviewed_at_ms));
+        let approvals = latest_by_reviewer
+            .iter()
+            .filter(|entry| entry.state == PullRequestReviewState::Approved)
+            .count();
+        let changes_requested = latest_by_reviewer
+            .iter()
+            .filter(|entry| entry.state == PullRequestReviewState::ChangesRequested)
+            .count();
+        let comments = latest_by_reviewer
+            .iter()
+            .filter(|entry| entry.state == PullRequestReviewState::Commented)
+            .count();
+        PullRequestReviewSummary {
+            approvals,
+            changes_requested,
+            comments,
+            latest_reviews: latest_by_reviewer,
+        }
     }
 
     fn lock_resolved_workspace(
@@ -754,6 +976,8 @@ impl WorkspaceService {
         let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
         let _lock = self.lock_resolved_workspace(&initial_workspace)?;
         let workspace = self.existing_workspace(path, fallback_branch)?;
+        let title = Self::normalize_required(&draft.title, "pull request title")?;
+        let description = draft.description.trim().to_string();
         let branches = self
             .repo_store
             .list_branches(&workspace)
@@ -777,20 +1001,32 @@ impl WorkspaceService {
         };
         let mut web_ui = self.load_web_ui_state(&workspace)?;
         let timestamp = Self::now_ms();
-        let pull_request = PullRequestRecord {
+        let mut pull_request = PullRequestRecord {
             id: Uuid::new_v4().to_string(),
-            title: draft.title,
-            description: draft.description,
+            title,
+            description,
             source_branch: draft.source_branch,
             target_branch: draft.target_branch,
             source_commit: Some(source_branch.commit.clone()),
             target_commit: Some(target_branch.commit.clone()),
             status: PullRequestStatus::Open,
-            author_role,
+            author_role: author_role.clone(),
             created_at_ms: timestamp,
             updated_at_ms: timestamp,
             merged_commit: None,
+            activities: Vec::new(),
         };
+        Self::push_activity(
+            &mut pull_request,
+            PullRequestActivityKind::Opened,
+            author_role,
+            None,
+            None,
+            None,
+            None,
+            None,
+            timestamp,
+        );
         web_ui.pull_requests.push(pull_request.clone());
         self.save_workspace_with_web_ui(&workspace, web_ui)?;
         Ok((workspace, pull_request))
@@ -829,10 +1065,246 @@ impl WorkspaceService {
             .await
             .map_err(DomainError::Repository)?;
 
+        let timestamp = Self::now_ms();
         web_ui.pull_requests[index].status = PullRequestStatus::Merged;
-        web_ui.pull_requests[index].updated_at_ms = Self::now_ms();
+        web_ui.pull_requests[index].updated_at_ms = timestamp;
         web_ui.pull_requests[index].merged_commit = Some(merged_commit);
+        Self::push_activity(
+            &mut web_ui.pull_requests[index],
+            PullRequestActivityKind::Merged,
+            UiRole::Owner,
+            None,
+            None,
+            None,
+            None,
+            None,
+            timestamp,
+        );
         let pull_request = web_ui.pull_requests[index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, pull_request))
+    }
+
+    pub async fn update_pull_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        pull_request_id: &str,
+        update: UpdatePullRequest,
+        actor_role: UiRole,
+    ) -> Result<(WorkspaceSpec, PullRequestRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let Some(index) = web_ui
+            .pull_requests
+            .iter()
+            .position(|pull_request| pull_request.id == pull_request_id)
+        else {
+            return Err(DomainError::Repository(RepositoryError::RefNotFound(
+                pull_request_id.to_string(),
+            )));
+        };
+
+        let mut changed = false;
+        let timestamp = Self::now_ms();
+        let pull_request = &mut web_ui.pull_requests[index];
+        if pull_request.status == PullRequestStatus::Merged && update.status.is_some() {
+            return Err(DomainError::InvalidPullRequest(
+                "merged pull requests cannot be reopened or closed".into(),
+            ));
+        }
+        if let Some(title) = update.title {
+            let title = Self::normalize_required(&title, "pull request title")?;
+            if title != pull_request.title {
+                pull_request.title = title;
+                changed = true;
+            }
+        }
+        if let Some(description) = update.description {
+            let description = description.trim().to_string();
+            if description != pull_request.description {
+                pull_request.description = description;
+                changed = true;
+            }
+        }
+        if changed {
+            pull_request.updated_at_ms = timestamp;
+            let next_title = pull_request.title.clone();
+            let next_description = pull_request.description.clone();
+            Self::push_activity(
+                pull_request,
+                PullRequestActivityKind::Edited,
+                actor_role.clone(),
+                None,
+                None,
+                None,
+                Some(next_title),
+                Some(next_description),
+                timestamp,
+            );
+        }
+
+        if let Some(status) = update.status {
+            let current_status = pull_request.status.clone();
+            match (&current_status, status.clone()) {
+                (PullRequestStatus::Open, PullRequestStatus::Closed) => {
+                    pull_request.status = PullRequestStatus::Closed;
+                    pull_request.updated_at_ms = timestamp;
+                    Self::push_activity(
+                        pull_request,
+                        PullRequestActivityKind::Closed,
+                        actor_role,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        timestamp,
+                    );
+                }
+                (PullRequestStatus::Closed, PullRequestStatus::Open) => {
+                    pull_request.status = PullRequestStatus::Open;
+                    pull_request.updated_at_ms = timestamp;
+                    Self::push_activity(
+                        pull_request,
+                        PullRequestActivityKind::Reopened,
+                        actor_role,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        timestamp,
+                    );
+                }
+                (PullRequestStatus::Merged, PullRequestStatus::Merged)
+                | (PullRequestStatus::Open, PullRequestStatus::Open)
+                | (PullRequestStatus::Closed, PullRequestStatus::Closed) => {}
+                (_, PullRequestStatus::Merged) => {
+                    return Err(DomainError::InvalidPullRequest(
+                        "pull requests must be merged through the merge action".into(),
+                    ));
+                }
+                _ => {
+                    return Err(DomainError::InvalidPullRequest(format!(
+                        "cannot transition pull request from {:?} to {:?}",
+                        current_status, status
+                    )));
+                }
+            }
+        }
+
+        let pull_request = web_ui.pull_requests[index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, pull_request))
+    }
+
+    pub async fn comment_pull_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        pull_request_id: &str,
+        comment: CreatePullRequestComment,
+        actor_role: UiRole,
+    ) -> Result<(WorkspaceSpec, PullRequestRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let Some(index) = web_ui
+            .pull_requests
+            .iter()
+            .position(|pull_request| pull_request.id == pull_request_id)
+        else {
+            return Err(DomainError::Repository(RepositoryError::RefNotFound(
+                pull_request_id.to_string(),
+            )));
+        };
+
+        let display_name = Self::normalize_required(&comment.display_name, "display name")?;
+        let body = Self::normalize_required(&comment.body, "comment body")?;
+        let timestamp = Self::now_ms();
+        web_ui.pull_requests[index].updated_at_ms = timestamp;
+        Self::push_activity(
+            &mut web_ui.pull_requests[index],
+            PullRequestActivityKind::Commented,
+            actor_role,
+            Some(display_name),
+            Some(body),
+            None,
+            None,
+            None,
+            timestamp,
+        );
+        let pull_request = web_ui.pull_requests[index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, pull_request))
+    }
+
+    pub async fn review_pull_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        pull_request_id: &str,
+        review: CreatePullRequestReview,
+        actor_role: UiRole,
+    ) -> Result<(WorkspaceSpec, PullRequestRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let Some(index) = web_ui
+            .pull_requests
+            .iter()
+            .position(|pull_request| pull_request.id == pull_request_id)
+        else {
+            return Err(DomainError::Repository(RepositoryError::RefNotFound(
+                pull_request_id.to_string(),
+            )));
+        };
+
+        let display_name = Self::normalize_required(&review.display_name, "display name")?;
+        let body = review.body.trim().to_string();
+        let timestamp = Self::now_ms();
+        web_ui.pull_requests[index].updated_at_ms = timestamp;
+        Self::push_activity(
+            &mut web_ui.pull_requests[index],
+            PullRequestActivityKind::Reviewed,
+            actor_role,
+            Some(display_name),
+            Some(body),
+            Some(review.state),
+            None,
+            None,
+            timestamp,
+        );
+        let pull_request = web_ui.pull_requests[index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, pull_request))
+    }
+
+    pub async fn delete_pull_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        pull_request_id: &str,
+    ) -> Result<(WorkspaceSpec, PullRequestRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let Some(index) = web_ui
+            .pull_requests
+            .iter()
+            .position(|pull_request| pull_request.id == pull_request_id)
+        else {
+            return Err(DomainError::Repository(RepositoryError::RefNotFound(
+                pull_request_id.to_string(),
+            )));
+        };
+        let pull_request = web_ui.pull_requests.remove(index);
         self.save_workspace_with_web_ui(&workspace, web_ui)?;
         Ok((workspace, pull_request))
     }
@@ -1079,6 +1551,74 @@ impl WorkspaceService {
     }
 }
 
+const PULL_REQUEST_HISTORY_LOOKBACK_LIMIT: usize = 120;
+
+pub async fn resolve_branch_commit_at_time(
+    repo_read_store: &dyn RepoReadStore,
+    workspace: &WorkspaceSpec,
+    branch: &str,
+    timestamp_ms: u64,
+) -> Option<String> {
+    let cutoff = (timestamp_ms / 1000) as i64;
+    let mut offset = 0;
+    loop {
+        let history = repo_read_store
+            .list_commits(
+                workspace,
+                Some(branch),
+                offset,
+                PULL_REQUEST_HISTORY_LOOKBACK_LIMIT,
+            )
+            .await
+            .ok()?;
+        if history.commits.is_empty() {
+            return None;
+        }
+        if let Some(commit) = history.commits.iter().find(|commit| commit.authored_at <= cutoff) {
+            return Some(commit.id.clone());
+        }
+        if !history.has_more {
+            return None;
+        }
+        offset += history.commits.len();
+    }
+}
+
+pub async fn resolve_pull_request_refs(
+    repo_read_store: &dyn RepoReadStore,
+    workspace: &WorkspaceSpec,
+    pull_request: &PullRequestRecord,
+) -> (String, String) {
+    let base_ref = if let Some(target_commit) = &pull_request.target_commit {
+        target_commit.clone()
+    } else {
+        resolve_branch_commit_at_time(
+            repo_read_store,
+            workspace,
+            &pull_request.target_branch,
+            pull_request.created_at_ms,
+        )
+        .await
+        .unwrap_or_else(|| pull_request.target_branch.clone())
+    };
+
+    let head_ref = if let Some(source_commit) = &pull_request.source_commit {
+        source_commit.clone()
+    } else {
+        resolve_branch_commit_at_time(
+            repo_read_store,
+            workspace,
+            &pull_request.source_branch,
+            pull_request.created_at_ms,
+        )
+        .await
+        .or_else(|| pull_request.merged_commit.clone())
+        .unwrap_or_else(|| pull_request.source_branch.clone())
+    };
+
+    (base_ref, head_ref)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,6 +1777,34 @@ mod tests {
             sidecar,
             WorkspaceId::from_worktree(&worktree),
         )
+    }
+
+    fn service_with_workspace(
+        exported_branch: &str,
+        checked_out_branch: &str,
+    ) -> (TempDir, Arc<StubRegistry>, WorkspaceService) {
+        let (temp, worktree, sidecar, workspace_id) = temp_workspace();
+        std::fs::create_dir_all(&sidecar).unwrap();
+        let registry = Arc::new(StubRegistry {
+            worktree: worktree.clone(),
+            default_sidecar: sidecar.clone(),
+            records: Mutex::new(HashMap::from([(
+                workspace_id,
+                WorkspaceRecord {
+                    worktree,
+                    sidecar,
+                    exported_branch: exported_branch.into(),
+                    checked_out_branch: Some(checked_out_branch.into()),
+                    web_ui: WorkspaceWebUiState::default(),
+                },
+            )])),
+        });
+        let service = WorkspaceService::new(
+            Arc::new(StubRepoStore),
+            registry.clone(),
+            Arc::new(StubIssuer),
+        );
+        (temp, registry, service)
     }
 
     #[tokio::test]
@@ -1551,5 +2119,152 @@ mod tests {
 
         assert_eq!(prepared.workspace.checked_out_branch, "trunk");
         assert_eq!(prepared.workspace.exported_branch, "trunk");
+    }
+
+    #[tokio::test]
+    async fn pull_request_lifecycle_tracks_discussion_reviews_and_status() {
+        let (_temp, registry, service) = service_with_workspace("main", "feature");
+
+        let (_, created) = service
+            .create_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreatePullRequest {
+                    title: "Feature PR".into(),
+                    description: "Initial description".into(),
+                    source_branch: "feature".into(),
+                    target_branch: "main".into(),
+                },
+                UiRole::User,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.activities.len(), 1);
+        assert_eq!(created.activities[0].kind, PullRequestActivityKind::Opened);
+
+        let (_, updated) = service
+            .update_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &created.id,
+                UpdatePullRequest {
+                    title: Some("Updated PR".into()),
+                    description: Some("Updated description".into()),
+                    status: Some(PullRequestStatus::Closed),
+                },
+                UiRole::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.title, "Updated PR");
+        assert_eq!(updated.status, PullRequestStatus::Closed);
+
+        let (_, commented) = service
+            .comment_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &created.id,
+                CreatePullRequestComment {
+                    display_name: "Casey".into(),
+                    body: "Looks close.".into(),
+                },
+                UiRole::User,
+            )
+            .await
+            .unwrap();
+
+        let (_, reviewed) = service
+            .review_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &created.id,
+                CreatePullRequestReview {
+                    display_name: "Casey".into(),
+                    body: "Please tighten this up.".into(),
+                    state: PullRequestReviewState::ChangesRequested,
+                },
+                UiRole::User,
+            )
+            .await
+            .unwrap();
+
+        let (_, reopened) = service
+            .update_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &created.id,
+                UpdatePullRequest {
+                    title: None,
+                    description: None,
+                    status: Some(PullRequestStatus::Open),
+                },
+                UiRole::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened.status, PullRequestStatus::Open);
+
+        let summary = WorkspaceService::pull_request_review_summary(&reviewed);
+        assert_eq!(summary.changes_requested, 1);
+        assert_eq!(summary.latest_reviews[0].display_name, "Casey");
+        assert_eq!(WorkspaceService::pull_request_comments(&commented).len(), 1);
+
+        let stored = registry.records.lock().unwrap();
+        let stored_pr = stored
+            .values()
+            .next()
+            .unwrap()
+            .web_ui
+            .pull_requests
+            .first()
+            .unwrap()
+            .clone();
+        assert_eq!(stored_pr.status, PullRequestStatus::Open);
+        assert!(stored_pr
+            .activities
+            .iter()
+            .any(|activity| activity.kind == PullRequestActivityKind::Closed));
+        assert!(stored_pr
+            .activities
+            .iter()
+            .any(|activity| activity.kind == PullRequestActivityKind::Reopened));
+        assert!(stored_pr
+            .activities
+            .iter()
+            .any(|activity| activity.kind == PullRequestActivityKind::Reviewed));
+    }
+
+    #[tokio::test]
+    async fn deleting_pull_requests_removes_them_from_workspace_state() {
+        let (_temp, registry, service) = service_with_workspace("main", "feature");
+        let (_, created) = service
+            .create_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreatePullRequest {
+                    title: "Disposable".into(),
+                    description: String::new(),
+                    source_branch: "feature".into(),
+                    target_branch: "main".into(),
+                },
+                UiRole::Owner,
+            )
+            .await
+            .unwrap();
+
+        let (_, deleted) = service
+            .delete_pull_request(PathBuf::from("."), DEFAULT_BRANCH, &created.id)
+            .await
+            .unwrap();
+        assert_eq!(deleted.id, created.id);
+
+        let stored = registry.records.lock().unwrap();
+        assert!(stored
+            .values()
+            .next()
+            .unwrap()
+            .web_ui
+            .pull_requests
+            .is_empty());
     }
 }

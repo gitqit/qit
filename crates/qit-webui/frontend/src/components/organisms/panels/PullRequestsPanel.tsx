@@ -1,18 +1,30 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   ArrowLeft,
   FileDiff,
   GitCommitHorizontal,
   GitMerge,
   GitPullRequestCreateArrow,
+  MessageSquareMore,
+  PencilLine,
+  RotateCcw,
+  Save,
   Search,
+  ThumbsDown,
+  ThumbsUp,
+  Trash2,
+  XCircle,
 } from 'lucide-react'
 import { api } from '../../../lib/api'
+import { usePersistentDisplayName } from '../../../lib/usePersistentDisplayName'
 import type {
+  PullRequestActivity,
   PullRequestDetailResponse,
   PullRequestRecord,
+  PullRequestReviewState,
   PullRequestStatus,
   RefDiffFile,
+  UiRole,
 } from '../../../lib/types'
 import { Badge, Button, EmptyState, Panel, Spinner } from '../../atoms/Controls'
 import { MonacoDiffSurface } from '../MonacoCodeSurface'
@@ -51,10 +63,49 @@ function diffHeight(file: RefDiffFile) {
   return Math.min(840, Math.max(220, lineCount * 20 + 56))
 }
 
+function actorLabel(actorRole: UiRole, displayName?: string | null) {
+  return displayName?.trim() || (actorRole === 'owner' ? 'Owner' : 'Viewer')
+}
+
+function reviewTone(state: PullRequestReviewState) {
+  return state === 'approved'
+    ? 'success'
+    : state === 'changes_requested'
+      ? 'danger'
+      : 'muted'
+}
+
+function reviewLabel(state: PullRequestReviewState) {
+  return state === 'changes_requested'
+    ? 'Changes requested'
+    : state === 'approved'
+      ? 'Approved'
+      : 'Commented'
+}
+
+function activityLabel(activity: PullRequestActivity) {
+  switch (activity.kind) {
+    case 'opened':
+      return 'opened this pull request'
+    case 'commented':
+      return 'left a comment'
+    case 'reviewed':
+      return activity.review_state ? reviewLabel(activity.review_state).toLowerCase() : 'reviewed'
+    case 'edited':
+      return 'edited the pull request details'
+    case 'closed':
+      return 'closed this pull request'
+    case 'reopened':
+      return 'reopened this pull request'
+    case 'merged':
+      return 'merged this pull request'
+  }
+}
+
 function PullRequestList({
   pullRequests,
   highlightedPullRequestId,
-  canMerge,
+  canManage,
   canCreate,
   onCreate,
   onMerge,
@@ -62,7 +113,7 @@ function PullRequestList({
 }: {
   pullRequests: PullRequestRecord[]
   highlightedPullRequestId: string | null
-  canMerge: boolean
+  canManage: boolean
   canCreate: boolean
   onCreate: () => void
   onMerge: (id: string) => Promise<void>
@@ -193,7 +244,7 @@ function PullRequestList({
                         </p>
                       ) : null}
                     </div>
-                    {pullRequest.status === 'open' && canMerge ? (
+                    {pullRequest.status === 'open' && canManage ? (
                       <Button
                         icon={<GitMerge className="h-4 w-4" strokeWidth={1.9} />}
                         onClick={(event) => {
@@ -221,51 +272,82 @@ function PullRequestList({
 }
 
 function PullRequestDetail({
+  actor,
   pullRequestId,
-  canMerge,
+  canManage,
   onBack,
+  onComment,
+  onDelete,
   onMerge,
+  onReview,
+  onUpdate,
 }: {
+  actor: UiRole
   pullRequestId: string
-  canMerge: boolean
+  canManage: boolean
   onBack: () => void
+  onComment: (id: string, payload: { display_name: string; body: string }) => Promise<PullRequestRecord>
+  onDelete: (id: string) => Promise<PullRequestRecord>
   onMerge: (id: string) => Promise<void>
+  onReview: (
+    id: string,
+    payload: { display_name: string; body: string; state: PullRequestReviewState },
+  ) => Promise<PullRequestRecord>
+  onUpdate: (
+    id: string,
+    payload: { title?: string; description?: string; status?: 'open' | 'closed' },
+  ) => Promise<PullRequestRecord>
 }) {
   const [detail, setDetail] = useState<PullRequestDetailResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
-  const [merging, setMerging] = useState(false)
+  const [pendingAction, setPendingAction] = useState<string | null>(null)
+  const [isEditing, setIsEditing] = useState(false)
+  const [titleDraft, setTitleDraft] = useState('')
+  const [descriptionDraft, setDescriptionDraft] = useState('')
+  const [commentBody, setCommentBody] = useState('')
+  const [reviewBody, setReviewBody] = useState('')
+  const [displayName, setDisplayName] = usePersistentDisplayName()
 
-  useEffect(() => {
-    let active = true
+  const loadDetail = useCallback(async () => {
     setLoading(true)
     setLoadError(null)
     setActionError(null)
-    setDetail(null)
-
-    void api
-      .pullRequest(pullRequestId)
-      .then((response) => {
-        if (active) {
-          setDetail(response)
-        }
-      })
-      .catch((loadError) => {
-        if (active) {
-          setLoadError(loadError instanceof Error ? loadError.message : 'Failed to load the pull request.')
-        }
-      })
-      .finally(() => {
-        if (active) {
-          setLoading(false)
-        }
-      })
-
-    return () => {
-      active = false
+    try {
+      const response = await api.pullRequest(pullRequestId)
+      setDetail(response)
+      setTitleDraft(response.pull_request.title)
+      setDescriptionDraft(response.pull_request.description)
+      setIsEditing(false)
+    } catch (nextError) {
+      setLoadError(nextError instanceof Error ? nextError.message : 'Failed to load the pull request.')
+    } finally {
+      setLoading(false)
     }
   }, [pullRequestId])
+
+  useEffect(() => {
+    void loadDetail()
+  }, [loadDetail])
+
+  const runAction = useCallback(
+    async (label: string, action: () => Promise<void>, reload = true) => {
+      setPendingAction(label)
+      setActionError(null)
+      try {
+        await action()
+        if (reload) {
+          await loadDetail()
+        }
+      } catch (nextError) {
+        setActionError(nextError instanceof Error ? nextError.message : 'Pull request action failed.')
+      } finally {
+        setPendingAction(null)
+      }
+    },
+    [loadDetail],
+  )
 
   if (loading) {
     return (
@@ -298,7 +380,9 @@ function PullRequestDetail({
     )
   }
 
-  const { pull_request: pullRequest, comparison, diffs } = detail
+  const { pull_request: pullRequest, comparison, diffs, comments, reviews, review_summary: reviewSummary, activity } = detail
+  const isBusy = pendingAction !== null
+  const reversedActivity = [...activity].reverse()
 
   return (
     <div className="space-y-6">
@@ -313,7 +397,7 @@ function PullRequestDetail({
           </Button>
         }
         subtitle="Review the pull request summary, commit range, and file-level changes in one place."
-        title={pullRequest.title}
+        title={isEditing ? 'Edit pull request' : pullRequest.title}
       >
         <div className="space-y-6">
           <div className="flex flex-wrap items-center gap-2">
@@ -326,7 +410,66 @@ function PullRequestDetail({
             ) : null}
           </div>
 
-          {pullRequest.description ? (
+          {canManage ? (
+            <div className="space-y-4 rounded-token border border-border bg-panel-subtle px-4 py-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-fg">Pull request details</p>
+                  <p className="text-sm text-fg-muted">Owners can refine the title, description, and status.</p>
+                </div>
+                <Button
+                  icon={<PencilLine className="h-4 w-4" strokeWidth={1.9} />}
+                  onClick={() => {
+                    if (isEditing) {
+                      setTitleDraft(pullRequest.title)
+                      setDescriptionDraft(pullRequest.description)
+                    }
+                    setIsEditing((current) => !current)
+                  }}
+                  tone="muted"
+                >
+                  {isEditing ? 'Cancel edit' : 'Edit details'}
+                </Button>
+              </div>
+              {isEditing ? (
+                <div className="space-y-4">
+                  <input
+                    className="w-full rounded-token border border-border bg-panel px-3.5 py-2.5 text-sm text-fg outline-none transition placeholder:text-fg-subtle focus:border-accent focus:ring-2 focus:ring-accent/20"
+                    onChange={(event) => setTitleDraft(event.target.value)}
+                    placeholder="Pull request title"
+                    value={titleDraft}
+                  />
+                  <textarea
+                    className="min-h-28 w-full rounded-token border border-border bg-panel px-3.5 py-3 text-sm text-fg outline-none transition placeholder:text-fg-subtle focus:border-accent focus:ring-2 focus:ring-accent/20"
+                    onChange={(event) => setDescriptionDraft(event.target.value)}
+                    placeholder="Describe this pull request"
+                    value={descriptionDraft}
+                  />
+                  <div className="flex flex-wrap items-center gap-3">
+                    <Button
+                      disabled={isBusy}
+                      icon={pendingAction === 'save' ? <Spinner /> : <Save className="h-4 w-4" strokeWidth={1.9} />}
+                      onClick={() =>
+                        void runAction('save', async () => {
+                          await onUpdate(pullRequest.id, {
+                            title: titleDraft,
+                            description: descriptionDraft,
+                          })
+                        })
+                      }
+                    >
+                      {pendingAction === 'save' ? 'Saving...' : 'Save details'}
+                    </Button>
+                    {actionError ? <p className="text-sm text-danger">{actionError}</p> : null}
+                  </div>
+                </div>
+              ) : pullRequest.description ? (
+                <p className="max-w-4xl text-sm leading-7 text-fg-muted">{pullRequest.description}</p>
+              ) : (
+                <p className="text-sm text-fg-subtle">No description was added to this pull request.</p>
+              )}
+            </div>
+          ) : pullRequest.description ? (
             <p className="max-w-4xl text-sm leading-7 text-fg-muted">{pullRequest.description}</p>
           ) : (
             <p className="text-sm text-fg-subtle">No description was added to this pull request.</p>
@@ -351,31 +494,295 @@ function PullRequestDetail({
             </div>
           </div>
 
-          {pullRequest.status === 'open' && canMerge ? (
-            <div className="flex flex-wrap items-center gap-3">
-              <Button
-                icon={merging ? <Spinner /> : <GitMerge className="h-4 w-4" strokeWidth={1.9} />}
-                onClick={async () => {
-                  setMerging(true)
-                  setActionError(null)
-                  try {
-                    await onMerge(pullRequest.id)
-                    setDetail(await api.pullRequest(pullRequest.id))
-                  } catch (mergeError) {
-                    setActionError(
-                      mergeError instanceof Error ? mergeError.message : 'Failed to merge pull request.',
-                    )
-                  } finally {
-                    setMerging(false)
+          <div className="flex flex-wrap items-center gap-3">
+            {pullRequest.status === 'open' && canManage ? (
+              <>
+                <Button
+                  disabled={isBusy}
+                  icon={pendingAction === 'merge' ? <Spinner /> : <GitMerge className="h-4 w-4" strokeWidth={1.9} />}
+                  onClick={() =>
+                    void runAction('merge', async () => {
+                      await onMerge(pullRequest.id)
+                    })
                   }
-                }}
+                >
+                  {pendingAction === 'merge' ? 'Merging...' : 'Merge pull request'}
+                </Button>
+                <Button
+                  disabled={isBusy}
+                  icon={pendingAction === 'close' ? <Spinner /> : <XCircle className="h-4 w-4" strokeWidth={1.9} />}
+                  onClick={() =>
+                    void runAction('close', async () => {
+                      await onUpdate(pullRequest.id, { status: 'closed' })
+                    })
+                  }
+                  tone="muted"
+                >
+                  {pendingAction === 'close' ? 'Closing...' : 'Close'}
+                </Button>
+              </>
+            ) : null}
+            {pullRequest.status === 'closed' && canManage ? (
+              <Button
+                disabled={isBusy}
+                icon={pendingAction === 'reopen' ? <Spinner /> : <RotateCcw className="h-4 w-4" strokeWidth={1.9} />}
+                onClick={() =>
+                  void runAction('reopen', async () => {
+                    await onUpdate(pullRequest.id, { status: 'open' })
+                  })
+                }
+                tone="muted"
               >
-                {merging ? 'Merging...' : 'Merge pull request'}
+                {pendingAction === 'reopen' ? 'Reopening...' : 'Reopen'}
               </Button>
+            ) : null}
+            {canManage ? (
+              <Button
+                disabled={isBusy}
+                icon={pendingAction === 'delete' ? <Spinner /> : <Trash2 className="h-4 w-4" strokeWidth={1.9} />}
+                onClick={() =>
+                  void runAction(
+                    'delete',
+                    async () => {
+                      await onDelete(pullRequest.id)
+                      onBack()
+                    },
+                    false,
+                  )
+                }
+                tone="danger"
+              >
+                {pendingAction === 'delete' ? 'Deleting...' : 'Delete'}
+              </Button>
+            ) : null}
+            {actionError ? <p className="text-sm text-danger">{actionError}</p> : null}
+          </div>
+        </div>
+      </Panel>
+
+      <Panel
+        subtitle="Leave a discussion comment or a formal review, and keep your preferred display name in this browser."
+        title="Discussion and review"
+      >
+        <div className="space-y-6">
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
+            <div className="space-y-4 rounded-token border border-border bg-panel-subtle px-4 py-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="space-y-2">
+                  <span className="text-sm font-medium text-fg">Display name</span>
+                  <input
+                    className="w-full rounded-token border border-border bg-panel px-3.5 py-2.5 text-sm text-fg outline-none transition placeholder:text-fg-subtle focus:border-accent focus:ring-2 focus:ring-accent/20"
+                    onChange={(event) => setDisplayName(event.target.value)}
+                    placeholder={actor === 'owner' ? 'Owner display name' : 'Viewer display name'}
+                    value={displayName}
+                  />
+                </label>
+              </div>
+              <label className="space-y-2">
+                <span className="text-sm font-medium text-fg">Comment</span>
+                <textarea
+                  className="min-h-28 w-full rounded-token border border-border bg-panel px-3.5 py-3 text-sm text-fg outline-none transition placeholder:text-fg-subtle focus:border-accent focus:ring-2 focus:ring-accent/20"
+                  onChange={(event) => {
+                    setCommentBody(event.target.value)
+                    setReviewBody(event.target.value)
+                  }}
+                  placeholder="Add context, feedback, or a decision."
+                  value={commentBody}
+                />
+              </label>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button
+                  disabled={isBusy}
+                  icon={pendingAction === 'comment' ? <Spinner /> : <MessageSquareMore className="h-4 w-4" strokeWidth={1.9} />}
+                  onClick={() =>
+                    void runAction('comment', async () => {
+                      await onComment(pullRequest.id, {
+                        display_name: displayName,
+                        body: commentBody,
+                      })
+                      setCommentBody('')
+                      setReviewBody('')
+                    })
+                  }
+                  tone="muted"
+                >
+                  {pendingAction === 'comment' ? 'Posting...' : 'Add comment'}
+                </Button>
+                <Button
+                  disabled={isBusy}
+                  icon={pendingAction === 'comment_review' ? <Spinner /> : <MessageSquareMore className="h-4 w-4" strokeWidth={1.9} />}
+                  onClick={() =>
+                    void runAction('comment_review', async () => {
+                      await onReview(pullRequest.id, {
+                        display_name: displayName,
+                        body: reviewBody,
+                        state: 'commented',
+                      })
+                      setCommentBody('')
+                      setReviewBody('')
+                    })
+                  }
+                  tone="muted"
+                >
+                  {pendingAction === 'comment_review' ? 'Submitting...' : 'Comment review'}
+                </Button>
+                <Button
+                  disabled={isBusy}
+                  icon={pendingAction === 'approve' ? <Spinner /> : <ThumbsUp className="h-4 w-4" strokeWidth={1.9} />}
+                  onClick={() =>
+                    void runAction('approve', async () => {
+                      await onReview(pullRequest.id, {
+                        display_name: displayName,
+                        body: reviewBody,
+                        state: 'approved',
+                      })
+                      setCommentBody('')
+                      setReviewBody('')
+                    })
+                  }
+                >
+                  {pendingAction === 'approve' ? 'Submitting...' : 'Approve'}
+                </Button>
+                <Button
+                  disabled={isBusy}
+                  icon={pendingAction === 'request_changes' ? <Spinner /> : <ThumbsDown className="h-4 w-4" strokeWidth={1.9} />}
+                  onClick={() =>
+                    void runAction('request_changes', async () => {
+                      await onReview(pullRequest.id, {
+                        display_name: displayName,
+                        body: reviewBody,
+                        state: 'changes_requested',
+                      })
+                      setCommentBody('')
+                      setReviewBody('')
+                    })
+                  }
+                  tone="danger"
+                >
+                  {pendingAction === 'request_changes' ? 'Submitting...' : 'Request changes'}
+                </Button>
+              </div>
               {actionError ? <p className="text-sm text-danger">{actionError}</p> : null}
             </div>
-          ) : null}
+
+            <div className="space-y-3 rounded-token border border-border bg-panel-subtle px-4 py-4">
+              <p className="text-sm font-semibold text-fg">Review summary</p>
+              <div className="flex flex-wrap gap-2">
+                <Badge tone="success">{reviewSummary.approvals} approvals</Badge>
+                <Badge tone="danger">{reviewSummary.changes_requested} changes requested</Badge>
+                <Badge tone="muted">{reviewSummary.comments} comment-only reviews</Badge>
+              </div>
+              {reviewSummary.latest_reviews.length === 0 ? (
+                <p className="text-sm text-fg-subtle">No reviews yet.</p>
+              ) : (
+                <div className="space-y-2">
+                  {reviewSummary.latest_reviews.map((entry) => (
+                    <div className="rounded-token border border-border bg-panel px-3 py-3" key={`${entry.actor_role}-${entry.display_name}`}>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-sm font-medium text-fg">{entry.display_name}</p>
+                        <Badge tone={reviewTone(entry.state)}>{reviewLabel(entry.state)}</Badge>
+                      </div>
+                      <p className="mt-1 text-xs text-fg-subtle">
+                        {formatRelativeTime(entry.reviewed_at_ms)} · {formatDate(entry.reviewed_at_ms)}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="grid gap-6 xl:grid-cols-2">
+            <div className="space-y-3">
+              <p className="text-sm font-semibold text-fg">Comments</p>
+              {comments.length === 0 ? (
+                <EmptyState title="No comments yet" message="Start the discussion with context, review notes, or follow-up questions." />
+              ) : (
+                comments.map((comment) => (
+                  <div className="rounded-token border border-border bg-panel-subtle px-4 py-4" key={comment.id}>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="text-sm font-semibold text-fg">{comment.display_name}</p>
+                      <Badge tone={comment.actor_role === 'owner' ? 'accent' : 'muted'}>
+                        {comment.actor_role === 'owner' ? 'Owner' : 'Viewer'}
+                      </Badge>
+                    </div>
+                    <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-fg-muted">{comment.body}</p>
+                    <p className="mt-3 text-xs text-fg-subtle">
+                      {formatRelativeTime(comment.created_at_ms)} · {formatDate(comment.created_at_ms)}
+                    </p>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-sm font-semibold text-fg">Reviews</p>
+              {reviews.length === 0 ? (
+                <EmptyState title="No reviews yet" message="Formal review decisions will appear here as approvals, changes requested, or comment-only reviews." />
+              ) : (
+                reviews
+                  .slice()
+                  .reverse()
+                  .map((review) => (
+                    <div className="rounded-token border border-border bg-panel-subtle px-4 py-4" key={review.id}>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="text-sm font-semibold text-fg">{review.display_name}</p>
+                          <Badge tone={review.actor_role === 'owner' ? 'accent' : 'muted'}>
+                            {review.actor_role === 'owner' ? 'Owner' : 'Viewer'}
+                          </Badge>
+                        </div>
+                        <Badge tone={reviewTone(review.state)}>{reviewLabel(review.state)}</Badge>
+                      </div>
+                      {review.body ? (
+                        <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-fg-muted">{review.body}</p>
+                      ) : (
+                        <p className="mt-2 text-sm text-fg-subtle">No review body provided.</p>
+                      )}
+                      <p className="mt-3 text-xs text-fg-subtle">
+                        {formatRelativeTime(review.created_at_ms)} · {formatDate(review.created_at_ms)}
+                      </p>
+                    </div>
+                  ))
+              )}
+            </div>
+          </div>
         </div>
+      </Panel>
+
+      <Panel subtitle="A running timeline of pull request activity." title="Activity">
+        {reversedActivity.length === 0 ? (
+          <EmptyState title="No activity yet" message="Pull request events will appear here as the review progresses." />
+        ) : (
+          <div className="space-y-3">
+            {reversedActivity.map((entry) => (
+              <div className="rounded-token border border-border bg-panel-subtle px-4 py-4" key={entry.id}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-sm font-semibold text-fg">{actorLabel(entry.actor_role, entry.display_name)}</p>
+                  <Badge tone={entry.actor_role === 'owner' ? 'accent' : 'muted'}>
+                    {entry.actor_role === 'owner' ? 'Owner' : 'Viewer'}
+                  </Badge>
+                  {entry.review_state ? (
+                    <Badge tone={reviewTone(entry.review_state)}>{reviewLabel(entry.review_state)}</Badge>
+                  ) : null}
+                </div>
+                <p className="mt-2 text-sm text-fg-muted">{activityLabel(entry)}</p>
+                {entry.body ? (
+                  <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-fg-muted">{entry.body}</p>
+                ) : null}
+                {entry.kind === 'edited' && (entry.title || entry.description) ? (
+                  <div className="mt-2 rounded-token border border-border bg-panel px-3 py-3 text-sm text-fg-muted">
+                    {entry.title ? <p>Title: {entry.title}</p> : null}
+                    {entry.description ? <p className="mt-1 whitespace-pre-wrap">Description: {entry.description}</p> : null}
+                  </div>
+                ) : null}
+                <p className="mt-3 text-xs text-fg-subtle">
+                  {formatRelativeTime(entry.created_at_ms)} · {formatDate(entry.created_at_ms)}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
       </Panel>
 
       <Panel
@@ -474,32 +881,53 @@ function PullRequestDetail({
 }
 
 export function PullRequestsPanel({
+  actor,
   pullRequests,
   highlightedPullRequestId,
   selectedPullRequestId,
-  canMerge,
+  canManage,
   canCreate,
   onBack,
+  onComment,
   onCreate,
+  onDelete,
   onMerge,
+  onReview,
   onSelect,
+  onUpdate,
 }: {
+  actor: UiRole
   pullRequests: PullRequestRecord[]
   highlightedPullRequestId: string | null
   selectedPullRequestId: string | null
-  canMerge: boolean
+  canManage: boolean
   canCreate: boolean
   onBack: () => void
+  onComment: (id: string, payload: { display_name: string; body: string }) => Promise<PullRequestRecord>
   onCreate: () => void
+  onDelete: (id: string) => Promise<PullRequestRecord>
   onMerge: (id: string) => Promise<void>
+  onReview: (
+    id: string,
+    payload: { display_name: string; body: string; state: PullRequestReviewState },
+  ) => Promise<PullRequestRecord>
   onSelect: (id: string) => void
+  onUpdate: (
+    id: string,
+    payload: { title?: string; description?: string; status?: 'open' | 'closed' },
+  ) => Promise<PullRequestRecord>
 }) {
   if (selectedPullRequestId) {
     return (
       <PullRequestDetail
-        canMerge={canMerge}
+        actor={actor}
+        canManage={canManage}
         onBack={onBack}
+        onComment={onComment}
+        onDelete={onDelete}
         onMerge={onMerge}
+        onReview={onReview}
+        onUpdate={onUpdate}
         pullRequestId={selectedPullRequestId}
       />
     )
@@ -508,7 +936,7 @@ export function PullRequestsPanel({
   return (
     <PullRequestList
       canCreate={canCreate}
-      canMerge={canMerge}
+      canManage={canManage}
       highlightedPullRequestId={highlightedPullRequestId}
       onCreate={onCreate}
       onMerge={onMerge}

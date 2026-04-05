@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 axum = { workspace = true }
+base64 = { workspace = true }
 qit-domain = { path = "../qit-domain" }
 rand = { workspace = true }
 serde = { workspace = true }

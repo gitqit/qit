@@ -4,10 +4,14 @@ use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{delete, get, post};
 use axum::{body::Body, Router};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use qit_domain::{
     BlobContent, BranchInfo, CommitDetail, CommitHistory, CommitRefDecoration, CommitRefKind,
-    CreatePullRequest, PullRequestRecord, RefComparison, RefDiffFile, RepoReadStore,
-    SessionCredentials, UiRole, WorkspaceService, WorkspaceSpec, WorkspaceWebUiState,
+    CreatePullRequest, CreatePullRequestComment, CreatePullRequestReview, PullRequestActivityRecord,
+    PullRequestRecord, PullRequestReviewRecord, PullRequestReviewState, PullRequestReviewSummary,
+    PullRequestStatus, RefComparison, RefDiffFile, RepoReadStore, SessionCredentials, UiRole,
+    UpdatePullRequest, WorkspaceService, WorkspaceSpec, WorkspaceWebUiState,
 };
 use rand::distributions::{Alphanumeric, DistString};
 use serde::{Deserialize, Serialize};
@@ -19,6 +23,8 @@ use tokio::sync::RwLock;
 
 const APP_JS: &str = include_str!("../frontend/dist/assets/app.js");
 const APP_CSS: &str = include_str!("../frontend/dist/assets/index.css");
+const QIT_LOGO_ON_DARK: &[u8] = include_bytes!("../frontend/dist/assets/qit-logo-on-dark.png");
+const QIT_LOGO_ON_LIGHT: &[u8] = include_bytes!("../frontend/dist/assets/qit-logo-on-light.png");
 const SESSION_TTL_MS: u64 = 12 * 60 * 60 * 1000;
 
 pub struct WebUiConfig {
@@ -99,6 +105,10 @@ struct PullRequestDetailResponse {
     pull_request: PullRequestRecord,
     comparison: Option<RefComparison>,
     diffs: Option<Vec<RefDiffFile>>,
+    comments: Vec<qit_domain::PullRequestCommentRecord>,
+    reviews: Vec<PullRequestReviewRecord>,
+    review_summary: PullRequestReviewSummary,
+    activity: Vec<PullRequestActivityRecord>,
 }
 
 #[derive(Serialize)]
@@ -139,6 +149,33 @@ struct PullRequestCreateRequest {
     description: String,
     source_branch: String,
     target_branch: String,
+}
+
+#[derive(Deserialize)]
+struct PullRequestUpdateRequest {
+    title: Option<String>,
+    description: Option<String>,
+    status: Option<PullRequestStatusRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PullRequestStatusRequest {
+    Open,
+    Closed,
+}
+
+#[derive(Deserialize)]
+struct PullRequestCommentRequest {
+    display_name: String,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct PullRequestReviewRequest {
+    display_name: String,
+    body: String,
+    state: PullRequestReviewState,
 }
 
 #[derive(Deserialize)]
@@ -205,66 +242,6 @@ fn decorate_history(history: &mut CommitHistory, branches: &[BranchInfo]) {
 }
 
 impl WebUiServer {
-    async fn resolve_branch_commit_at_time(
-        &self,
-        workspace: &WorkspaceSpec,
-        branch: &str,
-        timestamp_ms: u64,
-    ) -> Option<String> {
-        let cutoff = (timestamp_ms / 1000) as i64;
-        let mut offset = 0;
-        loop {
-            let history = self
-                .repo_read_store
-                .list_commits(workspace, Some(branch), offset, MAX_HISTORY_LIMIT)
-                .await
-                .ok()?;
-            if history.commits.is_empty() {
-                return None;
-            }
-            if let Some(commit) = history.commits.iter().find(|commit| commit.authored_at <= cutoff) {
-                return Some(commit.id.clone());
-            }
-            if !history.has_more {
-                return None;
-            }
-            offset += history.commits.len();
-        }
-    }
-
-    async fn resolve_pull_request_refs(
-        &self,
-        workspace: &WorkspaceSpec,
-        pull_request: &PullRequestRecord,
-    ) -> (String, String) {
-        let base_ref = if let Some(target_commit) = &pull_request.target_commit {
-            target_commit.clone()
-        } else {
-            self.resolve_branch_commit_at_time(
-                workspace,
-                &pull_request.target_branch,
-                pull_request.created_at_ms,
-            )
-            .await
-            .unwrap_or_else(|| pull_request.target_branch.clone())
-        };
-
-        let head_ref = if let Some(source_commit) = &pull_request.source_commit {
-            source_commit.clone()
-        } else {
-            self.resolve_branch_commit_at_time(
-                workspace,
-                &pull_request.source_branch,
-                pull_request.created_at_ms,
-            )
-            .await
-            .or_else(|| pull_request.merged_commit.clone())
-            .unwrap_or_else(|| pull_request.source_branch.clone())
-        };
-
-        (base_ref, head_ref)
-    }
-
     pub fn new(
         repo_read_store: Arc<dyn RepoReadStore>,
         workspace_service: Arc<WorkspaceService>,
@@ -291,6 +268,15 @@ impl WebUiServer {
             .route(&format!("{mount}/"), get(index))
             .route(&format!("{mount}/assets/app.js"), get(app_js))
             .route(&format!("{mount}/assets/app.css"), get(app_css))
+            .route(
+                &format!("{mount}/assets/qit-logo-on-dark.png"),
+                get(qit_logo_on_dark),
+            )
+            .route(
+                &format!("{mount}/assets/qit-logo-on-light.png"),
+                get(qit_logo_on_light),
+            )
+            .route(&format!("{mount}/assets/qit-og.svg"), get(qit_og_image))
             .route(&format!("{mount}/api/bootstrap"), get(bootstrap))
             .route(&format!("{mount}/api/session/login"), post(login))
             .route(&format!("{mount}/api/session/logout"), post(logout))
@@ -319,7 +305,15 @@ impl WebUiServer {
             )
             .route(
                 &format!("{mount}/api/pull-requests/{{id}}"),
-                get(read_pull_request),
+                get(read_pull_request).patch(update_pull_request).delete(delete_pull_request),
+            )
+            .route(
+                &format!("{mount}/api/pull-requests/{{id}}/comments"),
+                post(comment_pull_request),
+            )
+            .route(
+                &format!("{mount}/api/pull-requests/{{id}}/reviews"),
+                post(review_pull_request),
             )
             .route(
                 &format!("{mount}/api/pull-requests/{{id}}/merge"),
@@ -374,7 +368,73 @@ impl WebUiServer {
         (self.implicit_owner_mode && host_is_loopback(headers)).then_some(UiRole::Owner)
     }
 
+    fn repo_og_svg(&self) -> String {
+        let repo = self.repo_name();
+        let title_lines = split_repo_name(&repo);
+        let title_font_size = if title_lines.iter().map(|line| line.chars().count()).max().unwrap_or(0) > 20 {
+            54
+        } else {
+            64
+        };
+        let title_line_height = title_font_size + 12;
+        let title_start_y = if title_lines.len() > 1 { 264 } else { 300 };
+        let title_tspans = title_lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                format!(
+                    r#"<tspan x="88" y="{}">{}</tspan>"#,
+                    title_start_y + (index as i32 * title_line_height),
+                    escape_html(line)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let logo_data_uri = format!(
+            "data:image/png;base64,{}",
+            BASE64_STANDARD.encode(QIT_LOGO_ON_DARK)
+        );
+
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" fill="none">
+  <rect width="1200" height="630" rx="0" fill="#0D1117" />
+  <rect x="40" y="40" width="1120" height="550" rx="32" fill="url(#panel)" stroke="#30363D" />
+  <rect x="88" y="84" width="148" height="40" rx="20" fill="#161B22" stroke="#30363D" />
+  <circle cx="112" cy="104" r="6" fill="#3FB950" />
+  <text x="128" y="110" fill="#8B949E" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="600">Hosted on Qit</text>
+  <text x="88" y="184" fill="#8B949E" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="28" font-weight="500">Repository preview</text>
+  <text fill="#F0F6FC" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="{title_font_size}" font-weight="700">{title_tspans}</text>
+  <text x="88" y="470" fill="#8B949E" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="26" font-weight="500">Browse code, branches, pull requests, and clone details in one shareable session.</text>
+  <rect x="88" y="506" width="252" height="36" rx="18" fill="#0D1117" stroke="#30363D" />
+  <text x="112" y="530" fill="#7EE787" font-family="SFMono-Regular, ui-monospace, monospace" font-size="20" font-weight="600">qit</text>
+  <text x="154" y="530" fill="#C9D1D9" font-family="SFMono-Regular, ui-monospace, monospace" font-size="20">serve {repo}</text>
+  <rect x="834" y="84" width="278" height="278" rx="28" fill="#0D1117" stroke="#30363D" />
+  <image href="{logo_data_uri}" x="856" y="106" width="234" height="234" preserveAspectRatio="xMidYMid meet" />
+  <path d="M808 590C926 528 1011 458 1063 380" stroke="url(#accent)" stroke-width="20" stroke-linecap="round" opacity="0.9"/>
+  <path d="M808 590C925 600 1027 596 1114 578" stroke="#21262D" stroke-width="14" stroke-linecap="round"/>
+  <defs>
+    <linearGradient id="panel" x1="72" y1="56" x2="1128" y2="574" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#11161D" />
+      <stop offset="1" stop-color="#0D1117" />
+    </linearGradient>
+    <linearGradient id="accent" x1="808" y1="590" x2="1063" y2="380" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#19C176" />
+      <stop offset="1" stop-color="#52E39A" />
+    </linearGradient>
+  </defs>
+</svg>"##,
+            logo_data_uri = logo_data_uri,
+            repo = escape_html(&repo),
+            title_font_size = title_font_size,
+            title_tspans = title_tspans,
+        )
+    }
+
     fn index_html(&self) -> String {
+        let repo = self.repo_name();
+        let title = format!("{repo} · Qit");
+        let favicon = format!("{}/assets/qit-logo-on-dark.png", self.repo_mount_path);
+        let og_image = format!("{}/assets/qit-og.svg", self.repo_mount_path);
         format!(
             r#"<!doctype html>
 <html lang="en">
@@ -383,7 +443,15 @@ impl WebUiServer {
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="qit-base" content="{base}" />
     <meta name="qit-repo" content="{repo}" />
-    <title>{repo} · Qit</title>
+    <meta property="og:title" content="{title}" />
+    <meta property="og:image" content="{og_image}" />
+    <meta property="og:image:type" content="image/svg+xml" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="{og_image}" />
+    <title>{title}</title>
+    <link rel="icon" type="image/png" href="{favicon}" />
     <link rel="stylesheet" href="{base}/assets/app.css" />
   </head>
   <body>
@@ -392,7 +460,10 @@ impl WebUiServer {
   </body>
 </html>"#,
             base = self.repo_mount_path,
-            repo = self.repo_name()
+            favicon = favicon,
+            og_image = og_image,
+            repo = repo,
+            title = title
         )
     }
 
@@ -461,6 +532,54 @@ fn host_is_loopback(headers: &HeaderMap) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+    chars[..max_chars.saturating_sub(1)]
+        .iter()
+        .collect::<String>()
+        + "…"
+}
+
+fn split_repo_name(repo: &str) -> Vec<String> {
+    let repo = repo.trim();
+    let chars: Vec<char> = repo.chars().collect();
+    if chars.len() <= 18 {
+        return vec![repo.to_string()];
+    }
+
+    let target = 18.min(chars.len().saturating_sub(1));
+    let split_at = chars
+        .iter()
+        .enumerate()
+        .take(target + 1)
+        .filter_map(|(index, ch)| matches!(ch, '-' | '_' | '.' | ' ') .then_some(index + 1))
+        .last()
+        .unwrap_or(target);
+
+    let first = chars[..split_at].iter().collect::<String>();
+    let second = chars[split_at..].iter().collect::<String>();
+    let second = second.trim_matches(|ch: char| matches!(ch, '-' | '_' | '.' | ' '));
+    let second = if second.is_empty() {
+        truncate_with_ellipsis(repo, 18)
+    } else {
+        truncate_with_ellipsis(second, 22)
+    };
+
+    vec![first, second]
+}
+
 fn secure_eq(left: &str, right: &str) -> bool {
     if left.len() != right.len() {
         return false;
@@ -497,6 +616,30 @@ async fn app_css() -> impl IntoResponse {
             HeaderValue::from_static("text/css; charset=utf-8"),
         )],
         APP_CSS,
+    )
+}
+
+async fn qit_logo_on_dark() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, HeaderValue::from_static("image/png"))],
+        QIT_LOGO_ON_DARK,
+    )
+}
+
+async fn qit_logo_on_light() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, HeaderValue::from_static("image/png"))],
+        QIT_LOGO_ON_LIGHT,
+    )
+}
+
+async fn qit_og_image(State(state): State<Arc<WebUiServer>>) -> impl IntoResponse {
+    (
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+        )],
+        state.repo_og_svg(),
     )
 }
 
@@ -804,7 +947,9 @@ async fn read_pull_request(
     else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let (base_ref, head_ref) = state.resolve_pull_request_refs(&workspace, &pull_request).await;
+    let (base_ref, head_ref) =
+        qit_domain::resolve_pull_request_refs(state.repo_read_store.as_ref(), &workspace, &pull_request)
+            .await;
 
     let comparison_result = state
         .repo_read_store
@@ -816,11 +961,19 @@ async fn read_pull_request(
         .await;
     let comparison = comparison_result.ok();
     let diffs = diffs_result.ok();
+    let comments = WorkspaceService::pull_request_comments(&pull_request);
+    let reviews = WorkspaceService::pull_request_reviews(&pull_request);
+    let review_summary = WorkspaceService::pull_request_review_summary(&pull_request);
+    let activity = pull_request.activities.clone();
 
     Ok(Json(PullRequestDetailResponse {
         pull_request,
         comparison,
         diffs,
+        comments,
+        reviews,
+        review_summary,
+        activity,
     }))
 }
 
@@ -840,6 +993,105 @@ async fn create_pull_request(
                 description: body.description,
                 source_branch: body.source_branch,
                 target_branch: body.target_branch,
+            },
+            actor,
+        )
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(pull_request))
+}
+
+async fn update_pull_request(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<PullRequestUpdateRequest>,
+) -> Result<Json<PullRequestRecord>, StatusCode> {
+    let actor = state.require_actor(&headers).await?;
+    if actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let status = body.status.map(|status| match status {
+        PullRequestStatusRequest::Open => PullRequestStatus::Open,
+        PullRequestStatusRequest::Closed => PullRequestStatus::Closed,
+    });
+    let (_, pull_request) = state
+        .workspace_service
+        .update_pull_request(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            UpdatePullRequest {
+                title: body.title,
+                description: body.description,
+                status,
+            },
+            actor,
+        )
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(pull_request))
+}
+
+async fn delete_pull_request(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<PullRequestRecord>, StatusCode> {
+    state.require_owner(&headers).await?;
+    let (_, pull_request) = state
+        .workspace_service
+        .delete_pull_request(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+        )
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(pull_request))
+}
+
+async fn comment_pull_request(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<PullRequestCommentRequest>,
+) -> Result<Json<PullRequestRecord>, StatusCode> {
+    let actor = state.require_actor(&headers).await?;
+    let (_, pull_request) = state
+        .workspace_service
+        .comment_pull_request(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            CreatePullRequestComment {
+                display_name: body.display_name,
+                body: body.body,
+            },
+            actor,
+        )
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(pull_request))
+}
+
+async fn review_pull_request(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<PullRequestReviewRequest>,
+) -> Result<Json<PullRequestRecord>, StatusCode> {
+    let actor = state.require_actor(&headers).await?;
+    let (_, pull_request) = state
+        .workspace_service
+        .review_pull_request(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            CreatePullRequestReview {
+                display_name: body.display_name,
+                body: body.body,
+                state: body.state,
             },
             actor,
         )
@@ -1292,6 +1544,30 @@ mod tests {
         request
     }
 
+    async fn login_cookie(app: &Router, remote: SocketAddr, host: &str) -> String {
+        let login = Request::builder()
+            .method("POST")
+            .uri("/repo/api/session/login")
+            .header(HOST, host)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"username":"tester","password":"secret"}"#))
+            .unwrap();
+        let mut login = login;
+        login.extensions_mut().insert(ConnectInfo(remote));
+        let login_response = app.clone().oneshot(login).await.unwrap();
+        assert_eq!(login_response.status(), StatusCode::OK);
+        login_response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
     #[tokio::test]
     async fn local_only_mode_bootstrap_is_owner_and_git_stays_authenticated() {
         let app = app(true, false);
@@ -1453,6 +1729,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_ui_serves_brand_assets() {
+        let app = app(true, false);
+        let remote = SocketAddr::from(([127, 0, 0, 1], 3000));
+        let response = app
+            .clone()
+            .oneshot(request_with_remote(
+                "/repo/assets/qit-logo-on-dark.png",
+                remote,
+                "127.0.0.1:8080",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            HeaderValue::from_static("image/png")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!body.is_empty());
+
+        let og_response = app
+            .oneshot(request_with_remote(
+                "/repo/assets/qit-og.svg",
+                remote,
+                "127.0.0.1:8080",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(og_response.status(), StatusCode::OK);
+        assert_eq!(
+            og_response.headers().get(CONTENT_TYPE).unwrap(),
+            HeaderValue::from_static("image/svg+xml; charset=utf-8")
+        );
+        let og_body = String::from_utf8(
+            og_response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        assert!(og_body.contains("host"));
+        assert!(og_body.contains("Hosted on Qit"));
+    }
+
+    #[tokio::test]
+    async fn index_html_includes_favicon_and_social_image() {
+        let app = app(true, false);
+        let remote = SocketAddr::from(([127, 0, 0, 1], 3000));
+        let response = app
+            .oneshot(request_with_remote("/repo", remote, "127.0.0.1:8080"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains(r#"<link rel="icon" type="image/png" href="/repo/assets/qit-logo-on-dark.png" />"#));
+        assert!(body.contains(r#"<meta property="og:image" content="/repo/assets/qit-og.svg" />"#));
+        assert!(body.contains(r#"<meta property="og:image:type" content="image/svg+xml" />"#));
+        assert!(body.contains(r#"<meta property="og:image:width" content="1200" />"#));
+        assert!(body.contains(r#"<meta property="og:image:height" content="630" />"#));
+        assert!(body.contains(r#"<meta name="twitter:card" content="summary_large_image" />"#));
+        assert!(body.contains(r#"<meta name="twitter:image" content="/repo/assets/qit-og.svg" />"#));
+    }
+
+    #[tokio::test]
     async fn legacy_pull_request_detail_backfills_refs_from_branch_history() {
         let app = app_with_web_ui(
             false,
@@ -1471,6 +1817,7 @@ mod tests {
                     created_at_ms: 15_000,
                     updated_at_ms: 20_000,
                     merged_commit: Some("feature-current".into()),
+                    activities: Vec::new(),
                 }],
             },
         );
@@ -1519,6 +1866,181 @@ mod tests {
         .unwrap();
         assert_eq!(detail["comparison"]["base_ref"], "111111111111");
         assert_eq!(detail["comparison"]["head_ref"], "222222222222");
+    }
+
+    #[tokio::test]
+    async fn viewers_can_comment_and_review_but_not_manage_pull_requests() {
+        let app = app(false, true);
+        let remote = SocketAddr::from(([10, 0, 0, 2], 3000));
+        let cookie = login_cookie(&app, remote, "demo.ngrok.app").await;
+
+        let create_pr = Request::builder()
+            .method("POST")
+            .uri("/repo/api/pull-requests")
+            .header(HOST, "demo.ngrok.app")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .body(Body::from(
+                r#"{"title":"Review me","description":"needs feedback","source_branch":"feature","target_branch":"main"}"#,
+            ))
+            .unwrap();
+        let mut create_pr = create_pr;
+        create_pr.extensions_mut().insert(ConnectInfo(remote));
+        let create_response = app.clone().oneshot(create_pr).await.unwrap();
+        let created: PullRequestRecord = serde_json::from_slice(
+            &create_response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+
+        let comment = Request::builder()
+            .method("POST")
+            .uri(format!("/repo/api/pull-requests/{}/comments", created.id))
+            .header(HOST, "demo.ngrok.app")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .body(Body::from("{\"display_name\":\"Casey\",\"body\":\"Please add tests.\"}"))
+            .unwrap();
+        let mut comment = comment;
+        comment.extensions_mut().insert(ConnectInfo(remote));
+        let comment_response = app.clone().oneshot(comment).await.unwrap();
+        assert_eq!(comment_response.status(), StatusCode::OK);
+
+        let review = Request::builder()
+            .method("POST")
+            .uri(format!("/repo/api/pull-requests/{}/reviews", created.id))
+            .header(HOST, "demo.ngrok.app")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .body(Body::from(
+                r#"{"display_name":"Casey","body":"One more pass, please.","state":"changes_requested"}"#,
+            ))
+            .unwrap();
+        let mut review = review;
+        review.extensions_mut().insert(ConnectInfo(remote));
+        let review_response = app.clone().oneshot(review).await.unwrap();
+        assert_eq!(review_response.status(), StatusCode::OK);
+
+        let update = Request::builder()
+            .method("PATCH")
+            .uri(format!("/repo/api/pull-requests/{}", created.id))
+            .header(HOST, "demo.ngrok.app")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .body(Body::from(r#"{"status":"closed"}"#))
+            .unwrap();
+        let mut update = update;
+        update.extensions_mut().insert(ConnectInfo(remote));
+        let update_response = app.clone().oneshot(update).await.unwrap();
+        assert_eq!(update_response.status(), StatusCode::FORBIDDEN);
+
+        let delete = Request::builder()
+            .method("DELETE")
+            .uri(format!("/repo/api/pull-requests/{}", created.id))
+            .header(HOST, "demo.ngrok.app")
+            .header("cookie", cookie.clone())
+            .body(Body::empty())
+            .unwrap();
+        let mut delete = delete;
+        delete.extensions_mut().insert(ConnectInfo(remote));
+        let delete_response = app.clone().oneshot(delete).await.unwrap();
+        assert_eq!(delete_response.status(), StatusCode::FORBIDDEN);
+
+        let detail = Request::builder()
+            .uri(format!("/repo/api/pull-requests/{}", created.id))
+            .header(HOST, "demo.ngrok.app")
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap();
+        let mut detail = detail;
+        detail.extensions_mut().insert(ConnectInfo(remote));
+        let detail_response = app.clone().oneshot(detail).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(
+            &detail_response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(payload["comments"][0]["display_name"], "Casey");
+        assert_eq!(payload["reviews"][0]["state"], "changes_requested");
+        assert_eq!(payload["review_summary"]["changes_requested"], 1);
+        assert!(payload["activity"].as_array().unwrap().len() >= 3);
+    }
+
+    #[tokio::test]
+    async fn owners_can_edit_close_reopen_and_delete_pull_requests() {
+        let app = app(true, false);
+        let remote = SocketAddr::from(([127, 0, 0, 1], 3000));
+
+        let create_pr = Request::builder()
+            .method("POST")
+            .uri("/repo/api/pull-requests")
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"title":"Owner PR","description":"owner flow","source_branch":"feature","target_branch":"main"}"#,
+            ))
+            .unwrap();
+        let mut create_pr = create_pr;
+        create_pr.extensions_mut().insert(ConnectInfo(remote));
+        let create_response = app.clone().oneshot(create_pr).await.unwrap();
+        let created: PullRequestRecord = serde_json::from_slice(
+            &create_response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+
+        let close = Request::builder()
+            .method("PATCH")
+            .uri(format!("/repo/api/pull-requests/{}", created.id))
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"title":"Owner PR updated","status":"closed"}"#))
+            .unwrap();
+        let mut close = close;
+        close.extensions_mut().insert(ConnectInfo(remote));
+        let close_response = app.clone().oneshot(close).await.unwrap();
+        let closed: PullRequestRecord = serde_json::from_slice(
+            &close_response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(closed.title, "Owner PR updated");
+        assert_eq!(closed.status, qit_domain::PullRequestStatus::Closed);
+
+        let reopen = Request::builder()
+            .method("PATCH")
+            .uri(format!("/repo/api/pull-requests/{}", created.id))
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"status":"open"}"#))
+            .unwrap();
+        let mut reopen = reopen;
+        reopen.extensions_mut().insert(ConnectInfo(remote));
+        let reopen_response = app.clone().oneshot(reopen).await.unwrap();
+        let reopened: PullRequestRecord = serde_json::from_slice(
+            &reopen_response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(reopened.status, qit_domain::PullRequestStatus::Open);
+
+        let delete = Request::builder()
+            .method("DELETE")
+            .uri(format!("/repo/api/pull-requests/{}", created.id))
+            .header(HOST, "127.0.0.1:8080")
+            .body(Body::empty())
+            .unwrap();
+        let mut delete = delete;
+        delete.extensions_mut().insert(ConnectInfo(remote));
+        let delete_response = app.clone().oneshot(delete).await.unwrap();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let list = app
+            .oneshot(request_with_remote(
+                "/repo/api/pull-requests",
+                remote,
+                "127.0.0.1:8080",
+            ))
+            .await
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&list.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert!(payload["pull_requests"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

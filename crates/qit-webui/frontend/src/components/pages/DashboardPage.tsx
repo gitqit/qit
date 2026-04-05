@@ -12,6 +12,7 @@ import {
   LogIn,
   Shield,
 } from 'lucide-react'
+import { BrandLogo } from '../atoms/BrandLogo'
 import { Button, Panel } from '../atoms/Controls'
 import { KeyValueRow, SectionHeader, TextInput } from '../molecules/Fields'
 import { CreateBranchModal } from '../organisms/CreateBranchModal'
@@ -197,6 +198,9 @@ export function LoginPage({
   return (
     <div className="flex min-h-screen items-center justify-center bg-canvas px-6">
       <div className="w-full max-w-md space-y-6">
+        <div className="flex justify-center">
+          <BrandLogo className="h-24 sm:h-28" />
+        </div>
         <SectionHeader
           eyebrow="Qit"
           title="Sign in to this session"
@@ -253,6 +257,10 @@ export function DashboardPage({
   onSwitchBranch,
   onDeleteBranch,
   onCreatePullRequest,
+  onUpdatePullRequest,
+  onDeletePullRequest,
+  onCommentPullRequest,
+  onReviewPullRequest,
   onMergePullRequest,
   onSelectPullRequest,
   onClearSelectedPullRequest,
@@ -288,6 +296,19 @@ export function DashboardPage({
     source_branch: string
     target_branch: string
   }) => Promise<PullRequestRecord>
+  onUpdatePullRequest: (
+    id: string,
+    payload: { title?: string; description?: string; status?: 'open' | 'closed' },
+  ) => Promise<PullRequestRecord>
+  onDeletePullRequest: (id: string) => Promise<PullRequestRecord>
+  onCommentPullRequest: (
+    id: string,
+    payload: { display_name: string; body: string },
+  ) => Promise<PullRequestRecord>
+  onReviewPullRequest: (
+    id: string,
+    payload: { display_name: string; body: string; state: 'commented' | 'approved' | 'changes_requested' },
+  ) => Promise<PullRequestRecord>
   onMergePullRequest: (id: string) => Promise<void>
   onSelectPullRequest: (id: string) => void
   onClearSelectedPullRequest: () => void
@@ -383,13 +404,18 @@ export function DashboardPage({
         count: pullRequests.length,
         content: (
           <PullRequestsPanel
+            actor={actor}
             canCreate={canEdit}
-            canMerge={canEdit}
+            canManage={canEdit}
             highlightedPullRequestId={highlightedPullRequestId}
             onBack={onClearSelectedPullRequest}
+            onComment={onCommentPullRequest}
             onCreate={() => setCreatePullRequestOpen(true)}
+            onDelete={onDeletePullRequest}
             onMerge={onMergePullRequest}
+            onReview={onReviewPullRequest}
             onSelect={onSelectPullRequest}
+            onUpdate={onUpdatePullRequest}
             pullRequests={pullRequests}
             selectedPullRequestId={selectedPullRequestId}
           />
@@ -435,15 +461,19 @@ export function DashboardPage({
       latestCommit,
       onCheckoutBranch,
       onBrowseTree,
+      onCommentPullRequest,
       onClearSelectedPullRequest,
       onDeleteBranch,
+      onDeletePullRequest,
       onLoadTreePath,
       onLoadMoreCommits,
       onMergePullRequest,
       onSelectPullRequest,
+      onReviewPullRequest,
       onOpenTreeEntry,
       onSelectCommit,
       onSwitchBranch,
+      onUpdatePullRequest,
       pullRequests,
       readme,
       selectedPullRequestId,
