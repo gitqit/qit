@@ -12,13 +12,17 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
+http-body-util = { workspace = true }
 rand = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
 qit-domain = { path = "../crates/qit-domain" }
 qit-git = { path = "../crates/qit-git" }
 qit-http = { path = "../crates/qit-http" }
 qit-storage = { path = "../crates/qit-storage" }
 qit-transports = { path = "../crates/qit-transports" }
 qit-webui = { path = "../crates/qit-webui" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }

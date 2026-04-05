@@ -37,6 +37,7 @@ export function TextInput({
   autoFocus = false,
   name,
   type = 'text',
+  autoComplete,
   onBlur,
   onKeyDown,
 }: {
@@ -52,6 +53,7 @@ export function TextInput({
   autoFocus?: boolean
   name?: string
   type?: string
+  autoComplete?: string
   onBlur?: () => void
   onKeyDown?: KeyboardEventHandler<HTMLInputElement>
 }) {
@@ -70,6 +72,7 @@ export function TextInput({
         aria-describedby={describedBy}
         aria-invalid={error ? true : undefined}
         aria-required={required || undefined}
+        autoComplete={autoComplete}
         autoFocus={autoFocus}
         className={classNames(
           'w-full rounded-token border bg-panel-subtle px-3.5 py-2.5 text-sm text-fg outline-none transition-colors placeholder:text-fg-subtle focus:border-accent focus:ring-2 focus:ring-accent/20',

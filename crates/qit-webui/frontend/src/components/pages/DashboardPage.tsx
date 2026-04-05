@@ -268,7 +268,6 @@ function SessionMenu({
 }
 
 export function LoginPage({
-  approvedSetupToken,
   bootstrap,
   error,
   requestMessage,
@@ -277,7 +276,6 @@ export function LoginPage({
   onRequestAccess,
   onCompleteOnboarding,
 }: {
-  approvedSetupToken: string | null
   bootstrap: BootstrapResponse
   error: string | null
   requestMessage: string | null
@@ -299,22 +297,20 @@ export function LoginPage({
   const tabs: Array<{ id: RequestAuthView; label: string }> = [
     { id: 'signin', label: 'Sign in' },
     ...(supportsRequestAccess ? [{ id: 'request' as const, label: 'Request access' }] : []),
-    ...(supportsSetupToken ? [{ id: 'setup' as const, label: 'Complete setup' }] : []),
+    ...(supportsSetupToken ? [{ id: 'setup' as const, label: 'Use setup code' }] : []),
   ]
   const [activeView, setActiveView] = useState<RequestAuthView>('signin')
-  const setupFromApprovedRequest = Boolean(approvedSetupToken)
-  const setupCredential = approvedSetupToken ?? setupToken
 
   useEffect(() => {
-    if ((approvedSetupToken || setupMessage) && supportsSetupToken) {
-      setActiveView('setup')
+    if (requestMessage && supportsRequestAccess) {
+      setActiveView('request')
       return
     }
 
-    if (requestMessage && supportsRequestAccess) {
-      setActiveView('request')
+    if (setupMessage && supportsSetupToken) {
+      setActiveView('setup')
     }
-  }, [approvedSetupToken, requestMessage, setupMessage, supportsRequestAccess, supportsSetupToken])
+  }, [requestMessage, setupMessage, supportsRequestAccess, supportsSetupToken])
 
   const flowMeta: Record<
     RequestAuthView,
@@ -332,21 +328,19 @@ export function LoginPage({
           : 'Use the shared session credentials printed when the server started.'
         : 'Use your repo username and password if your account is already active.',
       ctaHint: supportsRequestAccess
-        ? 'New here? Request access first, then finish setup after approval.'
+        ? 'New here? Request access first. If an owner already sent you a setup code, switch tabs and redeem it there.'
         : supportsSetupToken
-          ? 'Already approved? Finish setup once with your onboarding token.'
+          ? 'Already have a setup code from an owner? Redeem it once, then sign in normally after that.'
           : 'Sign in with the credentials available for this repository.',
     },
     request: {
       title: 'Request access',
       subtitle: 'Tell the owner who you are so they can approve a per-user account.',
-      ctaHint: 'Already have an onboarding token? Switch to complete setup.',
+      ctaHint: 'This tab stays here while approval status updates. If an owner already gave you a setup code, switch tabs and redeem it there.',
     },
     setup: {
-      title: 'Complete setup',
-      subtitle: setupFromApprovedRequest
-        ? 'Your request was approved in this browser. Choose your repo username and password to activate the account.'
-        : 'Redeem the one-time onboarding token from the owner to activate your account.',
+      title: 'Use setup code',
+      subtitle: 'Redeem a one-time setup code from an owner to create your repo username and password.',
       ctaHint: 'Once setup is complete, Qit will sign you in automatically.',
     },
   }
@@ -364,9 +358,9 @@ export function LoginPage({
           title="Access this repository"
           detail={
             supportsRequestAccess
-              ? 'Use your repo account if you already have one. New collaborators can request approval, then finish setup with a one-time onboarding token.'
+              ? 'Use your repo account if you already have one. New collaborators can request approval here and wait for an owner to share a one-time setup code.'
               : supportsSetupToken
-                ? 'Use your repo account if it is already active, or finish setup with a one-time onboarding token from an owner.'
+                ? 'Use your repo account if it is already active, or redeem a one-time setup code from an owner.'
                 : 'Use the shared session credentials printed when the server started.'
           }
         />
@@ -404,6 +398,7 @@ export function LoginPage({
                 }}
               >
                 <TextInput
+                  autoComplete="username"
                   autoFocus
                   label="Username"
                   onChange={setUsername}
@@ -412,6 +407,7 @@ export function LoginPage({
                   value={username}
                 />
                 <TextInput
+                  autoComplete="current-password"
                   label="Password"
                   onChange={setPassword}
                   placeholder={supportsBasicAuth ? 'shared password or account password' : 'your account password'}
@@ -437,6 +433,7 @@ export function LoginPage({
                 }}
               >
                 <TextInput
+                  autoComplete="name"
                   autoFocus
                   label="Name"
                   onChange={setRequestName}
@@ -445,6 +442,7 @@ export function LoginPage({
                   value={requestName}
                 />
                 <TextInput
+                  autoComplete="email"
                   label="Email"
                   onChange={setRequestEmail}
                   placeholder="you@example.com"
@@ -471,25 +469,20 @@ export function LoginPage({
                 className="space-y-4"
                 onSubmit={async (event) => {
                   event.preventDefault()
-                  await onCompleteOnboarding(setupCredential, setupUsername, setupPassword)
+                  await onCompleteOnboarding(setupToken, setupUsername, setupPassword)
                 }}
               >
-                {setupFromApprovedRequest ? (
-                  <p className="rounded-token border border-success/40 bg-success/10 px-3.5 py-3 text-sm text-success">
-                    Approval arrived in this browser. You can finish setup without pasting an onboarding token.
-                  </p>
-                ) : (
-                  <TextInput
-                    autoFocus
-                    label="Onboarding token"
-                    onChange={setSetupToken}
-                    placeholder="qit_setup..."
-                    required
-                    value={setupToken}
-                  />
-                )}
                 <TextInput
-                  autoFocus={setupFromApprovedRequest}
+                  autoComplete="off"
+                  autoFocus
+                  label="Setup code"
+                  onChange={setSetupToken}
+                  placeholder="qit_setup..."
+                  required
+                  value={setupToken}
+                />
+                <TextInput
+                  autoComplete="username"
                   label="Username"
                   onChange={setSetupUsername}
                   placeholder="Choose a repo username"
@@ -497,6 +490,7 @@ export function LoginPage({
                   value={setupUsername}
                 />
                 <TextInput
+                  autoComplete="new-password"
                   label="Password"
                   onChange={setSetupPassword}
                   placeholder="Create a password"
@@ -567,6 +561,7 @@ export function DashboardPage({
   onDeleteBranchRule,
   onUpdateAuthMethods,
   onApproveAccessRequest,
+  onIssueSetupToken,
   onRejectAccessRequest,
   onPromoteUser,
   onDemoteUser,
@@ -635,6 +630,7 @@ export function DashboardPage({
   onDeleteBranchRule: (pattern: string) => Promise<void>
   onUpdateAuthMethods: (methods: AuthMethod[]) => Promise<void>
   onApproveAccessRequest: (id: string) => Promise<IssuedOnboarding>
+  onIssueSetupToken: (name: string, email: string) => Promise<IssuedOnboarding>
   onRejectAccessRequest: (id: string) => Promise<void>
   onPromoteUser: (id: string) => Promise<void>
   onDemoteUser: (id: string) => Promise<void>
@@ -859,13 +855,14 @@ export function DashboardPage({
       {
         id: 'settings',
         icon: shellTabIcons.settings,
-        label: 'Repo settings',
+        label: 'Settings',
         content: (
           <SettingsPanel
             bootstrap={bootstrap}
             branches={branches}
             canEdit={canEdit}
             onApproveAccessRequest={onApproveAccessRequest}
+            onIssueSetupToken={onIssueSetupToken}
             onDemoteUser={onDemoteUser}
             onDeleteBranchRule={onDeleteBranchRule}
             onPromoteUser={onPromoteUser}
@@ -935,6 +932,7 @@ export function DashboardPage({
       onReviewPullRequest,
       onOpenTreeEntry,
       onCreatePat,
+      onIssueSetupToken,
       onSelectCommit,
       onSwitchBranch,
       onUpdateBranchRule,

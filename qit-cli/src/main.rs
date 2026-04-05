@@ -1,4 +1,5 @@
 mod serve_output;
+mod supervisor;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
@@ -11,9 +12,9 @@ use qit_domain::{
     DEFAULT_BRANCH,
 };
 use qit_git::{GitHttpBackendAdapter, GitRepoStore};
-use qit_http::{repo_mount_path, GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
+use qit_http::{GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
 use qit_storage::FilesystemRegistry;
-use qit_transports::{expose, PublicTransport};
+use qit_transports::PublicTransport;
 use qit_webui::{WebUiConfig, WebUiServer};
 use rand::distributions::{Alphanumeric, DistString};
 use serve_output::{
@@ -22,10 +23,12 @@ use serve_output::{
 };
 use similar::TextDiff;
 use std::io::Write;
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
+use supervisor::{
+    claim_mount_path, ensure_supervisor, heartbeat_interval, heartbeat_route, register_route,
+    run_internal_supervisor, unregister_route,
+};
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
 use tracing_subscriber::EnvFilter;
@@ -137,6 +140,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(hide = true)]
+    InternalSupervisor {
+        #[arg(long)]
+        port: u16,
+
+        #[arg(long, value_enum)]
+        transport: TransportArg,
+    },
     /// Fast-forward the host folder to the latest exported branch in the sidecar repo.
     Apply {
         /// Folder previously published with qit.
@@ -1018,6 +1029,15 @@ async fn main() -> Result<()> {
 
     if let Some(command) = cli.command {
         match command {
+            Commands::InternalSupervisor { port, transport } => {
+                run_internal_supervisor(
+                    registry_store.data_root().to_path_buf(),
+                    port,
+                    transport.into(),
+                )
+                .await?;
+                return Ok(());
+            }
             Commands::Apply { path, branch } => {
                 let (workspace, outcome) = service.apply(path, default_branch, branch).await?;
                 say(&format!(
@@ -1827,6 +1847,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    run_shared_serve(cli, repo_store, registry_store, service).await
+}
+
+async fn run_shared_serve(
+    cli: Cli,
+    repo_store: Arc<GitRepoStore>,
+    registry_store: Arc<FilesystemRegistry>,
+    service: Arc<WorkspaceService>,
+) -> Result<()> {
     let path = cli.path.context("path is required")?;
     let prepared = service
         .prepare_serve(
@@ -1861,13 +1890,7 @@ async fn main() -> Result<()> {
         &credentials,
         effective_auth.has_method(&AuthMethod::BasicAuth) && !reveal_password,
     )?;
-    let repo_mount_path = repo_mount_path(&repo_name_from_worktree(&workspace.worktree));
-
-    let addr = SocketAddr::from_str(&format!("127.0.0.1:{}", cli.port)).expect("valid socket addr");
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind 127.0.0.1:{}", cli.port))?;
-    let local_url = Url::parse(&format!("http://127.0.0.1:{}/", cli.port)).context("local URL")?;
+    let current_exe = std::env::current_exe().context("locate qit executable")?;
     let transport = if cli.local_only {
         PublicTransport::Local
     } else {
@@ -1875,65 +1898,80 @@ async fn main() -> Result<()> {
             .map(Into::into)
             .unwrap_or(PublicTransport::Ngrok)
     };
-    let request_scheme = if transport == PublicTransport::Local {
-        "http".to_string()
-    } else {
-        "https".to_string()
-    };
-    let git_router = GitHttpServer::new(
-        Arc::new(GitHttpBackendAdapter),
-        registry_store,
-        service.clone(),
-        GitHttpServerConfig {
-            workspace: workspace.clone(),
-            credentials: credentials.clone(),
-            auto_apply: cli.auto_apply,
-            repo_mount_path: repo_mount_path.clone(),
-            request_scheme,
-            max_body_bytes: cli.max_body_bytes,
-        },
+    let shared_entrypoint = ensure_supervisor(
+        &current_exe,
+        registry_store.data_root(),
+        cli.port,
+        transport,
     )
-    .git_router();
-    let local_browser_url = repo_url(&local_url, &repo_mount_path)?;
-    let endpoint = expose(transport, &local_url).await?;
-    let public_repo_url = repo_url(&endpoint.public_url, &repo_mount_path)?;
+    .await?;
+    let route_lease = claim_mount_path(
+        &shared_entrypoint,
+        workspace.id,
+        &repo_name_from_worktree(&workspace.worktree),
+    )
+    .await?;
+    let request_scheme = if shared_entrypoint.public_base_url.scheme() == "https" {
+        "https".to_string()
+    } else {
+        "http".to_string()
+    };
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .context("bind qit worker listener")?;
+    let upstream_url = Url::parse(&format!(
+        "http://127.0.0.1:{}/",
+        listener.local_addr().context("read qit worker addr")?.port()
+    ))
+    .context("build qit worker URL")?;
+    let worker_app = build_worker_app(
+        repo_store.clone(),
+        registry_store.clone(),
+        service.clone(),
+        workspace.clone(),
+        credentials.clone(),
+        route_lease.mount_path.clone(),
+        cli.auto_apply,
+        cli.max_body_bytes,
+        request_scheme,
+        shared_entrypoint.public_base_url.as_str(),
+    );
+    register_route(
+        &shared_entrypoint,
+        &route_lease,
+        &upstream_url,
+        &workspace.worktree,
+    )
+    .await?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut serve = tokio::spawn(async move {
+        axum::serve(listener, worker_app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .map_err(anyhow::Error::new)
+    });
+
+    let local_browser_url = repo_url(&shared_entrypoint.local_base_url, &route_lease.mount_path)?;
+    let public_repo_url = repo_url(&shared_entrypoint.public_base_url, &route_lease.mount_path)?;
     let clone_url = if effective_auth.has_method(&AuthMethod::BasicAuth) {
         repo_url_with_credentials(&public_repo_url, &credentials, reveal_password)?
     } else {
         public_repo_url.clone()
     };
-    let clone_cmd = clone_command(&clone_url, transport);
-    let web_router = WebUiServer::new(
-        repo_store.clone(),
-        service.clone(),
-        WebUiConfig {
-            workspace: workspace.clone(),
-            repo_mount_path: repo_mount_path.clone(),
-            credentials: credentials.clone(),
-            implicit_owner_mode: true,
-            secure_cookies: transport != PublicTransport::Local,
-            public_repo_url: Some(public_repo_url.as_str().trim_end_matches('/').to_string()),
-        },
-    )
-    .router();
-    let app = web_router.merge(git_router);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let serve = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!(err))
-    });
+    let shared_transport = match shared_entrypoint.label.as_str() {
+        "NGROK" => PublicTransport::Ngrok,
+        "TAILSCALE" => PublicTransport::Tailscale,
+        _ => PublicTransport::Local,
+    };
+    let clone_cmd = clone_command(&clone_url, shared_transport);
     print_serve_summary(
         &workspace.worktree,
         &workspace.exported_branch,
         effective_auth.methods.clone(),
-        endpoint.label,
+        &shared_entrypoint.label,
         &public_repo_url,
         &local_browser_url,
         &public_repo_url,
@@ -1947,17 +1985,92 @@ async fn main() -> Result<()> {
     println!();
     let _ = std::io::stdout().flush();
 
-    tokio::signal::ctrl_c().await.context("ctrl_c")?;
+    let heartbeat_entrypoint = shared_entrypoint.clone();
+    let heartbeat_lease = route_lease.clone();
+    let mut heartbeat = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(heartbeat_interval()).await;
+            heartbeat_route(&heartbeat_entrypoint, &heartbeat_lease).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    });
+
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("ctrl_c")?;
+        }
+        result = &mut serve => {
+            match result {
+                Ok(Ok(())) => bail!("qit worker server exited unexpectedly"),
+                Ok(Err(error)) => return Err(error),
+                Err(error) => bail!("qit worker server task failed: {error}"),
+            }
+        }
+        result = &mut heartbeat => {
+            match result {
+                Ok(Ok(())) => bail!("qit supervisor heartbeat stopped unexpectedly"),
+                Ok(Err(error)) => return Err(error),
+                Err(error) => bail!("qit supervisor heartbeat task failed: {error}"),
+            }
+        }
+    }
+
+    heartbeat.abort();
     let _ = shutdown_tx.send(());
+    let _ = unregister_route(&shared_entrypoint, &route_lease).await;
     match timeout(Duration::from_secs(5), serve).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => return Err(error),
-        Ok(Err(error)) => bail!("git http server task failed: {error}"),
-        Err(_) => bail!("timed out waiting for git http server shutdown"),
+        Ok(Err(error)) => bail!("qit worker server task failed: {error}"),
+        Err(_) => bail!("timed out waiting for qit worker server shutdown"),
     }
-    endpoint
-        .shutdown()
-        .await
-        .context("shutdown public endpoint")?;
     Ok(())
+}
+
+fn build_worker_app(
+    repo_store: Arc<GitRepoStore>,
+    registry_store: Arc<FilesystemRegistry>,
+    service: Arc<WorkspaceService>,
+    workspace: WorkspaceSpec,
+    credentials: SessionCredentials,
+    mount_path: String,
+    auto_apply: bool,
+    max_body_bytes: usize,
+    request_scheme: String,
+    public_base_url: &str,
+) -> axum::Router {
+    let git_router = GitHttpServer::new(
+        Arc::new(GitHttpBackendAdapter),
+        registry_store,
+        service.clone(),
+        GitHttpServerConfig {
+            workspace: workspace.clone(),
+            credentials: credentials.clone(),
+            auto_apply,
+            repo_mount_path: mount_path.clone(),
+            request_scheme,
+            max_body_bytes,
+        },
+    )
+    .git_router();
+    let public_repo_url = format!(
+        "{}/{}",
+        public_base_url.trim_end_matches('/'),
+        mount_path.trim_start_matches('/')
+    );
+    let web_router = WebUiServer::new(
+        repo_store,
+        service,
+        WebUiConfig {
+            workspace,
+            repo_mount_path: mount_path,
+            credentials,
+            implicit_owner_mode: true,
+            secure_cookies: public_base_url.starts_with("https://"),
+            public_repo_url: Some(public_repo_url),
+        },
+    )
+    .router();
+    web_router.merge(git_router)
 }

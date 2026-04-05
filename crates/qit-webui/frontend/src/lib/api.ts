@@ -240,6 +240,11 @@ export const api = {
     requestJson<RepoUserView>(`/api/users/${encodeURIComponent(id)}/revoke`, {
       method: 'POST',
     }),
+  issueSetupToken: (name: string, email: string) =>
+    requestJson<IssuedOnboarding>('/api/users/setup-token', {
+      method: 'POST',
+      body: JSON.stringify({ name, email }),
+    }),
   resetUserSetup: (id: string) =>
     requestJson<IssuedOnboarding>(`/api/users/${encodeURIComponent(id)}/reset-setup`, {
       method: 'POST',

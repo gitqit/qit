@@ -122,13 +122,14 @@ impl WebUiServer {
             && matches!(session, Some(ResolvedSession { operator_override: true, .. }))
     }
 
-    fn login_attempt_key(headers: &HeaderMap) -> String {
-        headers
+    fn login_attempt_key(&self, headers: &HeaderMap) -> String {
+        let host = headers
             .get(axum::http::header::HOST)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("unknown-host")
             .trim()
-            .to_string()
+            .to_string();
+        format!("{host}{}", self.repo_mount_path)
     }
 
     pub(super) async fn allow_login_attempt(
@@ -136,7 +137,7 @@ impl WebUiServer {
         headers: &HeaderMap,
     ) -> Result<(), axum::http::StatusCode> {
         let now_ms = Self::now_ms();
-        let key = Self::login_attempt_key(headers);
+        let key = self.login_attempt_key(headers);
         let mut attempts = self.login_attempts.write().await;
         attempts.retain(|_, record| record.locked_until_ms > now_ms || record.failures > 0);
         if attempts
@@ -150,7 +151,7 @@ impl WebUiServer {
 
     pub(super) async fn record_login_failure(&self, headers: &HeaderMap) {
         let now_ms = Self::now_ms();
-        let key = Self::login_attempt_key(headers);
+        let key = self.login_attempt_key(headers);
         let mut attempts = self.login_attempts.write().await;
         let record = attempts.entry(key).or_insert_with(|| LoginAttemptRecord {
             failures: 0,
@@ -169,7 +170,7 @@ impl WebUiServer {
     }
 
     pub(super) async fn clear_login_attempts(&self, headers: &HeaderMap) {
-        let key = Self::login_attempt_key(headers);
+        let key = self.login_attempt_key(headers);
         self.login_attempts.write().await.remove(&key);
     }
 }

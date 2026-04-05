@@ -144,6 +144,7 @@ pub enum AuthActivityKind {
     AccessRequested,
     AccessApproved,
     AccessRejected,
+    UserSetupIssued,
     UserPromoted,
     UserDemoted,
     UserRevoked,

@@ -1563,6 +1563,83 @@ impl WorkspaceService {
         Ok((workspace, RepoUserView::from(&user), onboarding))
     }
 
+    pub fn issue_setup_token(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        name: &str,
+        email: &str,
+        role: RepoUserRole,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, RepoUserView, IssuedOnboarding), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        Self::require_auth_method(&web_ui.auth, AuthMethod::SetupToken)?;
+        let now_ms = Self::now_ms();
+        let name = Self::normalize_auth_required(name, "name", 120)?;
+        let email = Self::normalize_email(email)?;
+        if web_ui.auth.users.iter().any(|user| user.email == email) {
+            return Err(DomainError::InvalidAuth(
+                "a user with that email already exists".into(),
+            ));
+        }
+
+        let user = RepoUser {
+            id: Uuid::new_v4().to_string(),
+            name,
+            email: email.clone(),
+            username: None,
+            password_verifier: None,
+            role,
+            status: RepoUserStatus::ApprovedPendingSetup,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            approved_at_ms: Some(now_ms),
+            activated_at_ms: None,
+            revoked_at_ms: None,
+        };
+        let linked_request_id = web_ui
+            .auth
+            .access_requests
+            .iter()
+            .position(|request| request.email == email && request.status == AccessRequestStatus::Pending)
+            .map(|request_index| {
+                let request = &mut web_ui.auth.access_requests[request_index];
+                request.status = AccessRequestStatus::Approved;
+                request.linked_user_id = Some(user.id.clone());
+                request.reviewed_at_ms = Some(now_ms);
+                request.id.clone()
+            });
+        web_ui.auth.users.push(user.clone());
+        let onboarding = Self::issue_onboarding_for_user(&mut web_ui.auth, &user.id, now_ms)?;
+        if let Some(request_id) = linked_request_id.clone() {
+            Self::record_auth_activity(
+                &mut web_ui.auth,
+                actor,
+                AuthActivityKind::AccessApproved,
+                Some(user.id.clone()),
+                Some(request_id),
+                None,
+                Some(email.clone()),
+                now_ms,
+            );
+        }
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            actor,
+            AuthActivityKind::UserSetupIssued,
+            Some(user.id.clone()),
+            linked_request_id,
+            None,
+            Some(email),
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, RepoUserView::from(&user), onboarding))
+    }
+
     pub fn reject_access_request(
         &self,
         path: PathBuf,
@@ -3766,6 +3843,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(git_principal.user_id, principal.user_id);
+    }
+
+    #[test]
+    fn issuing_manual_setup_token_approves_matching_request_without_auto_setup() {
+        let (_temp, _registry, service) = service_with_workspace("main", "main");
+        service
+            .update_auth_mode(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                AuthMode::RequestBased,
+                &AuthActor::Operator,
+            )
+            .unwrap();
+        let (_, request) = service
+            .submit_access_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                "Alice",
+                "alice@example.com",
+            )
+            .unwrap();
+
+        let (_, user, onboarding) = service
+            .issue_setup_token(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                "Alice",
+                "alice@example.com",
+                RepoUserRole::User,
+                &AuthActor::Operator,
+            )
+            .unwrap();
+        assert_eq!(user.status, RepoUserStatus::ApprovedPendingSetup);
+        assert!(onboarding.secret.starts_with("qit_setup."));
+
+        let (_, progress) = service
+            .read_access_request_progress(PathBuf::from("."), DEFAULT_BRANCH, &request.secret)
+            .unwrap();
+        assert_eq!(progress.status, AccessRequestStatus::Approved);
+
+        let (_, principal) = service
+            .complete_onboarding(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &onboarding.secret,
+                "alice",
+                "very-secret-pass",
+            )
+            .unwrap();
+        assert_eq!(principal.username, "alice");
     }
 
     #[test]

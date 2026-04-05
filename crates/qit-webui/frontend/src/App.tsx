@@ -99,7 +99,6 @@ function App() {
   const [requestMessage, setRequestMessage] = useState<string | null>(null)
   const [setupMessage, setSetupMessage] = useState<string | null>(null)
   const [requestReceipt, setRequestReceipt] = useState<PendingAccessReceipt | null>(() => readPendingAccessReceipt())
-  const [approvedSetupToken, setApprovedSetupToken] = useState<string | null>(null)
   const [toastMessage, setToastMessage] = useState<string | null>(null)
   const [highlightedPullRequestId, setHighlightedPullRequestId] = useState<string | null>(null)
 
@@ -214,7 +213,6 @@ function App() {
       return
     }
     if (!bootstrap || !requestReceipt) {
-      setApprovedSetupToken(null)
       return
     }
     if (!bootstrap.auth_methods.includes('request_access') || !bootstrap.auth_methods.includes('setup_token')) {
@@ -233,16 +231,13 @@ function App() {
 
         if (progress.status === 'approved') {
           setAuthError(null)
-          setRequestMessage(null)
-          setSetupMessage('Approval received. Choose a username and password to finish setup.')
-          setApprovedSetupToken(requestReceipt.secret)
+          setRequestMessage('Request approved. Ask the owner for your one-time setup code, then use the setup code tab.')
           return
         }
 
         if (progress.status === 'rejected' || progress.status === 'revoked') {
           writePendingAccessReceipt(null)
           setRequestReceipt(null)
-          setApprovedSetupToken(null)
           setRequestMessage(null)
           setSetupMessage(null)
           setAuthError('Your access request was not approved.')
@@ -250,7 +245,6 @@ function App() {
         }
 
         setRequestMessage('Access request sent. Waiting for the owner to approve…')
-        setApprovedSetupToken(null)
         timeoutId = window.setTimeout(() => {
           void poll()
         }, 2500)
@@ -676,7 +670,6 @@ function App() {
   if (!actor) {
     return (
       <LoginPage
-        approvedSetupToken={approvedSetupToken}
         bootstrap={bootstrap}
         error={authError}
         requestMessage={requestMessage}
@@ -693,7 +686,6 @@ function App() {
         onRequestAccess={async (name, email) => {
           setAuthError(null)
           setSetupMessage(null)
-          setApprovedSetupToken(null)
           try {
             const submitted = await api.requestAccess(name, email)
             const receipt = { id: submitted.request.id, secret: submitted.secret }
@@ -711,7 +703,6 @@ function App() {
             await api.completeOnboarding(token, username, password)
             writePendingAccessReceipt(null)
             setRequestReceipt(null)
-            setApprovedSetupToken(null)
             setSetupMessage('Setup complete. Signing you in…')
             await refresh()
           } catch (setupError) {
@@ -776,7 +767,7 @@ function App() {
         }}
         onApproveAccessRequest={async (id) => {
           const issued = await api.approveAccessRequest(id)
-          setToastMessage(`Approved ${issued.email}. Share the one-time onboarding token now.`)
+          setToastMessage(`Approved ${issued.email}. Share the one-time setup code now.`)
           await refresh()
           return issued
         }}
@@ -800,9 +791,15 @@ function App() {
           setToastMessage('User revoked.')
           await refresh()
         }}
+        onIssueSetupToken={async (name, email) => {
+          const issued = await api.issueSetupToken(name, email)
+          setToastMessage(`Created a setup code for ${issued.email}. Share it now.`)
+          await refresh()
+          return issued
+        }}
         onResetUserSetup={async (id) => {
           const issued = await api.resetUserSetup(id)
-          setToastMessage(`Reset setup for ${issued.email}. Share the new onboarding token now.`)
+          setToastMessage(`Reset setup for ${issued.email}. Share the new setup code now.`)
           await refresh()
           return issued
         }}

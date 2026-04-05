@@ -474,6 +474,89 @@ fn qit_cli_serves_and_manual_apply_updates_host() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn qit_cli_shared_supervisor_serves_multiple_repos_on_one_entrypoint() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("data");
+    let worktree_one = root.path().join("alpha").join("host");
+    let worktree_two = root.path().join("beta").join("host");
+    std::fs::create_dir_all(&worktree_one)?;
+    std::fs::create_dir_all(&worktree_two)?;
+    std::fs::write(worktree_one.join("README.md"), "alpha\n")?;
+    std::fs::write(worktree_two.join("README.md"), "beta\n")?;
+
+    let port = free_port()?;
+    let (mut first_child, first_rx) =
+        spawn_qit_serve_with_env(&worktree_one, port, false, Some(&data_dir))?;
+    let first_clone_url = wait_for_clone_url(&first_rx)?;
+    let (mut second_child, second_rx) =
+        spawn_qit_serve_with_env(&worktree_two, port, false, Some(&data_dir))?;
+    let second_clone_url = wait_for_clone_url(&second_rx)?;
+
+    let first_url = Url::parse(&first_clone_url)?;
+    let second_url = Url::parse(&second_clone_url)?;
+    assert_eq!(first_url.host_str(), second_url.host_str());
+    assert_eq!(first_url.port_or_known_default(), second_url.port_or_known_default());
+    assert_ne!(first_url.path(), second_url.path());
+    assert_eq!(first_url.path(), "/host/");
+    assert!(second_url.path().starts_with("/host-"));
+
+    let status_page = reqwest::get(format!("http://127.0.0.1:{port}/"))
+        .await?
+        .text()
+        .await?;
+    assert!(status_page.contains("/host"));
+    assert!(status_page.contains(second_url.path().trim_end_matches('/')));
+
+    let clone_one = root.path().join("clone-one");
+    let clone_two = root.path().join("clone-two");
+    run_git(None, &["clone", &first_clone_url, clone_one.to_str().unwrap()])?;
+    run_git(None, &["clone", &second_clone_url, clone_two.to_str().unwrap()])?;
+    assert_eq!(
+        std::fs::read_to_string(clone_one.join("README.md"))?.replace("\r\n", "\n"),
+        "alpha\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(clone_two.join("README.md"))?.replace("\r\n", "\n"),
+        "beta\n"
+    );
+
+    let _ = second_child.kill();
+    let _ = second_child.wait();
+    let _ = first_child.kill();
+    let _ = first_child.wait();
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_host_through_shared_supervisor_does_not_get_local_operator_mode() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("data");
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "hello\n")?;
+
+    let port = free_port()?;
+    let (mut child, rx) = spawn_qit_serve_with_env(&worktree, port, false, Some(&data_dir))?;
+    let clone_url = wait_for_clone_url(&rx)?;
+    let mount_path = Url::parse(&clone_url)?.path().trim_end_matches('/').to_string();
+
+    let payload = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}{mount_path}/api/bootstrap"))
+        .header("Host", "demo.example.ts.net")
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(payload.contains("\"operator_override\":false"));
+    assert!(payload.contains("\"actor\":null"));
+    Ok(())
+}
+
 #[test]
 fn qit_cli_hides_password_and_clone_credentials_by_default() -> Result<()> {
     let root = TempDir::new()?;
@@ -498,7 +581,7 @@ fn qit_cli_hides_password_and_clone_credentials_by_default() -> Result<()> {
             Ok(line) if line.trim_start().starts_with("file: ") => {
                 saw_credentials_file = true;
             }
-            Ok(line) if line.contains("git clone http://") && !line.contains('@') => {
+            Ok(line) if line.contains("git clone ") && !line.contains('@') => {
                 saw_uncredentialed_clone = true;
             }
             Ok(line) if line.contains("===========================================================") => {
@@ -549,7 +632,7 @@ fn qit_cli_shows_password_with_show_pass() -> Result<()> {
             Ok(line) if line.trim_start().starts_with("password: ") => {
                 saw_password = !line.contains("hidden");
             }
-            Ok(line) if line.contains("git clone http://") && line.contains('@') => {
+            Ok(line) if line.contains("git clone ") && line.contains('@') => {
                 saw_credentialed_clone = true;
             }
             Ok(line) if line.contains("Ctrl+C to stop.") => break,

@@ -35,6 +35,8 @@
 - Git HTTP request bodies remain size-limited and configurable through the CLI.
 
 ## Operational Expectations
-- The current Web UI session store is in-memory and process-local.
+- Multiple `qit serve` processes can share one local/public entrypoint through a local supervisor that routes requests by repo path.
+- The current Web UI session store remains in-memory and process-local to each repo worker, so signing into one repo path does not sign the browser into another repo on the same shared host.
 - Durable request-based auth state lives in repo-persistent workspace metadata alongside repository settings and pull request records.
+- Login attempt throttling is scoped by exposed host plus repo path so one repo path cannot lock out another when they share a hostname.
 - Manual smoke testing is still required for environment-bound transports such as ngrok and Tailscale because those paths depend on external services and machine state.

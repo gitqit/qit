@@ -85,6 +85,7 @@ export function SettingsPanel({
   canEdit,
   settings,
   onApproveAccessRequest,
+  onIssueSetupToken,
   onDemoteUser,
   onDeleteBranchRule,
   onPromoteUser,
@@ -101,6 +102,7 @@ export function SettingsPanel({
   canEdit: boolean
   settings: SettingsResponse | null
   onApproveAccessRequest: (id: string) => Promise<IssuedOnboarding>
+  onIssueSetupToken: (name: string, email: string) => Promise<IssuedOnboarding>
   onDemoteUser: (id: string) => Promise<void>
   onDeleteBranchRule: (pattern: string) => Promise<void>
   onPromoteUser: (id: string) => Promise<void>
@@ -134,6 +136,9 @@ export function SettingsPanel({
   const [savingBranch, setSavingBranch] = useState(false)
   const [savingRule, setSavingRule] = useState(false)
   const [, setSavingAccess] = useState(false)
+  const [issuingSetupToken, setIssuingSetupToken] = useState(false)
+  const [manualSetupName, setManualSetupName] = useState('')
+  const [manualSetupEmail, setManualSetupEmail] = useState('')
   const [issuedOnboarding, setIssuedOnboarding] = useState<IssuedOnboarding | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -540,7 +545,7 @@ export function SettingsPanel({
                   <div className="space-y-1">
                     <h3 className="text-base font-semibold text-fg">Pending requests</h3>
                     <p className="text-sm leading-6 text-fg-muted">
-                      Approving a request issues a one-time setup token. Share it immediately because it will not be shown again.
+                      Approving a request issues a one-time setup code. Share it immediately because it will not be shown again.
                     </p>
                   </div>
                   {settings.access_requests.length ? (
@@ -597,9 +602,58 @@ export function SettingsPanel({
               {canEdit && supportsSetupToken ? (
                 <div className="space-y-4 rounded-lg border border-border/80 bg-canvas-raised/60 p-5">
                   <div className="space-y-1">
+                    <h3 className="text-base font-semibold text-fg">Issue setup code</h3>
+                    <p className="text-sm leading-6 text-fg-muted">
+                      Create a one-time setup code manually when you want to onboard someone directly instead of waiting on the browser request flow.
+                    </p>
+                  </div>
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <TextInput
+                      autoComplete="name"
+                      label="Name"
+                      onChange={setManualSetupName}
+                      placeholder="Collaborator name"
+                      value={manualSetupName}
+                    />
+                    <TextInput
+                      autoComplete="email"
+                      label="Email"
+                      onChange={setManualSetupEmail}
+                      placeholder="collaborator@example.com"
+                      type="email"
+                      value={manualSetupEmail}
+                    />
+                  </div>
+                  <FormActions hint="If there is already a pending request for this email, issuing a setup code will mark that request approved and let you share the code out-of-band.">
+                    <Button
+                      disabled={!manualSetupName.trim() || !manualSetupEmail.trim() || issuingSetupToken}
+                      icon={<Shield className="h-4 w-4" strokeWidth={1.9} />}
+                      onClick={async () => {
+                        setIssuingSetupToken(true)
+                        setError(null)
+                        try {
+                          const onboarding = await onIssueSetupToken(manualSetupName, manualSetupEmail)
+                          setIssuedOnboarding(onboarding)
+                          setManualSetupName('')
+                          setManualSetupEmail('')
+                        } catch (saveError) {
+                          setError(saveError instanceof Error ? saveError.message : 'Unable to create a setup code.')
+                        } finally {
+                          setIssuingSetupToken(false)
+                        }
+                      }}
+                    >
+                      {issuingSetupToken ? 'Creating…' : 'Create setup code'}
+                    </Button>
+                  </FormActions>
+                </div>
+              ) : null}
+              {canEdit && supportsSetupToken ? (
+                <div className="space-y-4 rounded-lg border border-border/80 bg-canvas-raised/60 p-5">
+                  <div className="space-y-1">
                     <h3 className="text-base font-semibold text-fg">Repo users</h3>
                     <p className="text-sm leading-6 text-fg-muted">
-                      Promote owners, revoke accounts, or reset setup for approved users who need a fresh onboarding token.
+                      Promote owners, revoke accounts, or reset setup for approved users who need a fresh setup code.
                     </p>
                   </div>
                   {settings.users.length ? (
@@ -678,7 +732,7 @@ export function SettingsPanel({
               ) : null}
               {issuedOnboarding ? (
                 <div className="rounded-token border border-success/30 bg-success/10 px-4 py-3 text-sm text-fg">
-                  <p className="font-medium">One-time onboarding token for {issuedOnboarding.email}</p>
+                  <p className="font-medium">One-time setup code for {issuedOnboarding.email}</p>
                   <p className="mt-1 break-all font-mono text-xs text-fg-muted">{issuedOnboarding.secret}</p>
                 </div>
               ) : null}

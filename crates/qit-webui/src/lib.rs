@@ -192,6 +192,12 @@ struct AccessRequestStatusRequest {
 }
 
 #[derive(Deserialize)]
+struct ManualSetupTokenRequest {
+    name: String,
+    email: String,
+}
+
+#[derive(Deserialize)]
 struct OnboardingCompleteRequest {
     token: String,
     username: String,
@@ -390,6 +396,7 @@ impl WebUiServer {
                 &format!("{mount}/api/access-requests/{{id}}/reject"),
                 post(reject_access_request),
             )
+            .route(&format!("{mount}/api/users/setup-token"), post(issue_setup_token))
             .route(&format!("{mount}/api/onboarding/complete"), post(complete_onboarding))
             .route(
                 &format!("{mount}/api/settings"),
@@ -1026,6 +1033,29 @@ async fn complete_onboarding(
         .header(SET_COOKIE, state.session_cookie(&token))
         .body(Body::from(payload))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn issue_setup_token(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    Json(body): Json<ManualSetupTokenRequest>,
+) -> Result<Json<qit_domain::IssuedOnboarding>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, _user, onboarding) = state
+        .workspace_service
+        .issue_setup_token(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &body.name,
+            &body.email,
+            RepoUserRole::User,
+            &auth_actor_from_session(&session),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(onboarding))
 }
 
 async fn promote_user(
