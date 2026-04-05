@@ -9,12 +9,14 @@ use axum::{body::Body, Router};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use qit_domain::{
-    BlobContent, BranchInfo, CommitDetail, CommitHistory, CommitRefDecoration,
-    CommitRefKind, CreatePullRequest, CreatePullRequestComment, CreatePullRequestReview,
-    DomainError, PullRequestActivityRecord, PullRequestRecord, PullRequestReviewRecord,
+    AccessRequestView, AuthActor, AuthMethod, AuthMode, AuthenticatedPrincipal, BlobContent,
+    BranchInfo, CommitDetail, CommitHistory, CommitRefDecoration, CommitRefKind,
+    CreatePullRequest, CreatePullRequestComment, CreatePullRequestReview, DomainError,
+    PatRecordView, PullRequestActivityRecord, PullRequestRecord, PullRequestReviewRecord,
     PullRequestReviewState, PullRequestReviewSummary, PullRequestStatus, RefComparison, RefDiffFile,
-    RepoReadStore, RepositorySettings, SessionCredentials, UiRole, UpdatePullRequest,
-    UpdateRepositorySettings, UpsertBranchRule, WorkspaceService, WorkspaceSpec, WorkspaceWebUiState,
+    RepoReadStore, RepoUserRole, RepoUserView, RepositorySettings, SessionCredentials, UiRole,
+    UpdatePullRequest, UpdateRepositorySettings, UpsertBranchRule, WorkspaceService, WorkspaceSpec,
+    WorkspaceWebUiState,
 };
 use rand::distributions::{Alphanumeric, DistString};
 use serde::{Deserialize, Serialize};
@@ -58,8 +60,16 @@ pub struct WebUiConfig {
 
 #[derive(Clone)]
 struct SessionRecord {
+    user_id: Option<String>,
     role: UiRole,
     expires_at_ms: u64,
+}
+
+#[derive(Clone)]
+struct ResolvedSession {
+    actor: UiRole,
+    principal: Option<AuthenticatedPrincipal>,
+    operator_override: bool,
 }
 
 #[derive(Clone, Default)]
@@ -86,12 +96,16 @@ pub struct WebUiServer {
 #[derive(Serialize, Deserialize)]
 struct BootstrapResponse {
     actor: Option<UiRole>,
+    principal: Option<AuthenticatedPrincipal>,
     repo_name: String,
     worktree: String,
     exported_branch: String,
     checked_out_branch: String,
     description: String,
     homepage_url: String,
+    auth_mode: AuthMode,
+    auth_methods: Vec<AuthMethod>,
+    operator_override: bool,
     local_only_owner_mode: bool,
     shared_remote_identity: bool,
     git_credentials_visible: bool,
@@ -102,8 +116,14 @@ struct BootstrapResponse {
 
 #[derive(Serialize, Deserialize)]
 struct SettingsResponse {
+    auth_mode: AuthMode,
+    auth_methods: Vec<AuthMethod>,
     local_only_owner_mode: bool,
     shared_remote_identity: bool,
+    current_user: Option<AuthenticatedPrincipal>,
+    users: Vec<RepoUserView>,
+    access_requests: Vec<AccessRequestView>,
+    personal_access_tokens: Vec<PatRecordView>,
     repository: RepositorySettings,
 }
 
@@ -158,6 +178,37 @@ struct BranchMutationResponse {
 struct LoginRequest {
     username: String,
     password: String,
+}
+
+#[derive(Deserialize)]
+struct AccessRequestCreateRequest {
+    name: String,
+    email: String,
+}
+
+#[derive(Deserialize)]
+struct AccessRequestStatusRequest {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct OnboardingCompleteRequest {
+    token: String,
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct PatCreateRequest {
+    label: String,
+}
+
+#[derive(Deserialize)]
+struct AuthModeUpdateRequest {
+    #[serde(default)]
+    mode: Option<AuthMode>,
+    #[serde(default)]
+    methods: Option<Vec<AuthMethod>>,
 }
 
 #[derive(Deserialize)]
@@ -325,10 +376,34 @@ impl WebUiServer {
             .route(&format!("{mount}/api/bootstrap"), get(bootstrap))
             .route(&format!("{mount}/api/session/login"), post(login))
             .route(&format!("{mount}/api/session/logout"), post(logout))
+            .route(&format!("{mount}/api/auth/mode"), post(update_auth_mode))
+            .route(&format!("{mount}/api/access-requests"), post(create_access_request))
+            .route(
+                &format!("{mount}/api/access-requests/status"),
+                post(read_access_request_status),
+            )
+            .route(
+                &format!("{mount}/api/access-requests/{{id}}/approve"),
+                post(approve_access_request),
+            )
+            .route(
+                &format!("{mount}/api/access-requests/{{id}}/reject"),
+                post(reject_access_request),
+            )
+            .route(&format!("{mount}/api/onboarding/complete"), post(complete_onboarding))
             .route(
                 &format!("{mount}/api/settings"),
                 get(get_settings).patch(update_settings),
             )
+            .route(&format!("{mount}/api/users/{{id}}/promote"), post(promote_user))
+            .route(&format!("{mount}/api/users/{{id}}/demote"), post(demote_user))
+            .route(&format!("{mount}/api/users/{{id}}/revoke"), post(revoke_user))
+            .route(
+                &format!("{mount}/api/users/{{id}}/reset-setup"),
+                post(reset_user_setup),
+            )
+            .route(&format!("{mount}/api/profile/pats"), post(create_pat))
+            .route(&format!("{mount}/api/profile/pats/{{id}}"), delete(revoke_pat))
             .route(
                 &format!("{mount}/api/settings/branch-rules"),
                 put(upsert_branch_rule),
@@ -502,11 +577,67 @@ impl WebUiServer {
 
 }
 
-fn settings_response(state: &WebUiServer, repository: RepositorySettings) -> SettingsResponse {
+fn settings_response(
+    state: &WebUiServer,
+    web_ui: &WorkspaceWebUiState,
+    session: Option<&ResolvedSession>,
+) -> SettingsResponse {
+    let auth_mode = web_ui.auth.mode.clone();
+    let auth_methods = web_ui.auth.methods.clone();
+    let current_user = session.and_then(|session| session.principal.clone());
+    let can_manage_access = session
+        .map(|session| session.operator_override || session.actor == UiRole::Owner)
+        .unwrap_or(false);
+    let current_user_id = current_user.as_ref().map(|user| user.user_id.clone());
     SettingsResponse {
+        auth_mode: auth_mode.clone(),
+        auth_methods,
         local_only_owner_mode: state.implicit_owner_mode,
-        shared_remote_identity: true,
-        repository,
+        shared_remote_identity: web_ui.auth.has_method(&AuthMethod::BasicAuth),
+        current_user,
+        users: if can_manage_access {
+            web_ui.auth.users.iter().map(RepoUserView::from).collect()
+        } else {
+            Vec::new()
+        },
+        access_requests: if can_manage_access {
+            web_ui
+                .auth
+                .access_requests
+                .iter()
+                .filter(|request| request.status == qit_domain::AccessRequestStatus::Pending)
+                .map(AccessRequestView::from)
+                .collect()
+        } else {
+            Vec::new()
+        },
+        personal_access_tokens: current_user_id
+            .as_deref()
+            .map(|user_id| {
+                web_ui
+                    .auth
+                    .personal_access_tokens
+                    .iter()
+                    .filter(|token| token.user_id == user_id && token.revoked_at_ms.is_none())
+                    .map(PatRecordView::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        repository: web_ui.repository.clone(),
+    }
+}
+
+fn auth_actor_from_session(session: &ResolvedSession) -> AuthActor {
+    if session.operator_override {
+        AuthActor::Operator
+    } else if let Some(principal) = &session.principal {
+        AuthActor::User {
+            user_id: principal.user_id.clone(),
+            username: principal.username.clone(),
+            role: principal.role.clone(),
+        }
+    } else {
+        AuthActor::Operator
     }
 }
 
@@ -515,8 +646,15 @@ fn domain_status(error: &DomainError) -> StatusCode {
         DomainError::InvalidPullRequest(_)
         | DomainError::InvalidSettings(_)
         | DomainError::BranchRuleViolation(_)
+        | DomainError::InvalidAuth(_)
         | DomainError::ExportedBranchConflict { .. } => StatusCode::BAD_REQUEST,
-        DomainError::MissingSidecar(_) => StatusCode::NOT_FOUND,
+        DomainError::AccessRequestNotFound(_)
+        | DomainError::UserNotFound(_)
+        | DomainError::PatNotFound(_)
+        | DomainError::MissingSidecar(_) => StatusCode::NOT_FOUND,
+        DomainError::InvalidOnboardingToken | DomainError::AuthenticationFailed => {
+            StatusCode::UNAUTHORIZED
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -643,18 +781,26 @@ async fn bootstrap(
     headers: HeaderMap,
 ) -> Result<Json<BootstrapResponse>, StatusCode> {
     let (workspace, web_ui) = state.latest_workspace()?;
-    let actor = state.current_actor(&headers).await?;
-    let git_credentials_visible = state.can_view_git_credentials(actor.as_ref());
+    let session = state.current_session(&headers).await?;
+    let auth_mode = web_ui.auth.mode.clone();
+    let git_credentials_visible = state.can_view_git_credentials(session.as_ref(), &web_ui.auth.methods);
     Ok(Json(BootstrapResponse {
-        actor,
+        actor: session.as_ref().map(|session| session.actor.clone()),
+        principal: session.as_ref().and_then(|session| session.principal.clone()),
         repo_name: state.repo_name(),
         worktree: workspace.worktree.display().to_string(),
         exported_branch: workspace.exported_branch,
         checked_out_branch: workspace.checked_out_branch,
         description: web_ui.repository.description,
         homepage_url: web_ui.repository.homepage_url,
+        auth_mode: auth_mode.clone(),
+        auth_methods: web_ui.auth.methods.clone(),
+        operator_override: session
+            .as_ref()
+            .map(|session| session.operator_override)
+            .unwrap_or(false),
         local_only_owner_mode: state.implicit_owner_mode,
-        shared_remote_identity: true,
+        shared_remote_identity: web_ui.auth.has_method(&AuthMethod::BasicAuth),
         git_credentials_visible,
         git_username: git_credentials_visible.then(|| state.credentials.username.clone()),
         git_password: git_credentials_visible.then(|| state.credentials.password.clone()),
@@ -667,8 +813,9 @@ async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<Response<Body>, StatusCode> {
-    if let Some(actor) = state.default_actor(&headers) {
-        let payload = serde_json::to_vec(&actor).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(session) = state.default_session(&headers) {
+        let payload =
+            serde_json::to_vec(&session.actor).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         return Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
@@ -677,25 +824,52 @@ async fn login(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
     state.allow_login_attempt(&headers).await?;
-    if !credentials_match(&body.username, &body.password, &state.credentials) {
-        state.record_login_failure(&headers).await;
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    let (_, auth) = state
+        .workspace_service
+        .read_auth_state(state.workspace.worktree.clone(), &state.workspace.exported_branch)
+        .map_err(|error| domain_status(&error))?;
+    let session_record = if auth.has_method(&AuthMethod::BasicAuth)
+        && credentials_match(&body.username, &body.password, &state.credentials)
+    {
+        SessionRecord {
+            user_id: None,
+            role: UiRole::User,
+            expires_at_ms: WebUiServer::now_ms().saturating_add(SESSION_TTL_MS),
+        }
+    } else {
+        let (_, principal) = match state
+            .workspace_service
+            .authenticate_web_user(
+                state.workspace.worktree.clone(),
+                &state.workspace.exported_branch,
+                &body.username,
+                &body.password,
+            )
+        {
+            Ok(value) => value,
+            Err(error) => {
+                if matches!(error, DomainError::AuthenticationFailed) {
+                    state.record_login_failure(&headers).await;
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+                return Err(domain_status(&error));
+            }
+        };
+        SessionRecord {
+            user_id: Some(principal.user_id.clone()),
+            role: principal.ui_role(),
+            expires_at_ms: WebUiServer::now_ms().saturating_add(SESSION_TTL_MS),
+        }
+    };
     state.clear_login_attempts(&headers).await;
     let token = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
     state
         .sessions
         .write()
         .await
-        .insert(
-            token.clone(),
-            SessionRecord {
-                role: UiRole::User,
-                expires_at_ms: WebUiServer::now_ms().saturating_add(SESSION_TTL_MS),
-            },
-        );
+        .insert(token.clone(), session_record.clone());
     let payload =
-        serde_json::to_vec(&UiRole::User).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        serde_json::to_vec(&session_record.role).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
@@ -712,22 +886,291 @@ async fn logout(
         state.sessions.write().await.remove(token);
     }
     Response::builder()
-        .status(StatusCode::OK)
+        .status(StatusCode::NO_CONTENT)
         .header(SET_COOKIE, state.clear_cookie())
         .body(Body::empty())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn update_auth_mode(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    Json(body): Json<AuthModeUpdateRequest>,
+) -> Result<Json<SettingsResponse>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let methods = if let Some(methods) = body.methods {
+        methods
+    } else if let Some(mode) = body.mode {
+        qit_domain::RepoAuthState::methods_for_mode(&mode)
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    state
+        .workspace_service
+        .update_auth_methods(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            methods,
+            &auth_actor_from_session(&session),
+        )
+        .map_err(|error| domain_status(&error))?;
+    let (_, web_ui) = state.latest_workspace()?;
+    Ok(Json(settings_response(&state, &web_ui, Some(&session))))
+}
+
+async fn create_access_request(
+    State(state): State<Arc<WebUiServer>>,
+    Json(body): Json<AccessRequestCreateRequest>,
+) -> Result<Json<qit_domain::SubmittedAccessRequest>, StatusCode> {
+    let (_, request) = state
+        .workspace_service
+        .submit_access_request(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &body.name,
+            &body.email,
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(request))
+}
+
+async fn read_access_request_status(
+    State(state): State<Arc<WebUiServer>>,
+    Json(body): Json<AccessRequestStatusRequest>,
+) -> Result<Json<qit_domain::AccessRequestProgress>, StatusCode> {
+    let (_, progress) = state
+        .workspace_service
+        .read_access_request_progress(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &body.token,
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(progress))
+}
+
+async fn approve_access_request(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<qit_domain::IssuedOnboarding>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, _user, onboarding) = state
+        .workspace_service
+        .approve_access_request(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            RepoUserRole::User,
+            &auth_actor_from_session(&session),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(onboarding))
+}
+
+async fn reject_access_request(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<AccessRequestView>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, request) = state
+        .workspace_service
+        .reject_access_request(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            &auth_actor_from_session(&session),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(request))
+}
+
+async fn complete_onboarding(
+    State(state): State<Arc<WebUiServer>>,
+    Json(body): Json<OnboardingCompleteRequest>,
+) -> Result<Response<Body>, StatusCode> {
+    let (_, principal) = state
+        .workspace_service
+        .complete_onboarding(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &body.token,
+            &body.username,
+            &body.password,
+        )
+        .map_err(|error| domain_status(&error))?;
+    let token = Alphanumeric.sample_string(&mut rand::thread_rng(), 32);
+    state.sessions.write().await.insert(
+        token.clone(),
+        SessionRecord {
+            user_id: Some(principal.user_id.clone()),
+            role: principal.ui_role(),
+            expires_at_ms: WebUiServer::now_ms().saturating_add(SESSION_TTL_MS),
+        },
+    );
+    let payload =
+        serde_json::to_vec(&principal.ui_role()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(SET_COOKIE, state.session_cookie(&token))
+        .body(Body::from(payload))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn promote_user(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RepoUserView>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, user) = state
+        .workspace_service
+        .promote_user(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            &auth_actor_from_session(&session),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(user))
+}
+
+async fn demote_user(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RepoUserView>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, user) = state
+        .workspace_service
+        .demote_user(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            &auth_actor_from_session(&session),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(user))
+}
+
+async fn revoke_user(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RepoUserView>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, user) = state
+        .workspace_service
+        .revoke_user(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            &auth_actor_from_session(&session),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(user))
+}
+
+async fn reset_user_setup(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<qit_domain::IssuedOnboarding>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, _user, onboarding) = state
+        .workspace_service
+        .reset_user_setup(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            &auth_actor_from_session(&session),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(onboarding))
+}
+
+async fn create_pat(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    Json(body): Json<PatCreateRequest>,
+) -> Result<Json<qit_domain::IssuedPat>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    let Some(principal) = session.principal.clone() else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    let (_, _pat, issued) = state
+        .workspace_service
+        .create_pat(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &principal.user_id,
+            &body.label,
+            &auth_actor_from_session(&session),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issued))
+}
+
+async fn revoke_pat(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<PatRecordView>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    let Some(principal) = session.principal.clone() else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    let (_, web_ui) = state.latest_workspace()?;
+    let allowed = web_ui
+        .auth
+        .personal_access_tokens
+        .iter()
+        .any(|token| token.id == id && token.user_id == principal.user_id);
+    if !allowed {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, pat) = state
+        .workspace_service
+        .revoke_pat(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            &auth_actor_from_session(&session),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(pat))
 }
 
 async fn get_settings(
     State(state): State<Arc<WebUiServer>>,
     headers: HeaderMap,
 ) -> Result<Json<SettingsResponse>, StatusCode> {
-    state.require_actor(&headers).await?;
-    let (_, repository) = state
-        .workspace_service
-        .read_repository_settings(state.workspace.worktree.clone(), &state.workspace.exported_branch)
-        .map_err(|error| domain_status(&error))?;
-    Ok(Json(settings_response(&state, repository)))
+    let session = state.require_session(&headers).await?;
+    let (_, web_ui) = state.latest_workspace()?;
+    Ok(Json(settings_response(&state, &web_ui, Some(&session))))
 }
 
 async fn update_settings(
@@ -735,8 +1178,11 @@ async fn update_settings(
     headers: HeaderMap,
     Json(body): Json<SettingsUpdateRequest>,
 ) -> Result<Json<SettingsResponse>, StatusCode> {
-    state.require_owner(&headers).await?;
-    let (_, repository) = state
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    state
         .workspace_service
         .update_repository_settings(
             state.workspace.worktree.clone(),
@@ -747,7 +1193,8 @@ async fn update_settings(
             },
         )
         .map_err(|error| domain_status(&error))?;
-    Ok(Json(settings_response(&state, repository)))
+    let (_, web_ui) = state.latest_workspace()?;
+    Ok(Json(settings_response(&state, &web_ui, Some(&session))))
 }
 
 async fn upsert_branch_rule(
@@ -755,8 +1202,11 @@ async fn upsert_branch_rule(
     headers: HeaderMap,
     Json(body): Json<BranchRuleRequest>,
 ) -> Result<Json<SettingsResponse>, StatusCode> {
-    state.require_owner(&headers).await?;
-    let (_, repository) = state
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    state
         .workspace_service
         .upsert_branch_rule(
             state.workspace.worktree.clone(),
@@ -771,7 +1221,8 @@ async fn upsert_branch_rule(
             },
         )
         .map_err(|error| domain_status(&error))?;
-    Ok(Json(settings_response(&state, repository)))
+    let (_, web_ui) = state.latest_workspace()?;
+    Ok(Json(settings_response(&state, &web_ui, Some(&session))))
 }
 
 async fn delete_branch_rule(
@@ -779,8 +1230,11 @@ async fn delete_branch_rule(
     headers: HeaderMap,
     AxumPath(pattern): AxumPath<String>,
 ) -> Result<Json<SettingsResponse>, StatusCode> {
-    state.require_owner(&headers).await?;
-    let (_, repository) = state
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    state
         .workspace_service
         .delete_branch_rule(
             state.workspace.worktree.clone(),
@@ -788,7 +1242,8 @@ async fn delete_branch_rule(
             &pattern,
         )
         .map_err(|error| domain_status(&error))?;
-    Ok(Json(settings_response(&state, repository)))
+    let (_, web_ui) = state.latest_workspace()?;
+    Ok(Json(settings_response(&state, &web_ui, Some(&session))))
 }
 
 async fn list_branches(
@@ -1609,8 +2064,23 @@ mod tests {
         web.merge(git)
     }
 
+    fn basic_auth_state() -> qit_domain::RepoAuthState {
+        qit_domain::RepoAuthState {
+            mode: qit_domain::AuthMode::SharedSession,
+            methods: vec![qit_domain::AuthMethod::BasicAuth],
+            ..Default::default()
+        }
+    }
+
     fn app(implicit_owner_mode: bool, secure_cookies: bool) -> Router {
-        app_with_web_ui(implicit_owner_mode, secure_cookies, WorkspaceWebUiState::default())
+        app_with_web_ui(
+            implicit_owner_mode,
+            secure_cookies,
+            WorkspaceWebUiState {
+                auth: basic_auth_state(),
+                ..Default::default()
+            },
+        )
     }
 
     struct TestIssuer;
@@ -1831,7 +2301,7 @@ mod tests {
         let mut logout = logout;
         logout.extensions_mut().insert(ConnectInfo(remote));
         let logout_response = app.clone().oneshot(logout).await.unwrap();
-        assert_eq!(logout_response.status(), StatusCode::OK);
+        assert_eq!(logout_response.status(), StatusCode::NO_CONTENT);
 
         let list_after_logout = Request::builder()
             .uri("/repo/api/pull-requests")
@@ -1845,6 +2315,169 @@ mod tests {
             .insert(ConnectInfo(remote));
         let after_logout_response = app.oneshot(list_after_logout).await.unwrap();
         assert_eq!(after_logout_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn request_based_mode_supports_onboarding_and_pat_git_auth() {
+        let app = app_with_web_ui(
+            true,
+            false,
+            WorkspaceWebUiState {
+                pull_requests: Vec::new(),
+                repository: RepositorySettings::default(),
+                auth: qit_domain::RepoAuthState {
+                    mode: qit_domain::AuthMode::RequestBased,
+                    ..Default::default()
+                },
+            },
+        );
+        let remote = SocketAddr::from(([10, 0, 0, 2], 3000));
+        let localhost = SocketAddr::from(([127, 0, 0, 1], 3000));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/repo/api/access-requests")
+            .header(HOST, "demo.ngrok.app")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"Alice","email":"alice@example.com"}"#))
+            .unwrap();
+        let mut request = request;
+        request.extensions_mut().insert(ConnectInfo(remote));
+        let request_response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(request_response.status(), StatusCode::OK);
+        let request: qit_domain::SubmittedAccessRequest = serde_json::from_slice(
+            &request_response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert!(request.secret.starts_with("qit_request."));
+
+        let status = Request::builder()
+            .method("POST")
+            .uri("/repo/api/access-requests/status")
+            .header(HOST, "demo.ngrok.app")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"token":"{}"}}"#, request.secret)))
+            .unwrap();
+        let mut status = status;
+        status.extensions_mut().insert(ConnectInfo(remote));
+        let status_response = app.clone().oneshot(status).await.unwrap();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status: qit_domain::AccessRequestProgress = serde_json::from_slice(
+            &status_response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(status.status, qit_domain::AccessRequestStatus::Pending);
+
+        let approve = Request::builder()
+            .method("POST")
+            .uri(format!("/repo/api/access-requests/{}/approve", request.request.id))
+            .header(HOST, "127.0.0.1:8080")
+            .body(Body::empty())
+            .unwrap();
+        let mut approve = approve;
+        approve.extensions_mut().insert(ConnectInfo(localhost));
+        let approve_response = app.clone().oneshot(approve).await.unwrap();
+        assert_eq!(approve_response.status(), StatusCode::OK);
+        let onboarding: qit_domain::IssuedOnboarding = serde_json::from_slice(
+            &approve_response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert!(onboarding.secret.starts_with("qit_setup."));
+
+        let complete = Request::builder()
+            .method("POST")
+            .uri("/repo/api/onboarding/complete")
+            .header(HOST, "demo.ngrok.app")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"token":"{}","username":"alice","password":"very-secret-pass"}}"#,
+                request.secret
+            )))
+            .unwrap();
+        let mut complete = complete;
+        complete.extensions_mut().insert(ConnectInfo(remote));
+        let complete_response = app.clone().oneshot(complete).await.unwrap();
+        assert_eq!(complete_response.status(), StatusCode::OK);
+        let cookie = complete_response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let settings = Request::builder()
+            .uri("/repo/api/settings")
+            .header(HOST, "demo.ngrok.app")
+            .header("cookie", cookie.clone())
+            .body(Body::empty())
+            .unwrap();
+        let mut settings = settings;
+        settings.extensions_mut().insert(ConnectInfo(remote));
+        let settings_response = app.clone().oneshot(settings).await.unwrap();
+        assert_eq!(settings_response.status(), StatusCode::OK);
+        let settings: serde_json::Value = serde_json::from_slice(
+            &settings_response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(settings["current_user"]["username"], "alice");
+
+        let create_pat = Request::builder()
+            .method("POST")
+            .uri("/repo/api/profile/pats")
+            .header(HOST, "demo.ngrok.app")
+            .header("content-type", "application/json")
+            .header("cookie", cookie)
+            .body(Body::from(r#"{"label":"laptop"}"#))
+            .unwrap();
+        let mut create_pat = create_pat;
+        create_pat.extensions_mut().insert(ConnectInfo(remote));
+        let create_pat_response = app.clone().oneshot(create_pat).await.unwrap();
+        assert_eq!(create_pat_response.status(), StatusCode::OK);
+        let pat: qit_domain::IssuedPat = serde_json::from_slice(
+            &create_pat_response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert!(pat.secret.starts_with("qit_pat."));
+
+        let legacy = Request::builder()
+            .uri("/repo/info/refs?service=git-upload-pack")
+            .header(HOST, "demo.ngrok.app")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!(
+                    "Basic {}",
+                    BASE64_STANDARD.encode("tester:secret")
+                ))
+                .unwrap(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let mut legacy = legacy;
+        legacy.extensions_mut().insert(ConnectInfo(remote));
+        let legacy_response = app.clone().oneshot(legacy).await.unwrap();
+        assert_eq!(legacy_response.status(), StatusCode::UNAUTHORIZED);
+
+        let pat_request = Request::builder()
+            .uri("/repo/info/refs?service=git-upload-pack")
+            .header(HOST, "demo.ngrok.app")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!(
+                    "Basic {}",
+                    BASE64_STANDARD.encode(format!("alice:{}", pat.secret))
+                ))
+                .unwrap(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let mut pat_request = pat_request;
+        pat_request.extensions_mut().insert(ConnectInfo(remote));
+        let pat_response = app.oneshot(pat_request).await.unwrap();
+        assert_eq!(pat_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1956,6 +2589,7 @@ mod tests {
                     activities: Vec::new(),
                 }],
                 repository: RepositorySettings::default(),
+                auth: basic_auth_state(),
             },
         );
         let remote = SocketAddr::from(([10, 0, 0, 2], 3000));
@@ -2013,6 +2647,7 @@ mod tests {
             WorkspaceWebUiState {
                 pull_requests: Vec::new(),
                 repository: RepositorySettings::default(),
+                auth: basic_auth_state(),
             },
         );
         let localhost = SocketAddr::from(([127, 0, 0, 1], 3000));

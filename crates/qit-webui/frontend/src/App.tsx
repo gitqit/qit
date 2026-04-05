@@ -16,6 +16,12 @@ import { DashboardPage, LoginPage } from './components/pages/DashboardPage'
 import { PreviewPage } from './components/pages/PreviewPage'
 
 const HISTORY_PAGE_SIZE = 40
+const ACCESS_REQUEST_STORAGE_KEY = 'qit.pendingAccessRequest'
+
+type PendingAccessReceipt = {
+  id: string
+  secret: string
+}
 
 function isReadmeEntry(entry: TreeEntry) {
   return entry.kind === 'blob' && /^readme(?:\.[a-z0-9]+)?$/i.test(entry.name)
@@ -24,6 +30,29 @@ function isReadmeEntry(entry: TreeEntry) {
 function parentPath(path: string) {
   const slash = path.lastIndexOf('/')
   return slash === -1 ? '' : path.slice(0, slash)
+}
+
+function readPendingAccessReceipt(): PendingAccessReceipt | null {
+  try {
+    const raw = window.localStorage.getItem(ACCESS_REQUEST_STORAGE_KEY)
+    if (!raw) {
+      return null
+    }
+    const parsed = JSON.parse(raw) as Partial<PendingAccessReceipt>
+    return typeof parsed.id === 'string' && typeof parsed.secret === 'string'
+      ? { id: parsed.id, secret: parsed.secret }
+      : null
+  } catch {
+    return null
+  }
+}
+
+function writePendingAccessReceipt(receipt: PendingAccessReceipt | null) {
+  if (!receipt) {
+    window.localStorage.removeItem(ACCESS_REQUEST_STORAGE_KEY)
+    return
+  }
+  window.localStorage.setItem(ACCESS_REQUEST_STORAGE_KEY, JSON.stringify(receipt))
 }
 
 async function loadReadme(reference: string, entries: TreeEntry[]) {
@@ -67,6 +96,10 @@ function App() {
   const [loadingMoreCommits, setLoadingMoreCommits] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [authError, setAuthError] = useState<string | null>(null)
+  const [requestMessage, setRequestMessage] = useState<string | null>(null)
+  const [setupMessage, setSetupMessage] = useState<string | null>(null)
+  const [requestReceipt, setRequestReceipt] = useState<PendingAccessReceipt | null>(() => readPendingAccessReceipt())
+  const [approvedSetupToken, setApprovedSetupToken] = useState<string | null>(null)
   const [toastMessage, setToastMessage] = useState<string | null>(null)
   const [highlightedPullRequestId, setHighlightedPullRequestId] = useState<string | null>(null)
 
@@ -175,6 +208,72 @@ function App() {
 
     return () => window.clearTimeout(timeoutId)
   }, [toastMessage])
+
+  useEffect(() => {
+    if (actor) {
+      return
+    }
+    if (!bootstrap || !requestReceipt) {
+      setApprovedSetupToken(null)
+      return
+    }
+    if (!bootstrap.auth_methods.includes('request_access') || !bootstrap.auth_methods.includes('setup_token')) {
+      return
+    }
+
+    let cancelled = false
+    let timeoutId: number | null = null
+
+    const poll = async () => {
+      try {
+        const progress = await api.accessRequestStatus(requestReceipt.secret)
+        if (cancelled) {
+          return
+        }
+
+        if (progress.status === 'approved') {
+          setAuthError(null)
+          setRequestMessage(null)
+          setSetupMessage('Approval received. Choose a username and password to finish setup.')
+          setApprovedSetupToken(requestReceipt.secret)
+          return
+        }
+
+        if (progress.status === 'rejected' || progress.status === 'revoked') {
+          writePendingAccessReceipt(null)
+          setRequestReceipt(null)
+          setApprovedSetupToken(null)
+          setRequestMessage(null)
+          setSetupMessage(null)
+          setAuthError('Your access request was not approved.')
+          return
+        }
+
+        setRequestMessage('Access request sent. Waiting for the owner to approve…')
+        setApprovedSetupToken(null)
+        timeoutId = window.setTimeout(() => {
+          void poll()
+        }, 2500)
+      } catch {
+        if (cancelled) {
+          return
+        }
+        timeoutId = window.setTimeout(() => {
+          void poll()
+        }, 4000)
+      }
+    }
+
+    setRequestMessage('Access request sent. Waiting for the owner to approve…')
+    void poll()
+
+    return () => {
+      cancelled = true
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId)
+      }
+    }
+  }, [actor, bootstrap, requestReceipt])
 
   useEffect(() => {
     if (!highlightedPullRequestId) {
@@ -577,7 +676,11 @@ function App() {
   if (!actor) {
     return (
       <LoginPage
+        approvedSetupToken={approvedSetupToken}
+        bootstrap={bootstrap}
         error={authError}
+        requestMessage={requestMessage}
+        setupMessage={setupMessage}
         onLogin={async (username, password) => {
           setAuthError(null)
           try {
@@ -585,6 +688,34 @@ function App() {
             await refresh()
           } catch (loginError) {
             setAuthError(loginError instanceof Error ? loginError.message : 'Unable to start the session.')
+          }
+        }}
+        onRequestAccess={async (name, email) => {
+          setAuthError(null)
+          setSetupMessage(null)
+          setApprovedSetupToken(null)
+          try {
+            const submitted = await api.requestAccess(name, email)
+            const receipt = { id: submitted.request.id, secret: submitted.secret }
+            writePendingAccessReceipt(receipt)
+            setRequestReceipt(receipt)
+            setRequestMessage('Access request sent. Waiting for the owner to approve…')
+          } catch (requestError) {
+            setAuthError(requestError instanceof Error ? requestError.message : 'Unable to send the access request.')
+          }
+        }}
+        onCompleteOnboarding={async (token, username, password) => {
+          setAuthError(null)
+          setSetupMessage(null)
+          try {
+            await api.completeOnboarding(token, username, password)
+            writePendingAccessReceipt(null)
+            setRequestReceipt(null)
+            setApprovedSetupToken(null)
+            setSetupMessage('Setup complete. Signing you in…')
+            await refresh()
+          } catch (setupError) {
+            setAuthError(setupError instanceof Error ? setupError.message : 'Unable to complete setup.')
           }
         }}
       />
@@ -599,7 +730,7 @@ function App() {
         </div>
       ) : null}
       {toastMessage ? (
-        <div className="fixed right-4 top-4 z-40 max-w-sm rounded-token border border-success/40 bg-success/12 px-4 py-3 text-sm text-success shadow-panel" role="status">
+        <div className="fixed right-4 top-4 z-40 max-w-sm rounded-token border border-success bg-success px-4 py-3 text-sm text-canvas shadow-panel" role="status">
           {toastMessage}
         </div>
       ) : null}
@@ -636,6 +767,60 @@ function App() {
         onDeleteBranchRule={async (pattern) => {
           await api.deleteBranchRule(pattern)
           setToastMessage(`Branch rule "${pattern}" deleted.`)
+          await refresh()
+        }}
+        onUpdateAuthMethods={async (methods) => {
+          await api.updateAuthMethods(methods)
+          setToastMessage(`Auth methods updated to "${methods.join(', ').replaceAll('_', '-') || 'none'}".`)
+          await refresh()
+        }}
+        onApproveAccessRequest={async (id) => {
+          const issued = await api.approveAccessRequest(id)
+          setToastMessage(`Approved ${issued.email}. Share the one-time onboarding token now.`)
+          await refresh()
+          return issued
+        }}
+        onRejectAccessRequest={async (id) => {
+          await api.rejectAccessRequest(id)
+          setToastMessage('Access request rejected.')
+          await refresh()
+        }}
+        onPromoteUser={async (id) => {
+          await api.promoteUser(id)
+          setToastMessage('User promoted to owner.')
+          await refresh()
+        }}
+        onDemoteUser={async (id) => {
+          await api.demoteUser(id)
+          setToastMessage('Owner demoted to user.')
+          await refresh()
+        }}
+        onRevokeUser={async (id) => {
+          await api.revokeUser(id)
+          setToastMessage('User revoked.')
+          await refresh()
+        }}
+        onResetUserSetup={async (id) => {
+          const issued = await api.resetUserSetup(id)
+          setToastMessage(`Reset setup for ${issued.email}. Share the new onboarding token now.`)
+          await refresh()
+          return issued
+        }}
+        onCreatePat={async (label) => {
+          const issued = await api.createPat(label)
+          setToastMessage(`Created PAT "${issued.label}".`)
+          await refresh()
+          return issued
+        }}
+        onLogout={async () => {
+          await api.logout()
+          setAuthError(null)
+          setError(null)
+          await refresh()
+        }}
+        onRevokePat={async (id) => {
+          await api.revokePat(id)
+          setToastMessage('PAT revoked.')
           await refresh()
         }}
         onCreatePullRequest={async (payload) => {

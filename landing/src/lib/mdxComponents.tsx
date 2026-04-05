@@ -1,5 +1,6 @@
 import type { MDXComponents } from 'mdx/types'
 import { DocsCodeBlock } from '../components/atoms/DocsCodeBlock'
+import { DocsTable } from '../components/atoms/DocsTable'
 import { isExternalHref } from './hrefs'
 import { SiteLink } from './siteLinks'
 
@@ -18,4 +19,5 @@ export const mdxComponents: MDXComponents = {
   },
   pre: (props) => <DocsCodeBlock {...props} />,
   code: (props) => <code className="docs-code" {...props} />,
+  table: (props) => <DocsTable {...props} />,
 }

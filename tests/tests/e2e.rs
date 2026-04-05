@@ -82,7 +82,7 @@ fn spawn_qit_serve(
     worktree: &Path,
     port: u16,
 ) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
-    spawn_qit_serve_with_options(worktree, port, false, None, true)
+    spawn_qit_serve_with_options(worktree, port, false, None, true, Some("shared-session"))
 }
 
 fn spawn_qit_serve_with_env(
@@ -91,7 +91,23 @@ fn spawn_qit_serve_with_env(
     auto_apply: bool,
     data_dir: Option<&Path>,
 ) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
-    spawn_qit_serve_with_options(worktree, port, auto_apply, data_dir, true)
+    spawn_qit_serve_with_options(
+        worktree,
+        port,
+        auto_apply,
+        data_dir,
+        true,
+        Some("shared-session"),
+    )
+}
+
+fn spawn_qit_serve_with_auth_mode(
+    worktree: &Path,
+    port: u16,
+    data_dir: Option<&Path>,
+    auth_mode: &str,
+) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
+    spawn_qit_serve_with_options(worktree, port, false, data_dir, true, Some(auth_mode))
 }
 
 fn spawn_qit_serve_with_options(
@@ -100,6 +116,7 @@ fn spawn_qit_serve_with_options(
     auto_apply: bool,
     data_dir: Option<&Path>,
     show_pass: bool,
+    auth_mode: Option<&str>,
 ) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
     let bin = qit_binary_path()?;
     let mut command = Command::new(bin);
@@ -110,6 +127,9 @@ fn spawn_qit_serve_with_options(
         .arg(port.to_string());
     if !show_pass {
         command.arg("--hidden-pass");
+    }
+    if let Some(auth_mode) = auth_mode {
+        command.arg("--auth-mode").arg(auth_mode);
     }
     if auto_apply {
         command.arg("--auto-apply");
@@ -208,6 +228,23 @@ fn wait_for_clone_url(rx: &std::sync::mpsc::Receiver<String>) -> Result<String> 
                     .split_once(':')
                     .map(|(_, value)| value.trim().to_string());
             }
+            Ok(line) if line.contains("Ctrl+C to stop.") => {
+                if let Some(clone_url) = clone_url.clone() {
+                    if let (Some(username), Some(password)) = (username.clone(), password.clone()) {
+                        let url = Url::parse(&clone_url).context("parse qit clone URL")?;
+                        if !url.username().is_empty() || url.password().is_some() {
+                            return Ok(url.to_string());
+                        }
+                        let mut url = url;
+                        url.set_username(&username)
+                            .map_err(|_| anyhow!("failed to encode username in URL"))?;
+                        url.set_password(Some(&password))
+                            .map_err(|_| anyhow!("failed to encode password in URL"))?;
+                        return Ok(url.to_string());
+                    }
+                    return Ok(clone_url);
+                }
+            }
             Ok(_) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -265,6 +302,14 @@ async fn start_server(
         .map_err(|err| anyhow!(err.to_string()))?;
     let credentials = prepared.credentials.clone();
     let workspace = prepared.workspace.clone();
+    service
+        .update_auth_mode(
+            workspace.worktree.clone(),
+            &workspace.exported_branch,
+            qit_domain::AuthMode::SharedSession,
+            &qit_domain::AuthActor::Operator,
+        )
+        .map_err(|err| anyhow!(err.to_string()))?;
     let mount_path = repo_mount_path("host");
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -437,7 +482,8 @@ fn qit_cli_hides_password_and_clone_credentials_by_default() -> Result<()> {
     std::fs::write(worktree.join("README.md"), "initial\n")?;
 
     let port = free_port()?;
-    let (mut child, rx) = spawn_qit_serve_with_options(&worktree, port, false, None, false)?;
+    let (mut child, rx) =
+        spawn_qit_serve_with_options(&worktree, port, false, None, false, Some("shared-session"))?;
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut saw_hidden_password = false;
     let mut saw_credentials_file = false;
@@ -493,7 +539,8 @@ fn qit_cli_shows_password_with_show_pass() -> Result<()> {
     std::fs::write(worktree.join("README.md"), "initial\n")?;
 
     let port = free_port()?;
-    let (mut child, rx) = spawn_qit_serve_with_options(&worktree, port, false, None, true)?;
+    let (mut child, rx) =
+        spawn_qit_serve_with_options(&worktree, port, false, None, true, Some("shared-session"))?;
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut saw_password = false;
     let mut saw_credentialed_clone = false;
@@ -988,6 +1035,130 @@ fn settings_commands_manage_metadata_and_branch_rules() -> Result<()> {
     )?;
     assert!(deleted.contains("deleted branch rule `main`"));
     assert!(deleted.contains("branch rules:"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_based_auth_cli_and_git_flow_works_end_to_end() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("qit-data");
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "initial\n")?;
+
+    let port = free_port()?;
+    let (mut child, rx) =
+        spawn_qit_serve_with_auth_mode(&worktree, port, Some(&data_dir), "request-based")?;
+    let legacy_clone_url = wait_for_clone_url(&rx)?;
+    assert!(!legacy_clone_url.contains('@'));
+
+    let client = reqwest::Client::new();
+    let request_url = format!("http://127.0.0.1:{port}/host/api/access-requests");
+    let request_response = client
+        .post(&request_url)
+        .header("content-type", "application/json")
+        .body(r#"{"name":"Alice","email":"alice@example.com"}"#)
+        .send()
+        .await?;
+    assert!(request_response.status().is_success());
+
+    let listed = run_qit_with_env(
+        &["auth", "requests", worktree.to_str().unwrap()],
+        Some(&data_dir),
+    )?;
+    let selector = listed
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == "none" || trimmed.starts_with("access requests for ") {
+                return None;
+            }
+            trimmed.split_whitespace().next().map(ToString::to_string)
+        })
+        .context("parse request selector")?;
+
+    let approved = run_qit_with_env(
+        &[
+            "auth",
+            "requests",
+            worktree.to_str().unwrap(),
+            "--approve",
+            &selector,
+        ],
+        Some(&data_dir),
+    )?;
+    let onboarding = approved
+        .lines()
+        .find_map(|line| line.contains("qit_setup.").then_some(line.trim().to_string()))
+        .context("parse onboarding token")?;
+
+    let onboarding_response = client
+        .post(format!("http://127.0.0.1:{port}/host/api/onboarding/complete"))
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"token":"{}","username":"alice","password":"very-secret-pass"}}"#,
+            onboarding
+        ))
+        .send()
+        .await?;
+    assert!(onboarding_response.status().is_success());
+
+    let legacy = client.get(format!("http://127.0.0.1:{port}/host/info/refs?service=git-upload-pack"));
+    let legacy_url = Url::parse(&legacy_clone_url)?;
+    let legacy_response = legacy
+        .basic_auth(legacy_url.username(), legacy_url.password())
+        .send()
+        .await?;
+    assert_eq!(legacy_response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let request_based_response = client
+        .get(format!(
+            "http://127.0.0.1:{port}/host/info/refs?service=git-upload-pack"
+        ))
+        .basic_auth("alice", Some("very-secret-pass"))
+        .send()
+        .await?;
+    assert!(request_based_response.status().is_success());
+
+    let promoted = run_qit_with_env(
+        &[
+            "auth",
+            "users",
+            worktree.to_str().unwrap(),
+            "--promote",
+            "alice",
+        ],
+        Some(&data_dir),
+    );
+    assert!(promoted.is_err());
+
+    let users = run_qit_with_env(
+        &["auth", "users", worktree.to_str().unwrap()],
+        Some(&data_dir),
+    )?;
+    let user_selector = users
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .contains("alice@example.com")
+                .then(|| trimmed.split_whitespace().next().unwrap_or_default().to_string())
+        })
+        .context("parse user selector")?;
+    let promoted = run_qit_with_env(
+        &[
+            "auth",
+            "users",
+            worktree.to_str().unwrap(),
+            "--promote",
+            &user_selector,
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(promoted.contains("promoted"));
 
     let _ = child.kill();
     let _ = child.wait();

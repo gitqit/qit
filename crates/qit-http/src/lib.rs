@@ -7,7 +7,7 @@ use axum::routing::any;
 use axum::{extract::DefaultBodyLimit, Router};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use qit_domain::{RegistryStore, SessionCredentials, WorkspaceService, WorkspaceSpec};
+use qit_domain::{AuthMethod, DomainError, RegistryStore, SessionCredentials, WorkspaceService, WorkspaceSpec};
 use qit_http_backend::{
     GitHttpBackend, GitHttpBackendError, GitHttpBackendRequest, GitHttpBackendResponse,
 };
@@ -252,10 +252,6 @@ impl GitHttpServer {
     }
 
     async fn handle(self: Arc<Self>, req: Request) -> Result<Response<Body>, StatusCode> {
-        if !authorize(req.headers(), &self.credentials) {
-            return Ok(unauthorized_response());
-        }
-
         let method = req.method().clone();
         let uri = req.uri().clone();
         let workspace = self.latest_workspace().map_err(|error| {
@@ -268,6 +264,21 @@ impl GitHttpServer {
             );
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+        if !self
+            .authorize_request(&workspace, req.headers())
+            .map_err(|error| {
+                warn!(
+                    method = %method,
+                    path = %uri.path(),
+                    worktree = %workspace.worktree.display(),
+                    %error,
+                    "git authorization failed while loading auth state"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+        {
+            return Ok(unauthorized_response());
+        }
         let path_info = match strip_repo_mount(uri.path(), &self.repo_mount_path) {
             Some(path_info) => path_info,
             None => return Err(StatusCode::NOT_FOUND),
@@ -353,28 +364,67 @@ impl GitHttpServer {
 
         Ok(build_response(response))
     }
+
+    fn authorize_request(
+        &self,
+        workspace: &WorkspaceSpec,
+        headers: &HeaderMap,
+    ) -> Result<bool, DomainError> {
+        let (_, auth) = self
+            .workspace_service
+            .read_auth_state(workspace.worktree.clone(), &workspace.exported_branch)?;
+        let Some((username, secret)) = basic_credentials(headers) else {
+            return Ok(false);
+        };
+        if auth.has_method(&AuthMethod::BasicAuth)
+            && secure_eq(&username, &self.credentials.username)
+            && secure_eq(&secret, &self.credentials.password)
+        {
+            return Ok(true);
+        }
+        self.workspace_service
+            .authenticate_git_user(
+                workspace.worktree.clone(),
+                &workspace.exported_branch,
+                &username,
+                &secret,
+            )
+            .map(|_| true)
+            .or_else(|error| {
+                if matches!(error, DomainError::AuthenticationFailed) {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            })
+    }
 }
 
 pub fn authorize(headers: &HeaderMap, credentials: &SessionCredentials) -> bool {
-    let Some(header) = headers.get(axum::http::header::AUTHORIZATION) else {
+    let Some((username, password)) = basic_credentials(headers) else {
         return false;
+    };
+    secure_eq(&username, &credentials.username) && secure_eq(&password, &credentials.password)
+}
+
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let Some(header) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return None;
     };
     let Ok(header) = header.to_str() else {
-        return false;
+        return None;
     };
     let Some(encoded) = header.strip_prefix("Basic ") else {
-        return false;
+        return None;
     };
     let Ok(decoded) = BASE64.decode(encoded) else {
-        return false;
+        return None;
     };
     let Ok(decoded) = String::from_utf8(decoded) else {
-        return false;
+        return None;
     };
-    let Some((username, password)) = decoded.split_once(':') else {
-        return false;
-    };
-    secure_eq(username, &credentials.username) && secure_eq(password, &credentials.password)
+    let (username, password) = decoded.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
 }
 
 fn secure_eq(left: &str, right: &str) -> bool {

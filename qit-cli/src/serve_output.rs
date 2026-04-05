@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use qit_domain::SessionCredentials;
+use qit_domain::{AuthMethod, SessionCredentials};
 use qit_transports::PublicTransport;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -83,6 +83,7 @@ pub fn write_credentials_file(
 pub fn print_serve_summary(
     worktree: &Path,
     exported_branch: &str,
+    auth_methods: Vec<AuthMethod>,
     label: &str,
     public_url: &Url,
     local_browser_url: &Url,
@@ -97,6 +98,12 @@ pub fn print_serve_summary(
     println!("Serving");
     println!("  path: {}", worktree.display());
     println!("  branch: {exported_branch}");
+    let auth_labels = auth_methods
+        .iter()
+        .map(AuthMethod::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  auth: {}", auth_labels.replace('_', "-"));
     println!("  transport: {}", label.to_ascii_lowercase());
     if auto_apply {
         println!("  auto-apply: on");
@@ -112,14 +119,20 @@ pub fn print_serve_summary(
     println!("  repo: {}/", public_url.as_str().trim_end_matches('/'));
     println!("  clone: {clone_cmd}");
     println!();
-    println!("Session");
-    println!("  username: {}", credentials.username);
-    if reveal_password {
-        println!("  password: {}", credentials.password);
+    if auth_methods.contains(&AuthMethod::BasicAuth) {
+        println!("Session");
+        println!("  username: {}", credentials.username);
+        if reveal_password {
+            println!("  password: {}", credentials.password);
+        } else {
+            println!("  password: hidden (--hidden-pass enabled)");
+        }
+        if let Some(credentials_path) = credentials_path {
+            println!("  file: {}", credentials_path.display());
+        }
     } else {
-        println!("  password: hidden (--hidden-pass enabled)");
-    }
-    if let Some(credentials_path) = credentials_path {
-        println!("  file: {}", credentials_path.display());
+        println!("Accounts");
+        println!("  shared basic auth is disabled");
+        println!("  remote users authenticate with per-user credentials");
     }
 }

@@ -10,6 +10,10 @@ import {
   GitBranch,
   GitBranchPlus,
   LogIn,
+  LogOut,
+  Settings,
+  ShieldCheck,
+  UserPlus,
 } from 'lucide-react'
 import { BrandLogo } from '../atoms/BrandLogo'
 import { Badge, Button, Panel } from '../atoms/Controls'
@@ -21,11 +25,13 @@ import { CodePanel } from '../organisms/panels/CodePanel'
 import { CommitsPanel } from '../organisms/panels/CommitsPanel'
 import { PullRequestsPanel } from '../organisms/panels/PullRequestsPanel'
 import { SettingsPanel } from '../organisms/panels/SettingsPanel'
-import { AppShell } from '../templates/AppShell'
+import { UserSettingsPanel } from '../organisms/panels/UserSettingsPanel'
+import { AppShell, type HeaderAlert } from '../templates/AppShell'
 import { shellTabIcons } from '../templates/shellTabIcons'
 import { api } from '../../lib/api'
 import { getQueryParam, mergeQueryParams } from '../../lib/queryState'
 import type {
+  AuthMethod,
   BlobContent,
   BootstrapResponse,
   BranchInfo,
@@ -36,16 +42,26 @@ import type {
   SettingsResponse,
   TreeEntry,
   UiRole,
+  IssuedOnboarding,
+  IssuedPat,
 } from '../../lib/types'
 
 function copyToClipboard(value: string) {
   return navigator.clipboard.writeText(value)
 }
 
+type RequestAuthView = 'signin' | 'request' | 'setup'
+
+function hasAuthMethod(methods: AuthMethod[], method: AuthMethod) {
+  return methods.includes(method)
+}
+
 function CloneMenu({ bootstrap }: { bootstrap: BootstrapResponse }) {
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [passwordVisible, setPasswordVisible] = useState(false)
   const hasVisibleCredentials = bootstrap.git_credentials_visible && !!bootstrap.git_username && !!bootstrap.git_password
+  const supportsBasicAuth = hasAuthMethod(bootstrap.auth_methods, 'basic_auth')
+  const supportsRepoAccounts = hasAuthMethod(bootstrap.auth_methods, 'setup_token')
 
   const cloneUrl = bootstrap.public_repo_url ?? `${window.location.origin}${api.baseUrl}`
   const authCloneUrl =
@@ -155,7 +171,11 @@ function CloneMenu({ bootstrap }: { bootstrap: BootstrapResponse }) {
           <p className="mt-2 text-xs text-fg-subtle">Served branch: {bootstrap.exported_branch}</p>
           {!hasVisibleCredentials ? (
             <p className="mt-2 text-xs text-fg-subtle">
-              Git credentials stay with the owner session. Ask the operator for the startup username and password if you need clone or push access.
+              {supportsBasicAuth && supportsRepoAccounts
+                ? 'Use either the shared session credentials from the operator or your own repo username and password. PATs are available from your account menu.'
+                : supportsBasicAuth
+                  ? 'Git credentials stay with the owner session. Ask the operator for the startup username and password if you need clone or push access.'
+                  : 'Use your repo username and password, or a PAT you create from your account menu.'}
             </p>
           ) : null}
         </div>
@@ -192,45 +212,312 @@ function CloneMenu({ bootstrap }: { bootstrap: BootstrapResponse }) {
   )
 }
 
-export function LoginPage({
-  error,
-  onLogin,
+function SessionMenu({
+  canLogout,
+  onOpenUserSettings,
+  onLogout,
+  triggerLabel,
 }: {
+  canLogout: boolean
+  onOpenUserSettings: () => void
+  onLogout: () => Promise<void>
+  triggerLabel: string
+}) {
+  return (
+    <Menu as="div" className="relative">
+      <MenuButton className="inline-flex items-center gap-2 rounded-token px-2.5 py-2 text-sm font-medium text-fg-muted outline-none transition hover:bg-panel-subtle hover:text-fg focus-visible:ring-2 focus-visible:ring-accent/30 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas data-active:bg-panel-subtle data-active:text-fg">
+        <span className="max-w-[16rem] truncate">{triggerLabel}</span>
+        <ChevronDown className="h-4 w-4" strokeWidth={1.9} />
+      </MenuButton>
+      <MenuItems
+        anchor="bottom end"
+        className="z-30 mt-2 w-64 rounded-token border border-border bg-panel p-2 shadow-panel outline-none"
+      >
+        <div className="border-b border-border/80 px-3 py-2">
+          <p className="truncate text-sm font-semibold text-fg">{triggerLabel}</p>
+        </div>
+        <div className="p-2">
+          <MenuItem>
+            <button
+              className="flex w-full items-center gap-2 rounded-token px-3 py-2 text-left text-sm font-medium text-fg-muted transition hover:bg-panel-subtle hover:text-fg"
+              onClick={onOpenUserSettings}
+              type="button"
+            >
+              <Settings className="h-4 w-4" strokeWidth={1.9} />
+              <span>User settings</span>
+            </button>
+          </MenuItem>
+          {canLogout ? (
+            <MenuItem>
+              <button
+                className="mt-1 flex w-full items-center gap-2 rounded-token px-3 py-2 text-left text-sm font-medium text-fg-muted transition hover:bg-panel-subtle hover:text-fg"
+                onClick={async () => {
+                  await onLogout()
+                }}
+                type="button"
+              >
+                <LogOut className="h-4 w-4" strokeWidth={1.9} />
+                <span>Log out</span>
+              </button>
+            </MenuItem>
+          ) : null}
+        </div>
+      </MenuItems>
+    </Menu>
+  )
+}
+
+export function LoginPage({
+  approvedSetupToken,
+  bootstrap,
+  error,
+  requestMessage,
+  setupMessage,
+  onLogin,
+  onRequestAccess,
+  onCompleteOnboarding,
+}: {
+  approvedSetupToken: string | null
+  bootstrap: BootstrapResponse
   error: string | null
+  requestMessage: string | null
+  setupMessage: string | null
   onLogin: (username: string, password: string) => Promise<void>
+  onRequestAccess: (name: string, email: string) => Promise<void>
+  onCompleteOnboarding: (token: string, username: string, password: string) => Promise<void>
 }) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [requestName, setRequestName] = useState('')
+  const [requestEmail, setRequestEmail] = useState('')
+  const [setupToken, setSetupToken] = useState('')
+  const [setupUsername, setSetupUsername] = useState('')
+  const [setupPassword, setSetupPassword] = useState('')
+  const supportsRequestAccess = hasAuthMethod(bootstrap.auth_methods, 'request_access')
+  const supportsSetupToken = hasAuthMethod(bootstrap.auth_methods, 'setup_token')
+  const supportsBasicAuth = hasAuthMethod(bootstrap.auth_methods, 'basic_auth')
+  const tabs: Array<{ id: RequestAuthView; label: string }> = [
+    { id: 'signin', label: 'Sign in' },
+    ...(supportsRequestAccess ? [{ id: 'request' as const, label: 'Request access' }] : []),
+    ...(supportsSetupToken ? [{ id: 'setup' as const, label: 'Complete setup' }] : []),
+  ]
+  const [activeView, setActiveView] = useState<RequestAuthView>('signin')
+  const setupFromApprovedRequest = Boolean(approvedSetupToken)
+  const setupCredential = approvedSetupToken ?? setupToken
+
+  useEffect(() => {
+    if ((approvedSetupToken || setupMessage) && supportsSetupToken) {
+      setActiveView('setup')
+      return
+    }
+
+    if (requestMessage && supportsRequestAccess) {
+      setActiveView('request')
+    }
+  }, [approvedSetupToken, requestMessage, setupMessage, supportsRequestAccess, supportsSetupToken])
+
+  const flowMeta: Record<
+    RequestAuthView,
+    {
+      title: string
+      subtitle: string
+      ctaHint: string
+    }
+  > = {
+    signin: {
+      title: 'Sign in',
+      subtitle: supportsBasicAuth
+        ? supportsSetupToken
+          ? 'Use either the shared session credentials from the operator or your own repo account if it is already active.'
+          : 'Use the shared session credentials printed when the server started.'
+        : 'Use your repo username and password if your account is already active.',
+      ctaHint: supportsRequestAccess
+        ? 'New here? Request access first, then finish setup after approval.'
+        : supportsSetupToken
+          ? 'Already approved? Finish setup once with your onboarding token.'
+          : 'Sign in with the credentials available for this repository.',
+    },
+    request: {
+      title: 'Request access',
+      subtitle: 'Tell the owner who you are so they can approve a per-user account.',
+      ctaHint: 'Already have an onboarding token? Switch to complete setup.',
+    },
+    setup: {
+      title: 'Complete setup',
+      subtitle: setupFromApprovedRequest
+        ? 'Your request was approved in this browser. Choose your repo username and password to activate the account.'
+        : 'Redeem the one-time onboarding token from the owner to activate your account.',
+      ctaHint: 'Once setup is complete, Qit will sign you in automatically.',
+    },
+  }
+
+  const currentFlow = flowMeta[activeView]
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-canvas px-6">
-      <div className="w-full max-w-md space-y-6">
+    <div className="flex min-h-screen items-center justify-center bg-canvas px-6 py-10">
+      <div className="w-full max-w-2xl space-y-6">
         <div className="flex justify-center">
           <BrandLogo className="h-24 sm:h-28" />
         </div>
         <SectionHeader
           eyebrow="Qit"
-          title="Sign in to this session"
-          detail="Public sessions use the temporary Git credentials printed when the server started, then convert that sign-in into a same-origin web session."
+          title="Access this repository"
+          detail={
+            supportsRequestAccess
+              ? 'Use your repo account if you already have one. New collaborators can request approval, then finish setup with a one-time onboarding token.'
+              : supportsSetupToken
+                ? 'Use your repo account if it is already active, or finish setup with a one-time onboarding token from an owner.'
+                : 'Use the shared session credentials printed when the server started.'
+          }
         />
-        <Panel
-          title="Session credentials"
-          subtitle="Local sessions stay open on localhost. Shared sessions must authenticate explicitly."
-        >
-          <form
-            className="space-y-4"
-            onSubmit={async (event) => {
-              event.preventDefault()
-              await onLogin(username, password)
-            }}
-          >
-            <TextInput label="Username" onChange={setUsername} value={username} />
-            <TextInput label="Password" onChange={setPassword} value={password} />
-            {error ? <p className="text-sm text-danger">{error}</p> : null}
-            <Button icon={<LogIn className="h-4 w-4" strokeWidth={1.9} />} type="submit">
-              Start session
-            </Button>
-          </form>
+        <Panel title={currentFlow.title} subtitle={currentFlow.subtitle}>
+          <div className="space-y-5">
+            {tabs.length > 1 ? (
+              <div className="inline-flex w-full flex-wrap gap-2 rounded-lg border border-border/80 bg-canvas-raised/70 p-1.5">
+                {tabs.map((tab) => (
+                  <Button
+                    aria-pressed={activeView === tab.id}
+                    className="flex-1 justify-center"
+                    key={tab.id}
+                    onClick={() => setActiveView(tab.id)}
+                    tone={activeView === tab.id ? 'primary' : 'muted'}
+                    type="button"
+                  >
+                    {tab.label}
+                  </Button>
+                ))}
+              </div>
+            ) : null}
+
+            {error ? (
+              <p className="rounded-token border border-danger/40 bg-danger/10 px-3.5 py-3 text-sm text-danger">
+                {error}
+              </p>
+            ) : null}
+
+            {activeView === 'signin' ? (
+              <form
+                className="space-y-4"
+                onSubmit={async (event) => {
+                  event.preventDefault()
+                  await onLogin(username, password)
+                }}
+              >
+                <TextInput
+                  autoFocus
+                  label="Username"
+                  onChange={setUsername}
+                  placeholder={supportsBasicAuth ? 'shared session or repo username' : 'your repo username'}
+                  required
+                  value={username}
+                />
+                <TextInput
+                  label="Password"
+                  onChange={setPassword}
+                  placeholder={supportsBasicAuth ? 'shared password or account password' : 'your account password'}
+                  required
+                  type="password"
+                  value={password}
+                />
+                <div className="flex flex-col gap-3 border-t border-border/80 pt-5 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-xs leading-5 text-fg-subtle">{currentFlow.ctaHint}</p>
+                  <Button icon={<LogIn className="h-4 w-4" strokeWidth={1.9} />} type="submit">
+                    Start session
+                  </Button>
+                </div>
+              </form>
+            ) : null}
+
+            {activeView === 'request' && supportsRequestAccess ? (
+              <form
+                className="space-y-4"
+                onSubmit={async (event) => {
+                  event.preventDefault()
+                  await onRequestAccess(requestName, requestEmail)
+                }}
+              >
+                <TextInput
+                  autoFocus
+                  label="Name"
+                  onChange={setRequestName}
+                  placeholder="Your full name"
+                  required
+                  value={requestName}
+                />
+                <TextInput
+                  label="Email"
+                  onChange={setRequestEmail}
+                  placeholder="you@example.com"
+                  required
+                  type="email"
+                  value={requestEmail}
+                />
+                {requestMessage ? (
+                  <p className="rounded-token border border-success/40 bg-success/10 px-3.5 py-3 text-sm text-success">
+                    {requestMessage}
+                  </p>
+                ) : null}
+                <div className="flex flex-col gap-3 border-t border-border/80 pt-5 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-xs leading-5 text-fg-subtle">{currentFlow.ctaHint}</p>
+                  <Button icon={<UserPlus className="h-4 w-4" strokeWidth={1.9} />} type="submit">
+                    Send request
+                  </Button>
+                </div>
+              </form>
+            ) : null}
+
+            {activeView === 'setup' && supportsSetupToken ? (
+              <form
+                className="space-y-4"
+                onSubmit={async (event) => {
+                  event.preventDefault()
+                  await onCompleteOnboarding(setupCredential, setupUsername, setupPassword)
+                }}
+              >
+                {setupFromApprovedRequest ? (
+                  <p className="rounded-token border border-success/40 bg-success/10 px-3.5 py-3 text-sm text-success">
+                    Approval arrived in this browser. You can finish setup without pasting an onboarding token.
+                  </p>
+                ) : (
+                  <TextInput
+                    autoFocus
+                    label="Onboarding token"
+                    onChange={setSetupToken}
+                    placeholder="qit_setup..."
+                    required
+                    value={setupToken}
+                  />
+                )}
+                <TextInput
+                  autoFocus={setupFromApprovedRequest}
+                  label="Username"
+                  onChange={setSetupUsername}
+                  placeholder="Choose a repo username"
+                  required
+                  value={setupUsername}
+                />
+                <TextInput
+                  label="Password"
+                  onChange={setSetupPassword}
+                  placeholder="Create a password"
+                  required
+                  type="password"
+                  value={setupPassword}
+                />
+                {setupMessage ? (
+                  <p className="rounded-token border border-success/40 bg-success/10 px-3.5 py-3 text-sm text-success">
+                    {setupMessage}
+                  </p>
+                ) : null}
+                <div className="flex flex-col gap-3 border-t border-border/80 pt-5 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-xs leading-5 text-fg-subtle">{currentFlow.ctaHint}</p>
+                  <Button icon={<ShieldCheck className="h-4 w-4" strokeWidth={1.9} />} type="submit">
+                    Finish setup
+                  </Button>
+                </div>
+              </form>
+            ) : null}
+          </div>
         </Panel>
       </div>
     </div>
@@ -278,6 +565,16 @@ export function DashboardPage({
   onUpdateSettings,
   onUpdateBranchRule,
   onDeleteBranchRule,
+  onUpdateAuthMethods,
+  onApproveAccessRequest,
+  onRejectAccessRequest,
+  onPromoteUser,
+  onDemoteUser,
+  onRevokeUser,
+  onResetUserSetup,
+  onCreatePat,
+  onRevokePat,
+  onLogout,
   onDeleteBranch,
   onCreatePullRequest,
   onUpdatePullRequest,
@@ -336,6 +633,16 @@ export function DashboardPage({
     block_delete: boolean
   }) => Promise<void>
   onDeleteBranchRule: (pattern: string) => Promise<void>
+  onUpdateAuthMethods: (methods: AuthMethod[]) => Promise<void>
+  onApproveAccessRequest: (id: string) => Promise<IssuedOnboarding>
+  onRejectAccessRequest: (id: string) => Promise<void>
+  onPromoteUser: (id: string) => Promise<void>
+  onDemoteUser: (id: string) => Promise<void>
+  onRevokeUser: (id: string) => Promise<void>
+  onResetUserSetup: (id: string) => Promise<IssuedOnboarding>
+  onCreatePat: (label: string) => Promise<IssuedPat>
+  onRevokePat: (id: string) => Promise<void>
+  onLogout: () => Promise<void>
   onDeleteBranch: (name: string) => Promise<void>
   onCreatePullRequest: (payload: {
     title: string
@@ -364,8 +671,33 @@ export function DashboardPage({
   const [createBranchOpen, setCreateBranchOpen] = useState(false)
   const [createPullRequestOpen, setCreatePullRequestOpen] = useState(false)
   const [selectedTabId, setSelectedTabId] = useState(() => getQueryParam(window.location.search, 'tab') ?? 'code')
-
+  const supportsRequestAccess = bootstrap.auth_methods.includes('request_access')
+  const pendingAccessRequests = settings?.access_requests ?? []
   const canEdit = actor === 'owner'
+  const alerts = useMemo<HeaderAlert[]>(
+    () =>
+      canEdit && supportsRequestAccess
+        ? pendingAccessRequests.map((request) => ({
+            id: request.id,
+            title: request.name,
+            detail: request.email,
+            primaryAction: {
+              label: 'Approve',
+              onSelect: async () => {
+                await onApproveAccessRequest(request.id)
+              },
+            },
+            secondaryAction: {
+              label: 'Reject',
+              onSelect: async () => {
+                await onRejectAccessRequest(request.id)
+              },
+              tone: 'danger',
+            },
+          }))
+        : [],
+    [canEdit, onApproveAccessRequest, onRejectAccessRequest, pendingAccessRequests, supportsRequestAccess],
+  )
   const latestCommit = history?.commits[0] ?? null
   const codeHeaderAction = (
     <div className="flex flex-wrap items-center justify-end gap-2">
@@ -527,16 +859,37 @@ export function DashboardPage({
       {
         id: 'settings',
         icon: shellTabIcons.settings,
-        label: 'Settings',
+        label: 'Repo settings',
         content: (
           <SettingsPanel
             bootstrap={bootstrap}
             branches={branches}
             canEdit={canEdit}
+            onApproveAccessRequest={onApproveAccessRequest}
+            onDemoteUser={onDemoteUser}
             onDeleteBranchRule={onDeleteBranchRule}
+            onPromoteUser={onPromoteUser}
+            onRejectAccessRequest={onRejectAccessRequest}
+            onResetUserSetup={onResetUserSetup}
+            onRevokeUser={onRevokeUser}
+            onUpdateAuthMethods={onUpdateAuthMethods}
             onSwitchBranch={onSwitchBranch}
             onUpdateBranchRule={onUpdateBranchRule}
             onUpdateSettings={onUpdateSettings}
+            settings={settings}
+          />
+        ),
+      },
+      {
+        id: 'user-settings',
+        hidden: true,
+        icon: shellTabIcons.settings,
+        label: 'User settings',
+        content: (
+          <UserSettingsPanel
+            bootstrap={bootstrap}
+            onCreatePat={onCreatePat}
+            onRevokePat={onRevokePat}
             settings={settings}
           />
         ),
@@ -581,12 +934,14 @@ export function DashboardPage({
       onSelectPullRequest,
       onReviewPullRequest,
       onOpenTreeEntry,
+      onCreatePat,
       onSelectCommit,
       onSwitchBranch,
       onUpdateBranchRule,
       onUpdateSettings,
       onUpdatePullRequest,
       onViewBranchCode,
+      onRevokePat,
       pullRequests,
       readme,
       selectedBranch,
@@ -602,6 +957,15 @@ export function DashboardPage({
     <>
       <AppShell
         actor={actor}
+        alerts={canEdit ? alerts : undefined}
+        sessionControl={
+          <SessionMenu
+            canLogout={!bootstrap.operator_override}
+            onOpenUserSettings={() => setSelectedTabId('user-settings')}
+            onLogout={onLogout}
+            triggerLabel={bootstrap.principal?.email ?? (bootstrap.operator_override ? 'Local operator' : 'Shared session')}
+          />
+        }
         branchCount={branches.length}
         checkedOutBranch={bootstrap.checked_out_branch}
         exportedBranch={bootstrap.exported_branch}

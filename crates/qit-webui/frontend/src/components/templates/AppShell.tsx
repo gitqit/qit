@@ -1,7 +1,7 @@
-import type { ReactNode } from 'react'
-import { Tab, TabGroup, TabList, TabPanel, TabPanels } from '@headlessui/react'
-import { GitBranch, Globe } from 'lucide-react'
-import { Badge } from '../atoms/Controls'
+import { Menu, MenuButton, MenuItem, MenuItems, Tab, TabGroup, TabList, TabPanel, TabPanels } from '@headlessui/react'
+import { Bell, CheckCircle2, GitBranch, Globe, X } from 'lucide-react'
+import { useState, type ReactNode } from 'react'
+import { Badge, Button } from '../atoms/Controls'
 import { BrandLogo } from '../atoms/BrandLogo'
 
 export interface ShellTab {
@@ -11,6 +11,126 @@ export interface ShellTab {
   icon?: ReactNode
   action?: ReactNode
   content: ReactNode
+  hidden?: boolean
+}
+
+export interface HeaderAlert {
+  id: string
+  title: string
+  detail: string
+  primaryAction?: {
+    label: string
+    onSelect: () => Promise<void>
+    icon?: ReactNode
+  }
+  secondaryAction?: {
+    label: string
+    onSelect: () => Promise<void>
+    tone?: 'danger' | 'muted'
+    icon?: ReactNode
+  }
+}
+
+function AlertsMenu({
+  alerts,
+}: {
+  alerts: HeaderAlert[]
+}) {
+  const [pendingAction, setPendingAction] = useState<{ id: string; kind: 'approve' | 'reject' } | null>(null)
+  const alertCount = alerts.length
+
+  return (
+    <Menu as="div" className="relative">
+      <MenuButton
+        aria-label={alertCount ? `${alertCount} pending alerts` : 'Alerts'}
+        className="relative inline-flex h-10 w-10 items-center justify-center rounded-token text-fg-muted outline-none transition hover:bg-panel-subtle hover:text-fg focus-visible:ring-2 focus-visible:ring-accent/30 focus-visible:ring-offset-2 focus-visible:ring-offset-canvas data-active:bg-panel-subtle data-active:text-fg"
+      >
+        <Bell className="h-4.5 w-4.5" strokeWidth={1.9} />
+        {alertCount ? (
+          <span className="absolute -right-1 -top-1 inline-flex min-w-5 items-center justify-center rounded-full border border-danger/40 bg-danger px-1.5 py-0.5 text-[10px] font-semibold text-canvas">
+            {alertCount}
+          </span>
+        ) : null}
+      </MenuButton>
+      <MenuItems
+        anchor="bottom end"
+        className="z-30 mt-2 w-[24rem] rounded-token border border-border bg-panel p-2 shadow-panel outline-none"
+      >
+        <div className="border-b border-border/80 px-3 py-2">
+          <p className="text-sm font-semibold text-fg">Alerts</p>
+          <p className="text-xs text-fg-subtle">
+            {alertCount
+              ? `${alertCount} item${alertCount === 1 ? '' : 's'} waiting for attention.`
+              : 'Important updates will appear here.'}
+          </p>
+        </div>
+        <div className="max-h-96 space-y-2 overflow-y-auto p-2">
+          {alerts.length ? (
+            alerts.map((alert) => {
+              const isPrimaryPending = pendingAction?.id === alert.id && pendingAction.kind === 'approve'
+              const isSecondaryPending = pendingAction?.id === alert.id && pendingAction.kind === 'reject'
+
+              return (
+                <div className="rounded-token border border-border/80 bg-panel-subtle px-3 py-3" key={alert.id}>
+                  <div className="space-y-1">
+                    <p className="text-sm font-medium text-fg">{alert.title}</p>
+                    <p className="text-xs text-fg-subtle">{alert.detail}</p>
+                  </div>
+                  {alert.primaryAction || alert.secondaryAction ? (
+                    <div className="mt-3 flex gap-2">
+                      {alert.primaryAction ? (
+                        <MenuItem>
+                          <Button
+                            className="flex-1"
+                            disabled={Boolean(pendingAction)}
+                            icon={alert.primaryAction.icon ?? <CheckCircle2 className="h-4 w-4" strokeWidth={1.9} />}
+                            onClick={async () => {
+                              setPendingAction({ id: alert.id, kind: 'approve' })
+                              try {
+                                await alert.primaryAction?.onSelect()
+                              } finally {
+                                setPendingAction(null)
+                              }
+                            }}
+                          >
+                            {isPrimaryPending ? `${alert.primaryAction.label}…` : alert.primaryAction.label}
+                          </Button>
+                        </MenuItem>
+                      ) : null}
+                      {alert.secondaryAction ? (
+                        <MenuItem>
+                          <Button
+                            className="flex-1"
+                            disabled={Boolean(pendingAction)}
+                            icon={alert.secondaryAction.icon ?? <X className="h-4 w-4" strokeWidth={1.9} />}
+                            onClick={async () => {
+                              setPendingAction({ id: alert.id, kind: 'reject' })
+                              try {
+                                await alert.secondaryAction?.onSelect()
+                              } finally {
+                                setPendingAction(null)
+                              }
+                            }}
+                            tone={alert.secondaryAction.tone ?? 'danger'}
+                          >
+                            {isSecondaryPending ? `${alert.secondaryAction.label}…` : alert.secondaryAction.label}
+                          </Button>
+                        </MenuItem>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              )
+            })
+          ) : (
+            <div className="rounded-token border border-dashed border-border/80 bg-panel-subtle px-4 py-6 text-center text-sm text-fg-muted">
+              No active alerts.
+            </div>
+          )}
+        </div>
+      </MenuItems>
+    </Menu>
+  )
 }
 
 export function AppShell({
@@ -22,6 +142,8 @@ export function AppShell({
   exportedBranch,
   branchCount,
   pullRequestCount,
+  alerts,
+  sessionControl,
   tabs,
   selectedTabId,
   onSelectTab,
@@ -34,6 +156,8 @@ export function AppShell({
   exportedBranch: string
   branchCount: number
   pullRequestCount: number
+  alerts?: HeaderAlert[]
+  sessionControl?: ReactNode
   tabs: ShellTab[]
   selectedTabId: string
   onSelectTab: (id: string) => void
@@ -60,9 +184,14 @@ export function AppShell({
                   {repoName}
                 </span>
               </div>
-              <span className="rounded-full border border-border bg-panel px-2.5 py-1 text-xs font-semibold text-fg-muted">
-                {actor === 'owner' ? 'Owner session' : 'Shared session'}
-              </span>
+              <div className="flex items-center gap-2">
+                {alerts ? <AlertsMenu alerts={alerts} /> : null}
+                {sessionControl ?? (
+                  <span className="rounded-full border border-border bg-panel px-2.5 py-1 text-xs font-semibold text-fg-muted">
+                    {actor === 'owner' ? 'Owner session' : 'Shared session'}
+                  </span>
+                )}
+              </div>
             </div>
 
             <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
@@ -113,7 +242,11 @@ export function AppShell({
             <TabList className="flex min-w-0 gap-1 overflow-x-auto">
               {tabs.map((tab) => (
                 <Tab
-                  className="group flex shrink-0 items-center gap-2 rounded-token border border-transparent px-3 py-2 text-sm font-semibold text-fg-muted outline-none transition hover:border-border hover:bg-panel-subtle hover:text-fg data-selected:border-accent/35 data-selected:bg-accent/10 data-selected:text-fg"
+                  className={
+                    tab.hidden
+                      ? 'hidden'
+                      : 'group flex shrink-0 items-center gap-2 rounded-token border border-transparent px-3 py-2 text-sm font-semibold text-fg-muted outline-none transition hover:border-border hover:bg-panel-subtle hover:text-fg data-selected:border-accent/35 data-selected:bg-accent/10 data-selected:text-fg'
+                  }
                   key={tab.id}
                 >
                   {tab.icon ? (

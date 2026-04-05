@@ -1,6 +1,18 @@
+mod auth;
 mod branch_rules;
 
+pub use auth::{
+    AccessRequest, AccessRequestProgress, AccessRequestStatus, AccessRequestView,
+    AuthActivityKind, AuthActivityRecord, AuthActor, AuthActorKind, AuthMethod, AuthMode,
+    AuthenticatedPrincipal, IssuedOnboarding, IssuedPat, PatRecord, PatRecordView, RepoAuthState,
+    RepoUser, RepoUserRole, RepoUserStatus, RepoUserView, SubmittedAccessRequest,
+    ONBOARDING_TOKEN_TTL_MS,
+};
 use async_trait::async_trait;
+use auth::{
+    hash_secret, issue_access_request_secret, issue_onboarding_secret, issue_pat_secret,
+    parse_access_request_secret, parse_onboarding_secret, parse_pat_secret, verify_secret,
+};
 use fs2::FileExt;
 use git2::Repository;
 use serde::{Deserialize, Serialize};
@@ -281,6 +293,8 @@ pub struct WorkspaceWebUiState {
     pub pull_requests: Vec<PullRequestRecord>,
     #[serde(default)]
     pub repository: RepositorySettings,
+    #[serde(default)]
+    pub auth: RepoAuthState,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -403,6 +417,18 @@ pub enum DomainError {
     InvalidSettings(String),
     #[error("branch rule blocked the operation: {0}")]
     BranchRuleViolation(String),
+    #[error("invalid auth state: {0}")]
+    InvalidAuth(String),
+    #[error("access request not found: {0}")]
+    AccessRequestNotFound(String),
+    #[error("user not found: {0}")]
+    UserNotFound(String),
+    #[error("personal access token not found: {0}")]
+    PatNotFound(String),
+    #[error("onboarding token is invalid or expired")]
+    InvalidOnboardingToken,
+    #[error("authentication failed")]
+    AuthenticationFailed,
     #[error(
         "refusing to serve existing Git worktree {0}; rerun with --allow-existing-git to opt in"
     )]
@@ -632,6 +658,239 @@ impl WorkspaceService {
 
     fn normalize_optional(value: &str) -> String {
         value.trim().to_string()
+    }
+
+    fn normalize_auth_required(value: &str, field: &str, max_len: usize) -> Result<String, DomainError> {
+        let normalized = value.trim();
+        if normalized.is_empty() {
+            return Err(DomainError::InvalidAuth(format!("{field} is required")));
+        }
+        if normalized.len() > max_len {
+            return Err(DomainError::InvalidAuth(format!(
+                "{field} must be {max_len} characters or fewer"
+            )));
+        }
+        Ok(normalized.to_string())
+    }
+
+    fn normalize_email(value: &str) -> Result<String, DomainError> {
+        let normalized = Self::normalize_auth_required(value, "email", 320)?.to_ascii_lowercase();
+        if !normalized.contains('@') || normalized.starts_with('@') || normalized.ends_with('@') {
+            return Err(DomainError::InvalidAuth("email must be valid".into()));
+        }
+        Ok(normalized)
+    }
+
+    fn normalize_username(value: &str) -> Result<String, DomainError> {
+        let normalized = Self::normalize_auth_required(value, "username", 32)?.to_ascii_lowercase();
+        if normalized.len() < 3 {
+            return Err(DomainError::InvalidAuth(
+                "username must be at least 3 characters".into(),
+            ));
+        }
+        if !normalized
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+        {
+            return Err(DomainError::InvalidAuth(
+                "username may only contain lowercase letters, digits, '.', '_' and '-'".into(),
+            ));
+        }
+        Ok(normalized)
+    }
+
+    fn normalize_pat_label(value: &str) -> Result<String, DomainError> {
+        Self::normalize_auth_required(value, "token label", 80)
+    }
+
+    fn owner_count(auth: &RepoAuthState) -> usize {
+        auth.users
+            .iter()
+            .filter(|user| user.role == RepoUserRole::Owner && user.status != RepoUserStatus::Revoked)
+            .count()
+    }
+
+    fn ensure_not_last_owner(auth: &RepoAuthState, user_id: &str) -> Result<(), DomainError> {
+        let is_owner = auth.users.iter().any(|user| {
+            user.id == user_id && user.role == RepoUserRole::Owner && user.status != RepoUserStatus::Revoked
+        });
+        if is_owner && Self::owner_count(auth) <= 1 {
+            return Err(DomainError::InvalidAuth(
+                "cannot remove or demote the last durable owner".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_auth_activity(
+        auth: &mut RepoAuthState,
+        actor: &AuthActor,
+        kind: AuthActivityKind,
+        target_user_id: Option<String>,
+        request_id: Option<String>,
+        pat_id: Option<String>,
+        detail: Option<String>,
+        created_at_ms: u64,
+    ) {
+        auth.activity.push(AuthActivityRecord {
+            id: Uuid::new_v4().to_string(),
+            kind,
+            actor_kind: actor.kind(),
+            actor_label: actor.label(),
+            target_user_id,
+            request_id,
+            pat_id,
+            detail,
+            created_at_ms,
+        });
+    }
+
+    fn normalize_auth_state(mut auth: RepoAuthState) -> Result<RepoAuthState, DomainError> {
+        if auth.methods.is_empty() {
+            auth.methods = RepoAuthState::methods_for_mode(&auth.mode);
+        }
+        auth.methods.sort();
+        auth.methods.dedup();
+        auth.mode = RepoAuthState::compatibility_mode_from_methods(&auth.methods);
+        for request in &mut auth.access_requests {
+            request.name = Self::normalize_auth_required(&request.name, "request name", 120)?;
+            request.email = Self::normalize_email(&request.email)?;
+        }
+        for user in &mut auth.users {
+            user.name = Self::normalize_auth_required(&user.name, "user name", 120)?;
+            user.email = Self::normalize_email(&user.email)?;
+            if let Some(username) = &user.username {
+                user.username = Some(Self::normalize_username(username)?);
+            }
+        }
+        for pat in &mut auth.personal_access_tokens {
+            pat.label = Self::normalize_pat_label(&pat.label)?;
+        }
+
+        let mut emails = std::collections::HashSet::new();
+        let mut usernames = std::collections::HashSet::new();
+        for user in &auth.users {
+            if !emails.insert(user.email.clone()) {
+                return Err(DomainError::InvalidAuth(format!(
+                    "duplicate user email `{}`",
+                    user.email
+                )));
+            }
+            if let Some(username) = &user.username {
+                if !usernames.insert(username.clone()) {
+                    return Err(DomainError::InvalidAuth(format!(
+                        "duplicate username `{username}`"
+                    )));
+                }
+            }
+        }
+        for token in &auth.onboarding_tokens {
+            if !auth.users.iter().any(|user| user.id == token.user_id) {
+                return Err(DomainError::InvalidAuth(format!(
+                    "onboarding token references missing user `{}`",
+                    token.user_id
+                )));
+            }
+        }
+        for pat in &auth.personal_access_tokens {
+            if !auth.users.iter().any(|user| user.id == pat.user_id) {
+                return Err(DomainError::InvalidAuth(format!(
+                    "token `{}` references missing user `{}`",
+                    pat.id, pat.user_id
+                )));
+            }
+        }
+        Ok(auth)
+    }
+
+    fn require_auth_method(auth: &RepoAuthState, method: AuthMethod) -> Result<(), DomainError> {
+        if !auth.has_method(&method) {
+            return Err(DomainError::InvalidAuth(format!(
+                "{} is not enabled for this repo",
+                method.as_str().replace('_', "-")
+            )));
+        }
+        Ok(())
+    }
+
+    fn find_user_mut<'a>(auth: &'a mut RepoAuthState, user_id: &str) -> Result<&'a mut RepoUser, DomainError> {
+        auth.users
+            .iter_mut()
+            .find(|user| user.id == user_id)
+            .ok_or_else(|| DomainError::UserNotFound(user_id.to_string()))
+    }
+
+    fn find_user<'a>(auth: &'a RepoAuthState, user_id: &str) -> Result<&'a RepoUser, DomainError> {
+        auth.users
+            .iter()
+            .find(|user| user.id == user_id)
+            .ok_or_else(|| DomainError::UserNotFound(user_id.to_string()))
+    }
+
+    fn find_active_user_by_username<'a>(
+        auth: &'a RepoAuthState,
+        username: &str,
+    ) -> Option<&'a RepoUser> {
+        auth.users.iter().find(|user| {
+            user.status == RepoUserStatus::Active
+                && user
+                    .username
+                    .as_deref()
+                    .is_some_and(|candidate| candidate == username)
+        })
+    }
+
+    fn access_request_index_from_secret(
+        auth: &RepoAuthState,
+        secret: &str,
+    ) -> Result<usize, DomainError> {
+        let (request_id, raw_secret) =
+            parse_access_request_secret(secret).ok_or(DomainError::AuthenticationFailed)?;
+        let request_index = auth
+            .access_requests
+            .iter()
+            .position(|request| request.id == request_id)
+            .ok_or(DomainError::AuthenticationFailed)?;
+        let verifier = auth.access_requests[request_index]
+            .request_secret_verifier
+            .as_deref()
+            .ok_or(DomainError::AuthenticationFailed)?;
+        if !verify_secret(raw_secret, verifier) {
+            return Err(DomainError::AuthenticationFailed);
+        }
+        Ok(request_index)
+    }
+
+    fn issue_onboarding_for_user(
+        auth: &mut RepoAuthState,
+        user_id: &str,
+        now_ms: u64,
+    ) -> Result<IssuedOnboarding, DomainError> {
+        let user = Self::find_user(auth, user_id)?.clone();
+        for token in auth
+            .onboarding_tokens
+            .iter_mut()
+            .filter(|token| token.user_id == user_id && token.redeemed_at_ms.is_none())
+        {
+            token.redeemed_at_ms = Some(now_ms);
+        }
+        let token_id = Uuid::new_v4().to_string();
+        let (secret, verifier) = issue_onboarding_secret(&token_id)?;
+        let expires_at_ms = now_ms.saturating_add(ONBOARDING_TOKEN_TTL_MS);
+        auth.onboarding_tokens.push(auth::OnboardingToken {
+            id: token_id,
+            user_id: user_id.to_string(),
+            verifier,
+            created_at_ms: now_ms,
+            expires_at_ms,
+            redeemed_at_ms: None,
+        });
+        Ok(IssuedOnboarding {
+            user_id: user.id,
+            email: user.email,
+            secret,
+            expires_at_ms,
+        })
     }
 
     fn push_activity(
@@ -1063,6 +1322,7 @@ impl WorkspaceService {
             .map(|record| record.web_ui)
             .unwrap_or_default();
         state.repository = Self::normalize_repository_settings(state.repository)?;
+        state.auth = Self::normalize_auth_state(state.auth)?;
         Ok(state)
     }
 
@@ -1072,6 +1332,7 @@ impl WorkspaceService {
         mut web_ui: WorkspaceWebUiState,
     ) -> Result<(), DomainError> {
         web_ui.repository = Self::normalize_repository_settings(web_ui.repository)?;
+        web_ui.auth = Self::normalize_auth_state(web_ui.auth)?;
         self.registry_store
             .save(
                 workspace.id,
@@ -1099,6 +1360,702 @@ impl WorkspaceService {
         let workspace = self.existing_workspace(path, fallback_branch)?;
         let web_ui = self.load_web_ui_state(&workspace)?;
         Ok((workspace, web_ui))
+    }
+
+    pub fn read_auth_state(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+    ) -> Result<(WorkspaceSpec, RepoAuthState), DomainError> {
+        let (workspace, web_ui) = self.load_web_ui(path, fallback_branch)?;
+        Ok((workspace, web_ui.auth))
+    }
+
+    pub fn update_auth_mode(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        mode: AuthMode,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, RepoAuthState), DomainError> {
+        self.update_auth_methods(
+            path,
+            fallback_branch,
+            RepoAuthState::methods_for_mode(&mode),
+            actor,
+        )
+    }
+
+    pub fn update_auth_methods(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        methods: Vec<AuthMethod>,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, RepoAuthState), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        web_ui.auth.methods = methods;
+        web_ui.auth = Self::normalize_auth_state(web_ui.auth)?;
+        let method_detail = web_ui.auth.method_labels().join(",");
+        let now_ms = Self::now_ms();
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            actor,
+            AuthActivityKind::AuthModeChanged,
+            None,
+            None,
+            None,
+            Some(method_detail),
+            now_ms,
+        );
+        let auth = web_ui.auth.clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, auth))
+    }
+
+    pub fn submit_access_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        name: &str,
+        email: &str,
+    ) -> Result<(WorkspaceSpec, SubmittedAccessRequest), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        Self::require_auth_method(&web_ui.auth, AuthMethod::RequestAccess)?;
+        let name = Self::normalize_auth_required(name, "name", 120)?;
+        let email = Self::normalize_email(email)?;
+        if web_ui.auth.users.iter().any(|user| user.email == email) {
+            return Err(DomainError::InvalidAuth(
+                "a user with that email already exists".into(),
+            ));
+        }
+        if web_ui
+            .auth
+            .access_requests
+            .iter()
+            .any(|request| request.email == email && request.status == AccessRequestStatus::Pending)
+        {
+            return Err(DomainError::InvalidAuth(
+                "a pending request already exists for that email".into(),
+            ));
+        }
+        let now_ms = Self::now_ms();
+        let request_id = Uuid::new_v4().to_string();
+        let (secret, verifier) = issue_access_request_secret(&request_id)?;
+        let request = AccessRequest {
+            id: request_id,
+            name,
+            email,
+            status: AccessRequestStatus::Pending,
+            request_secret_verifier: Some(verifier),
+            linked_user_id: None,
+            created_at_ms: now_ms,
+            reviewed_at_ms: None,
+        };
+        let view = AccessRequestView::from(&request);
+        web_ui.auth.access_requests.push(request.clone());
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            &AuthActor::Anonymous,
+            AuthActivityKind::AccessRequested,
+            None,
+            Some(request.id),
+            None,
+            Some(request.email),
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((
+            workspace,
+            SubmittedAccessRequest {
+                request: view,
+                secret,
+            },
+        ))
+    }
+
+    pub fn read_access_request_progress(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        secret: &str,
+    ) -> Result<(WorkspaceSpec, AccessRequestProgress), DomainError> {
+        let (workspace, auth) = self.read_auth_state(path, fallback_branch)?;
+        let request_index = Self::access_request_index_from_secret(&auth, secret)?;
+        let request = &auth.access_requests[request_index];
+        Ok((
+            workspace,
+            AccessRequestProgress {
+                id: request.id.clone(),
+                status: request.status.clone(),
+            },
+        ))
+    }
+
+    pub fn approve_access_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        request_id: &str,
+        role: RepoUserRole,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, RepoUserView, IssuedOnboarding), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        Self::require_auth_method(&web_ui.auth, AuthMethod::RequestAccess)?;
+        Self::require_auth_method(&web_ui.auth, AuthMethod::SetupToken)?;
+        let now_ms = Self::now_ms();
+        let request_index = web_ui
+            .auth
+            .access_requests
+            .iter()
+            .position(|request| request.id == request_id)
+            .ok_or_else(|| DomainError::AccessRequestNotFound(request_id.to_string()))?;
+        let request = web_ui.auth.access_requests[request_index].clone();
+        if request.status != AccessRequestStatus::Pending {
+            return Err(DomainError::InvalidAuth(
+                "only pending requests can be approved".into(),
+            ));
+        }
+        if web_ui.auth.users.iter().any(|user| user.email == request.email) {
+            return Err(DomainError::InvalidAuth(
+                "a user with that email already exists".into(),
+            ));
+        }
+        let user = RepoUser {
+            id: Uuid::new_v4().to_string(),
+            name: request.name.clone(),
+            email: request.email.clone(),
+            username: None,
+            password_verifier: None,
+            role,
+            status: RepoUserStatus::ApprovedPendingSetup,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            approved_at_ms: Some(now_ms),
+            activated_at_ms: None,
+            revoked_at_ms: None,
+        };
+        web_ui.auth.access_requests[request_index].status = AccessRequestStatus::Approved;
+        web_ui.auth.access_requests[request_index].linked_user_id = Some(user.id.clone());
+        web_ui.auth.access_requests[request_index].reviewed_at_ms = Some(now_ms);
+        web_ui.auth.users.push(user.clone());
+        let onboarding = Self::issue_onboarding_for_user(&mut web_ui.auth, &user.id, now_ms)?;
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            actor,
+            AuthActivityKind::AccessApproved,
+            Some(user.id.clone()),
+            Some(request.id),
+            None,
+            Some(user.email.clone()),
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, RepoUserView::from(&user), onboarding))
+    }
+
+    pub fn reject_access_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        request_id: &str,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, AccessRequestView), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        Self::require_auth_method(&web_ui.auth, AuthMethod::RequestAccess)?;
+        let now_ms = Self::now_ms();
+        let request = web_ui
+            .auth
+            .access_requests
+            .iter_mut()
+            .find(|request| request.id == request_id)
+            .ok_or_else(|| DomainError::AccessRequestNotFound(request_id.to_string()))?;
+        request.status = AccessRequestStatus::Rejected;
+        request.reviewed_at_ms = Some(now_ms);
+        let request_view = AccessRequestView::from(&*request);
+        let request_id = request.id.clone();
+        let request_email = request.email.clone();
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            actor,
+            AuthActivityKind::AccessRejected,
+            None,
+            Some(request_id),
+            None,
+            Some(request_email),
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, request_view))
+    }
+
+    pub fn promote_user(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        user_id: &str,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, RepoUserView), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let now_ms = Self::now_ms();
+        let view = {
+            let user = Self::find_user_mut(&mut web_ui.auth, user_id)?;
+            if user.status == RepoUserStatus::Revoked {
+                return Err(DomainError::InvalidAuth("cannot promote a revoked user".into()));
+            }
+            user.role = RepoUserRole::Owner;
+            user.updated_at_ms = now_ms;
+            RepoUserView::from(&*user)
+        };
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            actor,
+            AuthActivityKind::UserPromoted,
+            Some(user_id.to_string()),
+            None,
+            None,
+            None,
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, view))
+    }
+
+    pub fn demote_user(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        user_id: &str,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, RepoUserView), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        Self::ensure_not_last_owner(&web_ui.auth, user_id)?;
+        let now_ms = Self::now_ms();
+        let view = {
+            let user = Self::find_user_mut(&mut web_ui.auth, user_id)?;
+            if user.status == RepoUserStatus::Revoked {
+                return Err(DomainError::InvalidAuth("cannot demote a revoked user".into()));
+            }
+            user.role = RepoUserRole::User;
+            user.updated_at_ms = now_ms;
+            RepoUserView::from(&*user)
+        };
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            actor,
+            AuthActivityKind::UserDemoted,
+            Some(user_id.to_string()),
+            None,
+            None,
+            None,
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, view))
+    }
+
+    pub fn revoke_user(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        user_id: &str,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, RepoUserView), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        Self::ensure_not_last_owner(&web_ui.auth, user_id)?;
+        let now_ms = Self::now_ms();
+        {
+            let user = Self::find_user_mut(&mut web_ui.auth, user_id)?;
+            user.status = RepoUserStatus::Revoked;
+            user.updated_at_ms = now_ms;
+            user.revoked_at_ms = Some(now_ms);
+            user.password_verifier = None;
+        }
+        for token in web_ui
+            .auth
+            .onboarding_tokens
+            .iter_mut()
+            .filter(|token| token.user_id == user_id && token.redeemed_at_ms.is_none())
+        {
+            token.redeemed_at_ms = Some(now_ms);
+        }
+        for pat in web_ui
+            .auth
+            .personal_access_tokens
+            .iter_mut()
+            .filter(|pat| pat.user_id == user_id && pat.revoked_at_ms.is_none())
+        {
+            pat.revoked_at_ms = Some(now_ms);
+        }
+        let view = RepoUserView::from(Self::find_user(&web_ui.auth, user_id)?);
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            actor,
+            AuthActivityKind::UserRevoked,
+            Some(user_id.to_string()),
+            None,
+            None,
+            None,
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, view))
+    }
+
+    pub fn reset_user_setup(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        user_id: &str,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, RepoUserView, IssuedOnboarding), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        Self::require_auth_method(&web_ui.auth, AuthMethod::SetupToken)?;
+        let now_ms = Self::now_ms();
+        {
+            let user = Self::find_user_mut(&mut web_ui.auth, user_id)?;
+            if user.status == RepoUserStatus::Revoked {
+                return Err(DomainError::InvalidAuth("cannot reset setup for a revoked user".into()));
+            }
+            user.status = RepoUserStatus::ApprovedPendingSetup;
+            user.updated_at_ms = now_ms;
+            user.activated_at_ms = None;
+            user.password_verifier = None;
+            user.username = None;
+        }
+        for pat in web_ui
+            .auth
+            .personal_access_tokens
+            .iter_mut()
+            .filter(|pat| pat.user_id == user_id && pat.revoked_at_ms.is_none())
+        {
+            pat.revoked_at_ms = Some(now_ms);
+        }
+        let onboarding = Self::issue_onboarding_for_user(&mut web_ui.auth, user_id, now_ms)?;
+        let view = RepoUserView::from(Self::find_user(&web_ui.auth, user_id)?);
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            actor,
+            AuthActivityKind::UserSetupReset,
+            Some(user_id.to_string()),
+            None,
+            None,
+            None,
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, view, onboarding))
+    }
+
+    pub fn complete_onboarding(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        secret: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(WorkspaceSpec, AuthenticatedPrincipal), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        Self::require_auth_method(&web_ui.auth, AuthMethod::SetupToken)?;
+        let now_ms = Self::now_ms();
+        let username = Self::normalize_username(username)?;
+        if Self::find_active_user_by_username(&web_ui.auth, &username).is_some() {
+            return Err(DomainError::InvalidAuth(
+                "that username is already in use".into(),
+            ));
+        }
+        if password.trim().len() < 10 {
+            return Err(DomainError::InvalidAuth(
+                "password must be at least 10 characters".into(),
+            ));
+        }
+        let user_id = if let Some((token_id, raw_secret)) = parse_onboarding_secret(secret) {
+            let token_index = web_ui
+                .auth
+                .onboarding_tokens
+                .iter()
+                .position(|token| token.id == token_id)
+                .ok_or(DomainError::InvalidOnboardingToken)?;
+            let token = web_ui.auth.onboarding_tokens[token_index].clone();
+            if token.redeemed_at_ms.is_some() || token.expires_at_ms < now_ms {
+                return Err(DomainError::InvalidOnboardingToken);
+            }
+            if !verify_secret(raw_secret, &token.verifier) {
+                return Err(DomainError::InvalidOnboardingToken);
+            }
+            web_ui.auth.onboarding_tokens[token_index].redeemed_at_ms = Some(now_ms);
+            token.user_id
+        } else {
+            let request_index = Self::access_request_index_from_secret(&web_ui.auth, secret)?;
+            let request = web_ui.auth.access_requests[request_index].clone();
+            if request.status != AccessRequestStatus::Approved {
+                return Err(DomainError::InvalidAuth(
+                    "that access request has not been approved yet".into(),
+                ));
+            }
+            let user_id = request
+                .linked_user_id
+                .clone()
+                .ok_or(DomainError::InvalidOnboardingToken)?;
+            web_ui.auth.access_requests[request_index].request_secret_verifier = None;
+            user_id
+        };
+        {
+            let user = Self::find_user_mut(&mut web_ui.auth, &user_id)?;
+            if user.status != RepoUserStatus::ApprovedPendingSetup {
+                return Err(DomainError::InvalidOnboardingToken);
+            }
+            user.username = Some(username.clone());
+            user.password_verifier = Some(hash_secret(password)?);
+            user.status = RepoUserStatus::Active;
+            user.updated_at_ms = now_ms;
+            user.activated_at_ms = Some(now_ms);
+        }
+        let user = Self::find_user(&web_ui.auth, &user_id)?;
+        let principal = AuthenticatedPrincipal {
+            user_id: user.id.clone(),
+            name: user.name.clone(),
+            email: user.email.clone(),
+            username,
+            role: user.role.clone(),
+        };
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            &AuthActor::User {
+                user_id: principal.user_id.clone(),
+                username: principal.username.clone(),
+                role: principal.role.clone(),
+            },
+            AuthActivityKind::UserSetupCompleted,
+            Some(principal.user_id.clone()),
+            None,
+            None,
+            None,
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, principal))
+    }
+
+    pub fn authenticate_web_user(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(WorkspaceSpec, AuthenticatedPrincipal), DomainError> {
+        let (workspace, auth) = self.read_auth_state(path, fallback_branch)?;
+        let username = Self::normalize_username(username).map_err(|_| DomainError::AuthenticationFailed)?;
+        let user = Self::find_active_user_by_username(&auth, &username)
+            .ok_or(DomainError::AuthenticationFailed)?;
+        let verifier = user
+            .password_verifier
+            .as_deref()
+            .ok_or(DomainError::AuthenticationFailed)?;
+        if !verify_secret(password, verifier) {
+            return Err(DomainError::AuthenticationFailed);
+        }
+        Ok((
+            workspace,
+            AuthenticatedPrincipal {
+                user_id: user.id.clone(),
+                name: user.name.clone(),
+                email: user.email.clone(),
+                username,
+                role: user.role.clone(),
+            },
+        ))
+    }
+
+    pub fn authenticate_git_user(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        username: &str,
+        secret: &str,
+    ) -> Result<(WorkspaceSpec, AuthenticatedPrincipal), DomainError> {
+        let (workspace, auth) = self.read_auth_state(path, fallback_branch)?;
+        let username = Self::normalize_username(username).map_err(|_| DomainError::AuthenticationFailed)?;
+        let user = Self::find_active_user_by_username(&auth, &username)
+            .ok_or(DomainError::AuthenticationFailed)?;
+        if let Some(verifier) = user.password_verifier.as_deref() {
+            if verify_secret(secret, verifier) {
+                return Ok((
+                    workspace,
+                    AuthenticatedPrincipal {
+                        user_id: user.id.clone(),
+                        name: user.name.clone(),
+                        email: user.email.clone(),
+                        username,
+                        role: user.role.clone(),
+                    },
+                ));
+            }
+        }
+        if let Some((pat_id, raw_secret)) = parse_pat_secret(secret) {
+            if let Some(pat) = auth.personal_access_tokens.iter().find(|pat| {
+                pat.id == pat_id && pat.user_id == user.id && pat.revoked_at_ms.is_none()
+            }) {
+                if verify_secret(raw_secret, &pat.verifier) {
+                    return Ok((
+                        workspace,
+                        AuthenticatedPrincipal {
+                            user_id: user.id.clone(),
+                            name: user.name.clone(),
+                            email: user.email.clone(),
+                            username,
+                            role: user.role.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        Err(DomainError::AuthenticationFailed)
+    }
+
+    pub fn resolve_active_principal(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        user_id: &str,
+    ) -> Result<(WorkspaceSpec, AuthenticatedPrincipal), DomainError> {
+        let (workspace, auth) = self.read_auth_state(path, fallback_branch)?;
+        let user = Self::find_user(&auth, user_id)?;
+        if user.status != RepoUserStatus::Active {
+            return Err(DomainError::AuthenticationFailed);
+        }
+        let username = user
+            .username
+            .clone()
+            .ok_or(DomainError::AuthenticationFailed)?;
+        Ok((
+            workspace,
+            AuthenticatedPrincipal {
+                user_id: user.id.clone(),
+                name: user.name.clone(),
+                email: user.email.clone(),
+                username,
+                role: user.role.clone(),
+            },
+        ))
+    }
+
+    pub fn create_pat(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        user_id: &str,
+        label: &str,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, PatRecordView, IssuedPat), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let user = Self::find_user(&web_ui.auth, user_id)?;
+        if user.status != RepoUserStatus::Active {
+            return Err(DomainError::InvalidAuth(
+                "only active users can create personal access tokens".into(),
+            ));
+        }
+        let now_ms = Self::now_ms();
+        let label = Self::normalize_pat_label(label)?;
+        let pat_id = Uuid::new_v4().to_string();
+        let (secret, verifier) = issue_pat_secret(&pat_id)?;
+        let record = PatRecord {
+            id: pat_id.clone(),
+            user_id: user_id.to_string(),
+            label: label.clone(),
+            verifier,
+            created_at_ms: now_ms,
+            revoked_at_ms: None,
+        };
+        web_ui.auth.personal_access_tokens.push(record.clone());
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            actor,
+            AuthActivityKind::PatCreated,
+            Some(user_id.to_string()),
+            None,
+            Some(pat_id.clone()),
+            Some(label.clone()),
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((
+            workspace,
+            PatRecordView::from(&record),
+            IssuedPat {
+                id: pat_id,
+                label,
+                secret,
+                created_at_ms: now_ms,
+            },
+        ))
+    }
+
+    pub fn revoke_pat(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        pat_id: &str,
+        actor: &AuthActor,
+    ) -> Result<(WorkspaceSpec, PatRecordView), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let now_ms = Self::now_ms();
+        let pat = web_ui
+            .auth
+            .personal_access_tokens
+            .iter_mut()
+            .find(|pat| pat.id == pat_id)
+            .ok_or_else(|| DomainError::PatNotFound(pat_id.to_string()))?;
+        pat.revoked_at_ms = Some(now_ms);
+        let view = PatRecordView::from(&*pat);
+        let pat_user_id = pat.user_id.clone();
+        let pat_id = pat.id.clone();
+        let pat_label = pat.label.clone();
+        Self::record_auth_activity(
+            &mut web_ui.auth,
+            actor,
+            AuthActivityKind::PatRevoked,
+            Some(pat_user_id),
+            None,
+            Some(pat_id),
+            Some(pat_label),
+            now_ms,
+        );
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, view))
     }
 
     pub fn read_repository_settings(
@@ -2729,5 +3686,139 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, DomainError::BranchRuleViolation(_)));
+    }
+
+    #[test]
+    fn request_based_auth_flow_supports_onboarding_and_pat_auth() {
+        let (_temp, _registry, service) = service_with_workspace("main", "main");
+        service
+            .update_auth_mode(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                AuthMode::RequestBased,
+                &AuthActor::Operator,
+            )
+            .unwrap();
+        let (_, request) = service
+            .submit_access_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                "Alice",
+                "alice@example.com",
+            )
+            .unwrap();
+        assert!(request.secret.starts_with("qit_request."));
+        let (_, progress) = service
+            .read_access_request_progress(PathBuf::from("."), DEFAULT_BRANCH, &request.secret)
+            .unwrap();
+        assert_eq!(progress.status, AccessRequestStatus::Pending);
+        let (_, user, _onboarding) = service
+            .approve_access_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &request.request.id,
+                RepoUserRole::User,
+                &AuthActor::Operator,
+            )
+            .unwrap();
+        assert_eq!(user.status, RepoUserStatus::ApprovedPendingSetup);
+
+        let (_, principal) = service
+            .complete_onboarding(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &request.secret,
+                "alice",
+                "very-secret-pass",
+            )
+            .unwrap();
+        assert_eq!(principal.username, "alice");
+
+        let (_, web_principal) = service
+            .authenticate_web_user(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                "alice",
+                "very-secret-pass",
+            )
+            .unwrap();
+        assert_eq!(web_principal.user_id, principal.user_id);
+
+        let (_, _pat, issued_pat) = service
+            .create_pat(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &principal.user_id,
+                "laptop",
+                &AuthActor::User {
+                    user_id: principal.user_id.clone(),
+                    username: principal.username.clone(),
+                    role: principal.role.clone(),
+                },
+            )
+            .unwrap();
+        let (_, git_principal) = service
+            .authenticate_git_user(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                "alice",
+                &issued_pat.secret,
+            )
+            .unwrap();
+        assert_eq!(git_principal.user_id, principal.user_id);
+    }
+
+    #[test]
+    fn request_based_auth_prevents_removing_last_owner() {
+        let (_temp, _registry, service) = service_with_workspace("main", "main");
+        service
+            .update_auth_mode(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                AuthMode::RequestBased,
+                &AuthActor::Operator,
+            )
+            .unwrap();
+        let (_, request) = service
+            .submit_access_request(PathBuf::from("."), DEFAULT_BRANCH, "Owner", "owner@example.com")
+            .unwrap();
+        let (_, owner, onboarding) = service
+            .approve_access_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &request.request.id,
+                RepoUserRole::Owner,
+                &AuthActor::Operator,
+            )
+            .unwrap();
+        service
+            .complete_onboarding(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &onboarding.secret,
+                "owner-user",
+                "very-secret-pass",
+            )
+            .unwrap();
+
+        let demote_error = service
+            .demote_user(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &owner.id,
+                &AuthActor::Operator,
+            )
+            .unwrap_err();
+        assert!(matches!(demote_error, DomainError::InvalidAuth(_)));
+
+        let revoke_error = service
+            .revoke_user(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &owner.id,
+                &AuthActor::Operator,
+            )
+            .unwrap_err();
+        assert!(matches!(revoke_error, DomainError::InvalidAuth(_)));
     }
 }

@@ -1,4 +1,6 @@
 import type {
+  AccessRequestProgress,
+  AccessRequestView,
   BlobResponse,
   BootstrapResponse,
   BranchesResponse,
@@ -6,11 +8,18 @@ import type {
   CommitDetail,
   CommitsResponse,
   CompareResponse,
+  IssuedOnboarding,
+  IssuedPat,
+  PatRecordView,
   PullRequestDetailResponse,
   PullRequestRecord,
   PullRequestsResponse,
+  RepoUserView,
   SettingsResponse,
+  SubmittedAccessRequest,
   TreeResponse,
+  AuthMethod,
+  AuthMode,
   UiRole,
 } from './types'
 
@@ -51,6 +60,41 @@ export const api = {
   },
   logout: async () => {
     await requestJson<void>('/api/session/logout', { method: 'POST' })
+  },
+  updateAuthMode: (mode: AuthMode) =>
+    requestJson<SettingsResponse>('/api/auth/mode', {
+      method: 'POST',
+      body: JSON.stringify({ mode }),
+    }),
+  updateAuthMethods: (methods: AuthMethod[]) =>
+    requestJson<SettingsResponse>('/api/auth/mode', {
+      method: 'POST',
+      body: JSON.stringify({ methods }),
+    }),
+  requestAccess: (name: string, email: string) =>
+    requestJson<SubmittedAccessRequest>('/api/access-requests', {
+      method: 'POST',
+      body: JSON.stringify({ name, email }),
+    }),
+  accessRequestStatus: (token: string) =>
+    requestJson<AccessRequestProgress>('/api/access-requests/status', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    }),
+  approveAccessRequest: (id: string) =>
+    requestJson<IssuedOnboarding>(`/api/access-requests/${encodeURIComponent(id)}/approve`, {
+      method: 'POST',
+    }),
+  rejectAccessRequest: (id: string) =>
+    requestJson<AccessRequestView>(`/api/access-requests/${encodeURIComponent(id)}/reject`, {
+      method: 'POST',
+    }),
+  completeOnboarding: async (token: string, username: string, password: string) => {
+    const role = await requestJson<UiRole>('/api/onboarding/complete', {
+      method: 'POST',
+      body: JSON.stringify({ token, username, password }),
+    })
+    return role
   },
   settings: () => requestJson<SettingsResponse>('/api/settings'),
   updateSettings: (payload: { description?: string; homepage_url?: string }) =>
@@ -183,5 +227,30 @@ export const api = {
     requestJson<PullRequestRecord>(`/api/pull-requests/${encodeURIComponent(id)}/reviews`, {
       method: 'POST',
       body: JSON.stringify(payload),
+    }),
+  promoteUser: (id: string) =>
+    requestJson<RepoUserView>(`/api/users/${encodeURIComponent(id)}/promote`, {
+      method: 'POST',
+    }),
+  demoteUser: (id: string) =>
+    requestJson<RepoUserView>(`/api/users/${encodeURIComponent(id)}/demote`, {
+      method: 'POST',
+    }),
+  revokeUser: (id: string) =>
+    requestJson<RepoUserView>(`/api/users/${encodeURIComponent(id)}/revoke`, {
+      method: 'POST',
+    }),
+  resetUserSetup: (id: string) =>
+    requestJson<IssuedOnboarding>(`/api/users/${encodeURIComponent(id)}/reset-setup`, {
+      method: 'POST',
+    }),
+  createPat: (label: string) =>
+    requestJson<IssuedPat>('/api/profile/pats', {
+      method: 'POST',
+      body: JSON.stringify({ label }),
+    }),
+  revokePat: (id: string) =>
+    requestJson<PatRecordView>(`/api/profile/pats/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
     }),
 }

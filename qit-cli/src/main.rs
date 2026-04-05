@@ -3,11 +3,12 @@ mod serve_output;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use qit_domain::{
-    resolve_pull_request_refs, BranchInfo, CreatePullRequest, CreatePullRequestComment,
-    CreatePullRequestReview, CredentialIssuer, PullRequestRecord, PullRequestReviewState,
-    PullRequestStatus, RefComparison, RefDiffFile, RepoReadStore, RepositorySettings,
-    SessionCredentials, UiRole, UpdatePullRequest, UpdateRepositorySettings, UpsertBranchRule,
-    WorkspaceService, WorkspaceSpec, DEFAULT_BRANCH,
+    resolve_pull_request_refs, AccessRequestStatus, AuthActor, AuthMethod, AuthMode, BranchInfo,
+    CreatePullRequest, CreatePullRequestComment, CreatePullRequestReview, CredentialIssuer,
+    PullRequestRecord, PullRequestReviewState, PullRequestStatus, RefComparison, RefDiffFile,
+    RepoAuthState, RepoReadStore, RepoUserRole, RepoUserStatus, RepositorySettings, SessionCredentials, UiRole,
+    UpdatePullRequest, UpdateRepositorySettings, UpsertBranchRule, WorkspaceService, WorkspaceSpec,
+    DEFAULT_BRANCH,
 };
 use qit_git::{GitHttpBackendAdapter, GitRepoStore};
 use qit_http::{repo_mount_path, GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
@@ -35,6 +36,38 @@ enum TransportArg {
     Ngrok,
     Tailscale,
     Local,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ServeAuthModeArg {
+    SharedSession,
+    RequestBased,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ServeAuthMethodArg {
+    RequestAccess,
+    SetupToken,
+    BasicAuth,
+}
+
+impl From<ServeAuthModeArg> for AuthMode {
+    fn from(value: ServeAuthModeArg) -> Self {
+        match value {
+            ServeAuthModeArg::SharedSession => AuthMode::SharedSession,
+            ServeAuthModeArg::RequestBased => AuthMode::RequestBased,
+        }
+    }
+}
+
+impl From<ServeAuthMethodArg> for AuthMethod {
+    fn from(value: ServeAuthMethodArg) -> Self {
+        match value {
+            ServeAuthMethodArg::RequestAccess => AuthMethod::RequestAccess,
+            ServeAuthMethodArg::SetupToken => AuthMethod::SetupToken,
+            ServeAuthMethodArg::BasicAuth => AuthMethod::BasicAuth,
+        }
+    }
 }
 
 impl From<TransportArg> for PublicTransport {
@@ -92,6 +125,14 @@ struct Cli {
     /// Backward-compatible alias for `--transport local`.
     #[arg(long, hide = true)]
     local_only: bool,
+
+    /// Initial auth mode for this served repo.
+    #[arg(long, value_enum)]
+    auth_mode: Option<ServeAuthModeArg>,
+
+    /// Enable one or more auth methods for this served repo.
+    #[arg(long = "auth-method", value_enum, action = ArgAction::Append)]
+    auth_methods: Vec<ServeAuthMethodArg>,
 }
 
 #[derive(Subcommand)]
@@ -227,6 +268,11 @@ enum Commands {
     Settings {
         #[command(subcommand)]
         command: SettingsCommands,
+    },
+    /// Manage request-based auth, users, and PATs for a served folder.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
     },
 }
 
@@ -452,6 +498,66 @@ enum SettingsCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// View or change the repository auth mode.
+    Mode {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Enable request-based auth.
+        #[arg(long, conflicts_with = "shared_session")]
+        request_based: bool,
+
+        /// Keep the legacy shared-session auth mode.
+        #[arg(long, conflicts_with = "request_based")]
+        shared_session: bool,
+    },
+    /// List, approve, or reject access requests.
+    Requests {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Approve a request by id.
+        #[arg(long, conflicts_with = "reject")]
+        approve: Option<String>,
+
+        /// Reject a request by id.
+        #[arg(long, conflicts_with = "approve")]
+        reject: Option<String>,
+    },
+    /// List or manage repo users.
+    Users {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Promote a user to owner.
+        #[arg(long, conflicts_with_all = ["demote", "revoke", "reset_setup"])]
+        promote: Option<String>,
+
+        /// Demote an owner back to user.
+        #[arg(long, conflicts_with_all = ["promote", "revoke", "reset_setup"])]
+        demote: Option<String>,
+
+        /// Revoke a user account.
+        #[arg(long, conflicts_with_all = ["promote", "demote", "reset_setup"])]
+        revoke: Option<String>,
+
+        /// Reset setup and issue a new one-time onboarding token.
+        #[arg(long = "reset-setup", conflicts_with_all = ["promote", "demote", "revoke"])]
+        reset_setup: Option<String>,
+    },
+    /// List or revoke personal access tokens.
+    Pats {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Revoke a PAT by id.
+        #[arg(long)]
+        revoke: Option<String>,
+    },
+}
+
 struct RandomCredentialIssuer;
 
 impl CredentialIssuer for RandomCredentialIssuer {
@@ -563,6 +669,86 @@ fn print_repository_settings(workspace: &WorkspaceSpec, settings: &RepositorySet
     }
 }
 
+fn format_auth_mode(mode: AuthMode) -> &'static str {
+    match mode {
+        AuthMode::SharedSession => "shared_session",
+        AuthMode::RequestBased => "request_based",
+    }
+}
+
+fn print_auth_state(workspace: &WorkspaceSpec, auth: &qit_domain::RepoAuthState) {
+    say(&format!("auth for {}:", workspace.worktree.display()));
+    say(&format!("  mode: {}", format_auth_mode(auth.mode.clone())));
+    say("  pending requests:");
+    let pending_requests = auth
+        .access_requests
+        .iter()
+        .filter(|request| request.status == AccessRequestStatus::Pending)
+        .collect::<Vec<_>>();
+    if pending_requests.is_empty() {
+        say("    none");
+    } else {
+        for request in pending_requests {
+            say(&format!(
+                "    - {} {} <{}>",
+                request.id.chars().take(8).collect::<String>(),
+                request.name,
+                request.email
+            ));
+        }
+    }
+    say("  users:");
+    if auth.users.is_empty() {
+        say("    none");
+    } else {
+        for user in &auth.users {
+            let username = user.username.as_deref().unwrap_or("not set");
+            let role = match user.role {
+                RepoUserRole::Owner => "owner",
+                RepoUserRole::User => "user",
+            };
+            let status = match user.status {
+                RepoUserStatus::PendingRequest => "pending_request",
+                RepoUserStatus::ApprovedPendingSetup => "approved_pending_setup",
+                RepoUserStatus::Active => "active",
+                RepoUserStatus::Revoked => "revoked",
+            };
+            say(&format!(
+                "    - {} {} <{}> user={} role={} status={}",
+                user.id.chars().take(8).collect::<String>(),
+                user.name,
+                user.email,
+                username,
+                role,
+                status
+            ));
+        }
+    }
+    say("  personal access tokens:");
+    let active_pats = auth
+        .personal_access_tokens
+        .iter()
+        .filter(|token| token.revoked_at_ms.is_none())
+        .collect::<Vec<_>>();
+    if active_pats.is_empty() {
+        say("    none");
+    } else {
+        for token in active_pats {
+            let owner = auth
+                .users
+                .iter()
+                .find(|user| user.id == token.user_id)
+                .and_then(|user| user.username.as_deref())
+                .unwrap_or("unknown");
+            say(&format!(
+                "    - {} {} ({owner})",
+                token.id.chars().take(8).collect::<String>(),
+                token.label
+            ));
+        }
+    }
+}
+
 fn default_display_name() -> String {
     std::env::var("QIT_DISPLAY_NAME")
         .ok()
@@ -606,6 +792,25 @@ fn select_pull_request<'a>(
         .ok_or_else(|| anyhow!("pull request `{selector}` was not found"))?;
     if matches.next().is_some() {
         bail!("pull request selector `{selector}` is ambiguous");
+    }
+    Ok(first)
+}
+
+fn select_by_id_prefix<'a, T>(
+    values: &'a [T],
+    selector: &str,
+    id_of: impl Fn(&'a T) -> &'a str,
+    noun: &str,
+) -> Result<&'a T> {
+    if let Some(exact) = values.iter().find(|value| id_of(value) == selector) {
+        return Ok(exact);
+    }
+    let mut matches = values.iter().filter(|value| id_of(value).starts_with(selector));
+    let first = matches
+        .next()
+        .ok_or_else(|| anyhow!("{noun} `{selector}` was not found"))?;
+    if matches.next().is_some() {
+        bail!("{noun} selector `{selector}` is ambiguous");
     }
     Ok(first)
 }
@@ -1106,6 +1311,195 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
             },
+            Commands::Auth { command } => match command {
+                AuthCommands::Mode {
+                    path,
+                    request_based,
+                    shared_session,
+                } => {
+                    if request_based || shared_session {
+                        let mode = if request_based {
+                            AuthMode::RequestBased
+                        } else {
+                            AuthMode::SharedSession
+                        };
+                        let (workspace, auth) = service.update_auth_mode(
+                            path,
+                            default_branch,
+                            mode.clone(),
+                            &AuthActor::Operator,
+                        )?;
+                        say(&format!(
+                            "set auth mode for {} to {}",
+                            workspace.worktree.display(),
+                            format_auth_mode(mode)
+                        ));
+                        print_auth_state(&workspace, &auth);
+                        return Ok(());
+                    }
+                    let (workspace, auth) = service.read_auth_state(path, default_branch)?;
+                    print_auth_state(&workspace, &auth);
+                    return Ok(());
+                }
+                AuthCommands::Requests {
+                    path,
+                    approve,
+                    reject,
+                } => {
+                    let (workspace, auth) = service.read_auth_state(path.clone(), default_branch)?;
+                    if let Some(selector) = approve {
+                        let request = select_by_id_prefix(
+                            &auth.access_requests,
+                            &selector,
+                            |request| &request.id,
+                            "request",
+                        )?;
+                        let (_, _user, onboarding) = service.approve_access_request(
+                            path,
+                            default_branch,
+                            &request.id,
+                            RepoUserRole::User,
+                            &AuthActor::Operator,
+                        )?;
+                        say(&format!(
+                            "approved {} <{}>",
+                            request.name, request.email
+                        ));
+                        say("share this one-time setup token with the approved user now:");
+                        say(&format!("  {}", onboarding.secret));
+                        return Ok(());
+                    }
+                    if let Some(selector) = reject {
+                        let request = select_by_id_prefix(
+                            &auth.access_requests,
+                            &selector,
+                            |request| &request.id,
+                            "request",
+                        )?;
+                        service.reject_access_request(
+                            path,
+                            default_branch,
+                            &request.id,
+                            &AuthActor::Operator,
+                        )?;
+                        say(&format!("rejected {} <{}>", request.name, request.email));
+                        return Ok(());
+                    }
+                    say(&format!("access requests for {}:", workspace.worktree.display()));
+                    let pending = auth
+                        .access_requests
+                        .iter()
+                        .filter(|request| request.status == AccessRequestStatus::Pending)
+                        .collect::<Vec<_>>();
+                    if pending.is_empty() {
+                        say("  none");
+                    } else {
+                        for request in pending {
+                            say(&format!(
+                                "  {} {} <{}>",
+                                request.id.chars().take(8).collect::<String>(),
+                                request.name,
+                                request.email
+                            ));
+                        }
+                    }
+                    return Ok(());
+                }
+                AuthCommands::Users {
+                    path,
+                    promote,
+                    demote,
+                    revoke,
+                    reset_setup,
+                } => {
+                    let (workspace, auth) = service.read_auth_state(path.clone(), default_branch)?;
+                    if let Some(selector) = promote {
+                        let user = select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
+                        service.promote_user(path, default_branch, &user.id, &AuthActor::Operator)?;
+                        say(&format!("promoted {} to owner", user.email));
+                        return Ok(());
+                    }
+                    if let Some(selector) = demote {
+                        let user = select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
+                        service.demote_user(path, default_branch, &user.id, &AuthActor::Operator)?;
+                        say(&format!("demoted {} to user", user.email));
+                        return Ok(());
+                    }
+                    if let Some(selector) = revoke {
+                        let user = select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
+                        service.revoke_user(path, default_branch, &user.id, &AuthActor::Operator)?;
+                        say(&format!("revoked {}", user.email));
+                        return Ok(());
+                    }
+                    if let Some(selector) = reset_setup {
+                        let user = select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
+                        let (_, _, onboarding) =
+                            service.reset_user_setup(path, default_branch, &user.id, &AuthActor::Operator)?;
+                        say(&format!("reset setup for {}", user.email));
+                        say("share this one-time setup token with the user now:");
+                        say(&format!("  {}", onboarding.secret));
+                        return Ok(());
+                    }
+                    say(&format!("users for {}:", workspace.worktree.display()));
+                    if auth.users.is_empty() {
+                        say("  none");
+                    } else {
+                        for user in &auth.users {
+                            let role = match user.role {
+                                RepoUserRole::Owner => "owner",
+                                RepoUserRole::User => "user",
+                            };
+                            let status = match user.status {
+                                RepoUserStatus::PendingRequest => "pending_request",
+                                RepoUserStatus::ApprovedPendingSetup => "approved_pending_setup",
+                                RepoUserStatus::Active => "active",
+                                RepoUserStatus::Revoked => "revoked",
+                            };
+                            say(&format!(
+                                "  {} {} <{}> role={} status={}",
+                                user.id.chars().take(8).collect::<String>(),
+                                user.name,
+                                user.email,
+                                role,
+                                status
+                            ));
+                        }
+                    }
+                    return Ok(());
+                }
+                AuthCommands::Pats { path, revoke } => {
+                    let (workspace, auth) = service.read_auth_state(path.clone(), default_branch)?;
+                    if let Some(selector) = revoke {
+                        let pat = select_by_id_prefix(
+                            &auth.personal_access_tokens,
+                            &selector,
+                            |token| &token.id,
+                            "personal access token",
+                        )?;
+                        service.revoke_pat(path, default_branch, &pat.id, &AuthActor::Operator)?;
+                        say(&format!("revoked PAT {}", pat.label));
+                        return Ok(());
+                    }
+                    say(&format!("personal access tokens for {}:", workspace.worktree.display()));
+                    let active = auth
+                        .personal_access_tokens
+                        .iter()
+                        .filter(|token| token.revoked_at_ms.is_none())
+                        .collect::<Vec<_>>();
+                    if active.is_empty() {
+                        say("  none");
+                    } else {
+                        for token in active {
+                            say(&format!(
+                                "  {} {}",
+                                token.id.chars().take(8).collect::<String>(),
+                                token.label
+                            ));
+                        }
+                    }
+                    return Ok(());
+                }
+            },
             Commands::Pr { command } => {
                 match command {
                     PrCommands::List { path, state } => {
@@ -1444,8 +1838,29 @@ async fn main() -> Result<()> {
         .await?;
     let workspace = prepared.workspace.clone();
     let credentials = prepared.credentials.clone();
+    let requested_auth_methods = if !cli.auth_methods.is_empty() {
+        cli.auth_methods.iter().copied().map(Into::into).collect::<Vec<_>>()
+    } else if let Some(mode) = cli.auth_mode.map(Into::into) {
+        RepoAuthState::methods_for_mode(&mode)
+    } else {
+        Vec::new()
+    };
+    if !requested_auth_methods.is_empty() {
+        service.update_auth_methods(
+            workspace.worktree.clone(),
+            &workspace.exported_branch,
+            requested_auth_methods,
+            &AuthActor::Operator,
+        )?;
+    }
+    let effective_auth = service
+        .read_auth_state(workspace.worktree.clone(), &workspace.exported_branch)?
+        .1;
     let reveal_password = !cli.hidden_pass;
-    let credentials_path = write_credentials_file(&credentials, !reveal_password)?;
+    let credentials_path = write_credentials_file(
+        &credentials,
+        effective_auth.has_method(&AuthMethod::BasicAuth) && !reveal_password,
+    )?;
     let repo_mount_path = repo_mount_path(&repo_name_from_worktree(&workspace.worktree));
 
     let addr = SocketAddr::from_str(&format!("127.0.0.1:{}", cli.port)).expect("valid socket addr");
@@ -1482,7 +1897,11 @@ async fn main() -> Result<()> {
     let local_browser_url = repo_url(&local_url, &repo_mount_path)?;
     let endpoint = expose(transport, &local_url).await?;
     let public_repo_url = repo_url(&endpoint.public_url, &repo_mount_path)?;
-    let clone_url = repo_url_with_credentials(&public_repo_url, &credentials, reveal_password)?;
+    let clone_url = if effective_auth.has_method(&AuthMethod::BasicAuth) {
+        repo_url_with_credentials(&public_repo_url, &credentials, reveal_password)?
+    } else {
+        public_repo_url.clone()
+    };
     let clone_cmd = clone_command(&clone_url, transport);
     let web_router = WebUiServer::new(
         repo_store.clone(),
@@ -1513,6 +1932,7 @@ async fn main() -> Result<()> {
     print_serve_summary(
         &workspace.worktree,
         &workspace.exported_branch,
+        effective_auth.methods.clone(),
         endpoint.label,
         &public_repo_url,
         &local_browser_url,

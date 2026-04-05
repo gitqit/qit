@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
+  CheckCircle2,
   ExternalLink,
   GitBranch,
   Globe,
@@ -7,10 +8,18 @@ import {
   ShieldAlert,
   Sparkles,
   Trash2,
+  UserCheck,
+  UserCog,
 } from 'lucide-react'
 import { Badge, Button, EmptyState, Panel } from '../../atoms/Controls'
 import { FormActions, KeyValueRow, TextArea, TextInput } from '../../molecules/Fields'
-import type { BootstrapResponse, BranchInfo, SettingsResponse } from '../../../lib/types'
+import type {
+  AuthMethod,
+  BootstrapResponse,
+  BranchInfo,
+  IssuedOnboarding,
+  SettingsResponse,
+} from '../../../lib/types'
 
 type SectionId = 'general' | 'branches' | 'access'
 
@@ -75,7 +84,14 @@ export function SettingsPanel({
   branches,
   canEdit,
   settings,
+  onApproveAccessRequest,
+  onDemoteUser,
   onDeleteBranchRule,
+  onPromoteUser,
+  onRejectAccessRequest,
+  onResetUserSetup,
+  onRevokeUser,
+  onUpdateAuthMethods,
   onSwitchBranch,
   onUpdateBranchRule,
   onUpdateSettings,
@@ -84,7 +100,14 @@ export function SettingsPanel({
   branches: BranchInfo[]
   canEdit: boolean
   settings: SettingsResponse | null
+  onApproveAccessRequest: (id: string) => Promise<IssuedOnboarding>
+  onDemoteUser: (id: string) => Promise<void>
   onDeleteBranchRule: (pattern: string) => Promise<void>
+  onPromoteUser: (id: string) => Promise<void>
+  onRejectAccessRequest: (id: string) => Promise<void>
+  onResetUserSetup: (id: string) => Promise<IssuedOnboarding>
+  onRevokeUser: (id: string) => Promise<void>
+  onUpdateAuthMethods: (methods: AuthMethod[]) => Promise<void>
   onSwitchBranch: (name: string) => Promise<void>
   onUpdateBranchRule: (payload: {
     pattern: string
@@ -110,6 +133,8 @@ export function SettingsPanel({
   const [savingGeneral, setSavingGeneral] = useState(false)
   const [savingBranch, setSavingBranch] = useState(false)
   const [savingRule, setSavingRule] = useState(false)
+  const [, setSavingAccess] = useState(false)
+  const [issuedOnboarding, setIssuedOnboarding] = useState<IssuedOnboarding | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -132,6 +157,10 @@ export function SettingsPanel({
 
   const copy = sectionCopy(selectedSection)
   const rules = settings?.repository.branch_rules ?? []
+  const authMethods = settings?.auth_methods ?? []
+  const supportsBasicAuth = authMethods.includes('basic_auth')
+  const supportsRequestAccess = authMethods.includes('request_access')
+  const supportsSetupToken = authMethods.includes('setup_token')
   const selectClassName =
     'w-full rounded-token border border-border bg-panel-subtle px-3.5 py-2.5 text-sm text-fg outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent/20'
 
@@ -166,7 +195,7 @@ export function SettingsPanel({
 
   return (
     <div className="grid gap-6 lg:grid-cols-[220px_minmax(0,1fr)]">
-      <Panel subtitle="GitHub-style settings navigation inside this repo session." title="Settings">
+      <Panel subtitle="GitHub-style settings navigation for repository configuration." title="Repository settings">
         <nav className="space-y-1">
           {sections.map((section) => {
             const active = section.id === selectedSection
@@ -451,18 +480,18 @@ export function SettingsPanel({
         ) : null}
 
         {selectedSection === 'access' ? (
-          <Panel subtitle="Keep the trust model visible without forcing people to read startup logs." title="Access policy">
+          <Panel subtitle="Switch auth modes, approve access requests, and manage repo accounts without leaving the session." title="Access policy">
             <div className="space-y-4">
               <div className="rounded-token border border-border bg-panel-subtle px-4 py-2">
                 <KeyValueRow
                   icon={<Shield className="h-4 w-4" strokeWidth={1.85} />}
-                  label="Access mode"
-                  value={settings.local_only_owner_mode ? 'Local-only owner access' : 'Credentialed web session'}
+                  label="Enabled methods"
+                  value={authMethods.length ? authMethods.join(', ').replaceAll('_', '-') : 'None'}
                 />
                 <KeyValueRow
                   icon={<ShieldAlert className="h-4 w-4" strokeWidth={1.85} />}
                   label="Remote identity"
-                  value="Shared session account"
+                  value={supportsBasicAuth && supportsSetupToken ? 'Shared session plus per-user accounts' : supportsBasicAuth ? 'Shared session account' : 'Per-user accounts'}
                 />
                 <KeyValueRow
                   icon={<Globe className="h-4 w-4" strokeWidth={1.85} />}
@@ -470,8 +499,191 @@ export function SettingsPanel({
                   value={settings.repository.homepage_url || 'Not set'}
                 />
               </div>
+              {canEdit ? (
+                <div className="space-y-3 rounded-lg border border-border/80 bg-canvas-raised/60 p-5">
+                  <div className="space-y-1">
+                    <h3 className="text-base font-semibold text-fg">Auth methods</h3>
+                    <p className="text-sm leading-6 text-fg-muted">
+                      Combine shared basic auth with per-user onboarding. New repos default to request access plus setup tokens.
+                    </p>
+                  </div>
+                  {([
+                    ['request_access', 'Request access', 'Allow remote collaborators to submit their name and email for owner approval.'],
+                    ['setup_token', 'Setup token', 'Allow owners to issue one-time onboarding tokens so users can create their own account credentials.'],
+                    ['basic_auth', 'Basic auth', 'Keep the current shared username and password flow, including auth-file output and show-password behavior.'],
+                  ] as const).map(([method, label, description]) => (
+                    <RuleToggle
+                      checked={authMethods.includes(method)}
+                      description={description}
+                      key={method}
+                      label={label}
+                      onChange={async (checked) => {
+                        setSavingAccess(true)
+                        setError(null)
+                        try {
+                          const next = checked
+                            ? [...authMethods, method]
+                            : authMethods.filter((candidate) => candidate !== method)
+                          await onUpdateAuthMethods(Array.from(new Set(next)))
+                        } catch (saveError) {
+                          setError(saveError instanceof Error ? saveError.message : 'Unable to update auth methods.')
+                        } finally {
+                          setSavingAccess(false)
+                        }
+                      }}
+                    />
+                  ))}
+                </div>
+              ) : null}
+              {canEdit && supportsRequestAccess ? (
+                <div className="space-y-4 rounded-lg border border-border/80 bg-canvas-raised/60 p-5">
+                  <div className="space-y-1">
+                    <h3 className="text-base font-semibold text-fg">Pending requests</h3>
+                    <p className="text-sm leading-6 text-fg-muted">
+                      Approving a request issues a one-time setup token. Share it immediately because it will not be shown again.
+                    </p>
+                  </div>
+                  {settings.access_requests.length ? (
+                    <div className="space-y-2">
+                      {settings.access_requests.map((request) => (
+                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-token border border-border/80 bg-panel-subtle px-4 py-3" key={request.id}>
+                          <div>
+                            <p className="text-sm font-medium text-fg">{request.name}</p>
+                            <p className="text-xs text-fg-subtle">{request.email}</p>
+                          </div>
+                          <div className="flex gap-2">
+                            <Button
+                              icon={<CheckCircle2 className="h-4 w-4" strokeWidth={1.9} />}
+                              onClick={async () => {
+                                setSavingAccess(true)
+                                setError(null)
+                                try {
+                                  const onboarding = await onApproveAccessRequest(request.id)
+                                  setIssuedOnboarding(onboarding)
+                                } catch (saveError) {
+                                  setError(saveError instanceof Error ? saveError.message : 'Unable to approve the request.')
+                                } finally {
+                                  setSavingAccess(false)
+                                }
+                              }}
+                            >
+                              Approve
+                            </Button>
+                            <Button
+                              onClick={async () => {
+                                setSavingAccess(true)
+                                setError(null)
+                                try {
+                                  await onRejectAccessRequest(request.id)
+                                } catch (saveError) {
+                                  setError(saveError instanceof Error ? saveError.message : 'Unable to reject the request.')
+                                } finally {
+                                  setSavingAccess(false)
+                                }
+                              }}
+                              tone="danger"
+                            >
+                              Reject
+                            </Button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <EmptyState message="New access requests will appear here after remote collaborators submit them." title="No pending requests" />
+                  )}
+                </div>
+              ) : null}
+              {canEdit && supportsSetupToken ? (
+                <div className="space-y-4 rounded-lg border border-border/80 bg-canvas-raised/60 p-5">
+                  <div className="space-y-1">
+                    <h3 className="text-base font-semibold text-fg">Repo users</h3>
+                    <p className="text-sm leading-6 text-fg-muted">
+                      Promote owners, revoke accounts, or reset setup for approved users who need a fresh onboarding token.
+                    </p>
+                  </div>
+                  {settings.users.length ? (
+                    <div className="space-y-2">
+                      {settings.users.map((user) => (
+                        <div className="space-y-3 rounded-token border border-border/80 bg-panel-subtle px-4 py-3" key={user.id}>
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                              <p className="text-sm font-medium text-fg">{user.name}</p>
+                              <p className="text-xs text-fg-subtle">
+                                {user.email} · {user.username || 'username pending'} · {user.status}
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <Badge tone={user.role === 'owner' ? 'accent' : 'muted'}>{user.role}</Badge>
+                              <Button
+                                icon={<UserCheck className="h-4 w-4" strokeWidth={1.9} />}
+                                onClick={async () => {
+                                  setSavingAccess(true)
+                                  setError(null)
+                                  try {
+                                    await (user.role === 'owner' ? onDemoteUser(user.id) : onPromoteUser(user.id))
+                                  } catch (saveError) {
+                                    setError(saveError instanceof Error ? saveError.message : 'Unable to update the user role.')
+                                  } finally {
+                                    setSavingAccess(false)
+                                  }
+                                }}
+                                tone="muted"
+                              >
+                                {user.role === 'owner' ? 'Demote' : 'Promote'}
+                              </Button>
+                              <Button
+                                icon={<UserCog className="h-4 w-4" strokeWidth={1.9} />}
+                                onClick={async () => {
+                                  setSavingAccess(true)
+                                  setError(null)
+                                  try {
+                                    const onboarding = await onResetUserSetup(user.id)
+                                    setIssuedOnboarding(onboarding)
+                                  } catch (saveError) {
+                                    setError(saveError instanceof Error ? saveError.message : 'Unable to reset setup.')
+                                  } finally {
+                                    setSavingAccess(false)
+                                  }
+                                }}
+                                tone="muted"
+                              >
+                                Reset setup
+                              </Button>
+                              <Button
+                                onClick={async () => {
+                                  setSavingAccess(true)
+                                  setError(null)
+                                  try {
+                                    await onRevokeUser(user.id)
+                                  } catch (saveError) {
+                                    setError(saveError instanceof Error ? saveError.message : 'Unable to revoke the user.')
+                                  } finally {
+                                    setSavingAccess(false)
+                                  }
+                                }}
+                                tone="danger"
+                              >
+                                Revoke
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <EmptyState message="Approved users will appear here once the repo leaves shared-session mode." title="No users yet" />
+                  )}
+                </div>
+              ) : null}
+              {issuedOnboarding ? (
+                <div className="rounded-token border border-success/30 bg-success/10 px-4 py-3 text-sm text-fg">
+                  <p className="font-medium">One-time onboarding token for {issuedOnboarding.email}</p>
+                  <p className="mt-1 break-all font-mono text-xs text-fg-muted">{issuedOnboarding.secret}</p>
+                </div>
+              ) : null}
               <p className="text-sm leading-6 text-fg-muted">
-                Local-only sessions stay frictionless on localhost. Exposed sessions require the temporary credentials printed when the server starts.
+                Local-only sessions stay frictionless on localhost. Exposed sessions either use the startup credentials in shared-session mode or per-user accounts in request-based mode.
               </p>
             </div>
           </Panel>

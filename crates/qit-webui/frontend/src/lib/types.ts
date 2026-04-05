@@ -1,4 +1,9 @@
 export type UiRole = 'owner' | 'user'
+export type AuthMode = 'shared_session' | 'request_based'
+export type AuthMethod = 'request_access' | 'setup_token' | 'basic_auth'
+export type RepoUserRole = 'owner' | 'user'
+export type RepoUserStatus = 'pending_request' | 'approved_pending_setup' | 'active' | 'revoked'
+export type AccessRequestStatus = 'pending' | 'approved' | 'rejected' | 'revoked'
 
 export type PullRequestStatus = 'open' | 'merged' | 'closed'
 
@@ -17,12 +22,16 @@ export type TreeEntryKind = 'tree' | 'blob'
 
 export interface BootstrapResponse {
   actor: UiRole | null
+  principal: AuthenticatedPrincipal | null
   repo_name: string
   worktree: string
   exported_branch: string
   checked_out_branch: string
   description: string
   homepage_url: string
+  auth_mode: AuthMode
+  auth_methods: AuthMethod[]
+  operator_override: boolean
   local_only_owner_mode: boolean
   shared_remote_identity: boolean
   git_credentials_visible: boolean
@@ -47,9 +56,76 @@ export interface RepositorySettings {
 }
 
 export interface SettingsResponse {
+  auth_mode: AuthMode
+  auth_methods: AuthMethod[]
   local_only_owner_mode: boolean
   shared_remote_identity: boolean
+  current_user: AuthenticatedPrincipal | null
+  users: RepoUserView[]
+  access_requests: AccessRequestView[]
+  personal_access_tokens: PatRecordView[]
   repository: RepositorySettings
+}
+
+export interface AuthenticatedPrincipal {
+  user_id: string
+  name: string
+  email: string
+  username: string
+  role: RepoUserRole
+}
+
+export interface RepoUserView {
+  id: string
+  name: string
+  email: string
+  username: string | null
+  role: RepoUserRole
+  status: RepoUserStatus
+  created_at_ms: number
+  approved_at_ms: number | null
+  activated_at_ms: number | null
+  revoked_at_ms: number | null
+}
+
+export interface AccessRequestView {
+  id: string
+  name: string
+  email: string
+  status: AccessRequestStatus
+  created_at_ms: number
+  reviewed_at_ms: number | null
+}
+
+export interface SubmittedAccessRequest {
+  request: AccessRequestView
+  secret: string
+}
+
+export interface AccessRequestProgress {
+  id: string
+  status: AccessRequestStatus
+}
+
+export interface PatRecordView {
+  id: string
+  label: string
+  created_at_ms: number
+  revoked_at_ms: number | null
+}
+
+export interface IssuedOnboarding {
+  user_id: string
+  email: string
+  secret: string
+  expires_at_ms: number
+}
+
+export interface IssuedPat {
+  id: string
+  label: string
+  secret: string
+  created_at_ms: number
 }
 
 export interface BranchInfo {

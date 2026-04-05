@@ -1,10 +1,10 @@
 use super::{
-    cookie_value, LoginAttemptRecord, SessionRecord, WebUiServer, LOGIN_FAILURE_LIMIT,
-    LOGIN_LOCKOUT_MS, LOGIN_WINDOW_MS,
+    cookie_value, LoginAttemptRecord, ResolvedSession, SessionRecord, WebUiServer,
+    LOGIN_FAILURE_LIMIT, LOGIN_LOCKOUT_MS, LOGIN_WINDOW_MS,
 };
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
-use qit_domain::UiRole;
+use qit_domain::{AuthMethod, UiRole};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 impl WebUiServer {
@@ -37,16 +37,20 @@ impl WebUiServer {
             .unwrap_or(0)
     }
 
-    pub(super) fn default_actor(&self, headers: &HeaderMap) -> Option<UiRole> {
-        (self.implicit_owner_mode && host_is_loopback(headers)).then_some(UiRole::Owner)
+    pub(super) fn default_session(&self, headers: &HeaderMap) -> Option<ResolvedSession> {
+        (self.implicit_owner_mode && host_is_loopback(headers)).then_some(ResolvedSession {
+            actor: UiRole::Owner,
+            principal: None,
+            operator_override: true,
+        })
     }
 
-    pub(super) async fn current_actor(
+    pub(super) async fn current_session(
         &self,
         headers: &HeaderMap,
-    ) -> Result<Option<UiRole>, axum::http::StatusCode> {
-        if let Some(actor) = self.default_actor(headers) {
-            return Ok(Some(actor));
+    ) -> Result<Option<ResolvedSession>, axum::http::StatusCode> {
+        if let Some(session) = self.default_session(headers) {
+            return Ok(Some(session));
         }
         let Some(token) = cookie_value(headers, Self::cookie_name()) else {
             return Ok(None);
@@ -54,16 +58,49 @@ impl WebUiServer {
         let now_ms = Self::now_ms();
         let mut sessions = self.sessions.write().await;
         sessions.retain(|_, session: &mut SessionRecord| session.expires_at_ms > now_ms);
-        Ok(sessions.get(token).map(|session| session.role.clone()))
+        let Some(session) = sessions.get(token).cloned() else {
+            return Ok(None);
+        };
+        if let Some(user_id) = session.user_id {
+            match self.workspace_service.resolve_active_principal(
+                self.workspace.worktree.clone(),
+                &self.workspace.exported_branch,
+                &user_id,
+            ) {
+                Ok((_workspace, principal)) => {
+                    return Ok(Some(ResolvedSession {
+                        actor: principal.ui_role(),
+                        principal: Some(principal),
+                        operator_override: false,
+                    }))
+                }
+                Err(_) => {
+                    sessions.remove(token);
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(ResolvedSession {
+            actor: session.role,
+            principal: None,
+            operator_override: false,
+        }))
+    }
+
+    pub(super) async fn require_session(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<ResolvedSession, axum::http::StatusCode> {
+        self.current_session(headers)
+            .await?
+            .ok_or(axum::http::StatusCode::UNAUTHORIZED)
     }
 
     pub(super) async fn require_actor(
         &self,
         headers: &HeaderMap,
     ) -> Result<UiRole, axum::http::StatusCode> {
-        self.current_actor(headers)
-            .await?
-            .ok_or(axum::http::StatusCode::UNAUTHORIZED)
+        Ok(self.require_session(headers).await?.actor)
     }
 
     pub(super) async fn require_owner(
@@ -76,8 +113,13 @@ impl WebUiServer {
         }
     }
 
-    pub(super) fn can_view_git_credentials(&self, actor: Option<&UiRole>) -> bool {
-        matches!(actor, Some(UiRole::Owner))
+    pub(super) fn can_view_git_credentials(
+        &self,
+        session: Option<&ResolvedSession>,
+        auth_methods: &[AuthMethod],
+    ) -> bool {
+        auth_methods.contains(&AuthMethod::BasicAuth)
+            && matches!(session, Some(ResolvedSession { operator_override: true, .. }))
     }
 
     fn login_attempt_key(headers: &HeaderMap) -> String {
