@@ -237,13 +237,14 @@ jobs:
 
           cd homebrew-tap
 
-          if git diff --quiet -- Formula/qit.rb; then
+          git add Formula/qit.rb
+
+          if git diff --cached --quiet; then
             echo "Homebrew formula already matches v${VERSION}."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/qit.rb
           git commit -m "Update qit formula to v${VERSION}"
           git push
