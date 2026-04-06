@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
-import { releasesUrl, repoUrl } from '../../lib/content'
+import { repoUrl } from '../../lib/content'
 import { docsBySection, getAdjacentDocs, type DocEntry } from '../../lib/docs'
+import { getPrimaryInstallCta } from '../../lib/install'
 import { mdxComponents } from '../../lib/mdxComponents'
 import { classNames } from '../../lib/classNames'
 import { SiteLink } from '../../lib/siteLinks'
@@ -64,6 +65,7 @@ export function DocsPage({
 }: {
   doc: DocEntry
 }) {
+  const installCta = getPrimaryInstallCta()
   const { next, previous } = getAdjacentDocs(doc.slug)
   const DocContent = doc.Component
   const articleRef = useRef<HTMLElement | null>(null)
@@ -159,7 +161,8 @@ export function DocsPage({
     <LandingShell
       brandHref="/"
       className="pb-0"
-      ctaHref={releasesUrl}
+      ctaHref={installCta.href}
+      ctaLabel={installCta.label}
       contentSpacingClass="space-y-0"
       headerClassName="mb-5"
       navItems={docsNavItems}
@@ -326,10 +329,13 @@ function DocPagerCard({
 }
 
 export function DocsEmptyState() {
+  const installCta = getPrimaryInstallCta()
+
   return (
     <LandingShell
       brandHref="/"
-      ctaHref={releasesUrl}
+      ctaHref={installCta.href}
+      ctaLabel={installCta.label}
       contentSpacingClass="space-y-0"
       headerClassName="mb-5"
       navItems={docsNavItems}

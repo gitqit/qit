@@ -6,8 +6,12 @@ import type { FaqContent, FeatureContent, FooterLinks, HeroContent, PreviewConte
 
 export function LandingHero({
   content,
+  primaryCtaHref = content.primaryCta.href,
+  primaryCtaLabel = content.primaryCta.label,
 }: {
   content: HeroContent
+  primaryCtaHref?: string
+  primaryCtaLabel?: string
 }) {
   return (
     <section className="grid gap-8 lg:grid-cols-[1.05fr_0.95fr] lg:items-center">
@@ -19,8 +23,8 @@ export function LandingHero({
           <p className="max-w-2xl text-sm leading-6 text-ink-subtle">{content.supportingNote}</p>
         </div>
         <HeroActions
-          primaryHref={content.primaryCta.href}
-          primaryLabel={content.primaryCta.label}
+          primaryHref={primaryCtaHref}
+          primaryLabel={primaryCtaLabel}
           secondaryHref={content.secondaryCta.href}
           secondaryLabel={content.secondaryCta.label}
         />

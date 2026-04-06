@@ -6,9 +6,9 @@ export const heroContent = {
   eyebrow: 'Qit',
   title: 'Quick Git for normal folders.',
   description:
-    'Download a release, point it at any folder, and share it over authenticated Git Smart HTTP without dropping `.git` into the working tree.',
+    'Install Qit, point it at any folder, and share it over authenticated Git Smart HTTP without dropping `.git` into the working tree.',
   supportingNote:
-    'Release binaries are the default path. If you would rather build from source, the quick start still documents that flow.',
+    'Use Homebrew on macOS or Linux, grab a release binary on other platforms, or build from source if you prefer.',
   primaryCta: {
     href: releasesUrl,
     label: 'Download binaries',

@@ -5,6 +5,7 @@ import {
   heroContent,
   previewContent,
 } from '../../lib/content'
+import { getPrimaryInstallCta } from '../../lib/install'
 import {
   FaqSection,
   FeatureGrid,
@@ -15,9 +16,12 @@ import {
 import { LandingShell } from '../templates/LandingShell'
 
 export function LandingPage() {
+  const installCta = getPrimaryInstallCta()
+
   return (
     <LandingShell
-      ctaHref={heroContent.primaryCta.href}
+      ctaHref={installCta.href}
+      ctaLabel={installCta.label}
       navItems={[
         { href: '#features', label: 'Features' },
         { href: '#preview', label: 'Preview' },
@@ -25,7 +29,7 @@ export function LandingPage() {
         { href: '/docs/install', label: 'Docs' },
       ]}
     >
-      <LandingHero content={heroContent} />
+      <LandingHero content={heroContent} primaryCtaHref={installCta.href} primaryCtaLabel={installCta.label} />
       <FeatureGrid content={featureContent} />
       <PreviewStrip content={previewContent} />
       <FaqSection content={faqContent} />

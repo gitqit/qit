@@ -1,4 +1,5 @@
-import { releasesUrl, repoUrl } from '../../lib/content'
+import { repoUrl } from '../../lib/content'
+import { getPrimaryInstallCta } from '../../lib/install'
 import { ButtonLink, SectionEyebrow, Surface } from '../atoms/primitives'
 import { LandingShell } from '../templates/LandingShell'
 
@@ -15,10 +16,13 @@ export function NotFoundPage({
   title?: string
   description?: string
 }) {
+  const installCta = getPrimaryInstallCta()
+
   return (
     <LandingShell
       brandHref="/"
-      ctaHref={releasesUrl}
+      ctaHref={installCta.href}
+      ctaLabel={installCta.label}
       contentSpacingClass="space-y-0"
       headerClassName="mb-5"
       navItems={navItems}
