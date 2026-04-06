@@ -42,15 +42,21 @@ fn qit_binary_path() -> Result<PathBuf> {
 
     let root = workspace_root();
     let bin_name = if cfg!(windows) { "qit.exe" } else { "qit" };
-    let bin = root.join("target").join("debug").join(bin_name);
-    let status = Command::new("cargo")
+    let profile = if cfg!(windows) { "release" } else { "debug" };
+    let bin = root.join("target").join(profile).join(bin_name);
+    let mut command = Command::new("cargo");
+    command
         .arg("build")
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
         .arg("-p")
-        .arg("qit")
-        .status()
-        .context("build qit binary")?;
+        .arg("qit");
+    if cfg!(windows) {
+        // Windows CI was overflowing the debug binary's main-thread stack in subprocess-based e2e tests.
+        // Use the optimized binary there while keeping faster debug builds on other platforms.
+        command.arg("--release");
+    }
+    let status = command.status().context("build qit binary")?;
     if !status.success() {
         bail!("failed to build qit binary");
     }
