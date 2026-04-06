@@ -119,7 +119,13 @@ impl WebUiServer {
         auth_methods: &[AuthMethod],
     ) -> bool {
         auth_methods.contains(&AuthMethod::BasicAuth)
-            && matches!(session, Some(ResolvedSession { operator_override: true, .. }))
+            && matches!(
+                session,
+                Some(ResolvedSession {
+                    operator_override: true,
+                    ..
+                })
+            )
     }
 
     fn login_attempt_key(&self, headers: &HeaderMap) -> String {

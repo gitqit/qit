@@ -1,0 +1,128 @@
+---
+title: Web UI Reference
+description: A complete guide to the features and navigation of the Qit Web interface.
+slug: /reference/web-ui
+section: Reference
+sidebar_label: Web UI reference
+sidebar_position: 52
+---
+
+# Web UI Reference
+
+The Qit Web UI is the browser surface for browsing, reviewing, and administering a served workspace. It is served on the same origin as the Git remote and reads the same workspace state.
+
+The screenshots on this page come from a local owner session against the `Nebula Vault` example repository.
+
+## Navigation Tabs
+
+The interface is organized into several primary tabs:
+
+### 1. Code
+
+Browse the current state of the host folder or any sidecar branch.
+
+- **File Tree**: Navigate the repository-relative directory structure.
+- **File Viewer**: Open files and inspect raw text content.
+- **README Rendering**: Render a folder `README.md` inline when one is present.
+- **Clone Menu**: Quickly copy the clone URL, credentials (if visible), and ready-to-use `git clone` commands.
+
+![Code tab showing the repository tree and rendered README](/web-ui-code-tab.png)
+
+The code view combines file browsing with rendered documentation, so a repository root or subfolder can act like a lightweight landing page instead of a dead file list.
+
+### 2. Commits
+
+View the history of the sidecar repository.
+
+- **Commit List**: A reverse-chronological list of commits.
+- **Commit Detail**: Open a commit to inspect its author, message, and changed files.
+- **Snapshot Browser**: Browse the entire file tree as it existed at any point in history.
+
+![Commits tab showing the sidecar history timeline](/web-ui-commits-tab.png)
+
+The commits view is centered on published workspace history, not local uncommitted host-folder edits. It is the fastest place to answer "what has been snapshotted so far?"
+
+### 3. Branches
+
+Manage the branches in your sidecar repository.
+
+- **Branch List**: See all local sidecar branches.
+- **Create Branch**: Create a new branch from any existing ref.
+- **Checkout/Switch**: Change which branch is materialized in the host folder or which branch is served to new clones.
+- **Delete Branch**: Remove sidecar branches (with safety checks for unmerged work).
+
+![Branches tab showing checked-out and served branch state](/web-ui-branches-tab.png)
+
+The branches view keeps Qit's two branch concepts visible at once: what is currently materialized in the host folder and what the session is serving to collaborators.
+
+### 4. Issues
+
+Track tasks and bugs directly on the workspace.
+
+- **Issue List**: Filter by open/closed state.
+- **Issue Detail**: View the discussion timeline, labels, assignees, and milestones.
+- **Markdown Support**: Full markdown support for descriptions and comments.
+- **Linking**: Link issues to Pull Requests to track resolution.
+
+![Issue detail view with discussion, metadata, and linked pull requests](/web-ui-issues-tab.png)
+
+Issue detail brings the conversation, metadata, and linked pull requests together so the operator does not have to hop between separate admin screens to understand the state of a task.
+
+### 5. Pull Requests
+
+The core of the Qit review workflow.
+
+- **PR List**: View open and historical pull requests.
+- **PR Detail**: A unified view of the discussion, file diffs, and review status.
+- **Reviews**: Submit "Approve", "Request Changes", or "Comment" reviews.
+- **Merge**: Fast-forward the target branch with the PR's changes (enforces branch rules).
+
+![Pull request detail view with review summary and commit range](/web-ui-pull-requests-tab.png)
+
+The pull-request view is where Qit's sidecar review model becomes concrete: branch comparison, linked issues, review state, activity, and diffs all sit on one screen before anything is applied back to the host folder.
+
+### 6. Settings
+
+Administrative controls for the workspace (Owner only).
+
+- **Repository Metadata**: Edit the description and homepage URL.
+- **Branch Rules**: Configure protections like required PRs, approval counts, and push restrictions.
+- **Auth Management**: Switch between `shared-session` and `request-based` modes.
+- **User Management**: Approve access requests, promote/demote users, and revoke accounts.
+
+![Settings tab showing repository profile controls](/web-ui-settings-tab.png)
+
+The settings area follows a GitHub-style structure. General settings handle repository identity, while the branch and access sections group the workflow and auth controls separately.
+
+## User Settings
+
+Accessed from the session menu in the top right.
+
+- **Display Name**: Set your preferred name for comments and reviews (persisted in `localStorage`).
+- **Personal Access Tokens**: Generate and revoke PATs for headless Git access.
+
+![User settings view showing the account-scoped PAT area](/web-ui-user-settings-tab.png)
+
+User settings are intentionally separate from repository settings. They focus on the current browser session and, when a real repo account is signed in, become the home for personal access token management.
+
+## Authentication States
+
+### Localhost Bypass
+When accessing the Web UI via `localhost`, `127.0.0.1`, or `::1`, Qit grants implicit **Owner** access. This allows you to manage the workspace without needing to sign in.
+
+### Remote Authentication
+
+When accessing via a public or LAN URL, you must sign in:
+
+- **Shared Session**: Use the generated username and password from the terminal.
+- **Request-Based**: Use your durable username and password.
+
+![Remote login screen shown on a non-local host](/web-ui-auth-login.png)
+
+Remote access deliberately differs from localhost. The login screen is the clearest visual proof that Qit keys the owner bypass off the request host, not merely off the fact that the browser is on the same machine.
+
+## Related Pages
+
+- [The Sidecar Model](/docs/concepts/sidecar-model)
+- [Managing Authentication](/docs/guides/managing-authentication)
+- [Configuring Branch Protection Rules](/docs/guides/branch-protection)

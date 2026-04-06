@@ -197,9 +197,9 @@ export function AppShell({
             <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
               <div className="space-y-2">
                 <h1 className="text-4xl font-semibold tracking-tight text-fg sm:text-5xl">{repoName}</h1>
-                <p className="max-w-2xl text-sm leading-6 text-fg-muted sm:text-base">
-                  {repoDescription || 'Browse the published snapshot, inspect branch and pull-request state, and hand off the served clone details when collaborators need them.'}
-                </p>
+                {repoDescription ? (
+                  <p className="max-w-2xl text-sm leading-6 text-fg-muted sm:text-base">{repoDescription}</p>
+                ) : null}
                 <div className="flex flex-wrap items-center gap-2 text-sm text-fg-muted">
                   <span>{branchCount} branches</span>
                   <span className="text-fg-subtle">•</span>
@@ -228,7 +228,7 @@ export function AppShell({
         </div>
       </header>
 
-      <main className="mx-auto max-w-7xl px-5 py-6 sm:px-6 sm:py-8" id="qit-main">
+      <main className="mx-auto max-w-7xl px-5 pt-3 pb-6 sm:px-6 sm:pt-4 sm:pb-8" id="qit-main">
         <TabGroup
           onChange={(index) => {
             const nextTab = tabs[index]

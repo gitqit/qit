@@ -18,8 +18,11 @@ import {
 import { api } from '../../../lib/api'
 import { usePersistentDisplayName } from '../../../lib/usePersistentDisplayName'
 import type {
+  IssueLinkRelation,
+  IssueLinkSource,
   PullRequestActivity,
   PullRequestDetailResponse,
+  PullRequestLinkedIssueView,
   PullRequestRecord,
   PullRequestReviewState,
   PullRequestStatus,
@@ -27,6 +30,7 @@ import type {
   UiRole,
 } from '../../../lib/types'
 import { Badge, Button, EmptyState, Panel, Spinner } from '../../atoms/Controls'
+import { MarkdownSurface } from '../MarkdownSurface'
 import { shortSha } from './panelUtils'
 
 const MonacoDiffSurface = lazy(async () => {
@@ -85,6 +89,27 @@ function reviewLabel(state: PullRequestReviewState) {
     : state === 'approved'
       ? 'Approved'
       : 'Commented'
+}
+
+function linkRelationLabel(relation: IssueLinkRelation) {
+  return relation === 'closing' ? 'Closes' : 'Related'
+}
+
+function linkSourceLabel(source: IssueLinkSource) {
+  switch (source) {
+    case 'manual':
+      return 'Manual'
+    case 'issue_description':
+      return 'Issue body'
+    case 'issue_comment':
+      return 'Issue comment'
+    case 'pull_request_description':
+      return 'PR body'
+    case 'pull_request_comment':
+      return 'PR comment'
+    case 'pull_request_review':
+      return 'PR review'
+  }
 }
 
 function activityLabel(activity: PullRequestActivity) {
@@ -384,7 +409,16 @@ function PullRequestDetail({
     )
   }
 
-  const { pull_request: pullRequest, comparison, diffs, comments, reviews, review_summary: reviewSummary, activity } = detail
+  const {
+    pull_request: pullRequest,
+    comparison,
+    diffs,
+    linked_issues: linkedIssues,
+    comments,
+    reviews,
+    review_summary: reviewSummary,
+    activity,
+  } = detail
   const isBusy = pendingAction !== null
   const reversedActivity = [...activity].reverse()
 
@@ -468,13 +502,13 @@ function PullRequestDetail({
                   </div>
                 </div>
               ) : pullRequest.description ? (
-                <p className="max-w-4xl text-sm leading-7 text-fg-muted">{pullRequest.description}</p>
+                <MarkdownSurface source={pullRequest.description} />
               ) : (
                 <p className="text-sm text-fg-subtle">No description was added to this pull request.</p>
               )}
             </div>
           ) : pullRequest.description ? (
-            <p className="max-w-4xl text-sm leading-7 text-fg-muted">{pullRequest.description}</p>
+            <MarkdownSurface source={pullRequest.description} />
           ) : (
             <p className="text-sm text-fg-subtle">No description was added to this pull request.</p>
           )}
@@ -496,6 +530,36 @@ function PullRequestDetail({
               <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-fg-subtle">Behind</p>
               <p className="mt-1 text-lg font-semibold text-fg">{comparison?.behind_by ?? 0}</p>
             </div>
+          </div>
+
+          <div className="space-y-3 rounded-token border border-border bg-panel-subtle px-4 py-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-sm font-semibold text-fg">Linked issues</p>
+              <Badge tone="muted">{linkedIssues.length}</Badge>
+            </div>
+            {linkedIssues.length === 0 ? (
+              <p className="text-sm text-fg-subtle">No linked issues yet.</p>
+            ) : (
+              <div className="space-y-2">
+                {linkedIssues.map((linked: PullRequestLinkedIssueView) => (
+                  <div
+                    className="rounded-token border border-border bg-panel px-3.5 py-3"
+                    key={`${linked.issue.id}-${linked.source}-${linked.relation}`}
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="font-medium text-fg">#{linked.issue.number} {linked.issue.title}</p>
+                      <Badge tone={linked.issue.status === 'open' ? 'accent' : 'muted'}>
+                        {linked.issue.status}
+                      </Badge>
+                      <Badge tone={linked.relation === 'closing' ? 'accent' : 'muted'}>
+                        {linkRelationLabel(linked.relation)}
+                      </Badge>
+                      <Badge tone="muted">{linkSourceLabel(linked.source)}</Badge>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
@@ -710,7 +774,9 @@ function PullRequestDetail({
                         {comment.actor_role === 'owner' ? 'Owner' : 'Viewer'}
                       </Badge>
                     </div>
-                    <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-fg-muted">{comment.body}</p>
+                    <div className="mt-2">
+                      <MarkdownSurface source={comment.body} />
+                    </div>
                     <p className="mt-3 text-xs text-fg-subtle">
                       {formatRelativeTime(comment.created_at_ms)} · {formatDate(comment.created_at_ms)}
                     </p>
@@ -739,7 +805,9 @@ function PullRequestDetail({
                         <Badge tone={reviewTone(review.state)}>{reviewLabel(review.state)}</Badge>
                       </div>
                       {review.body ? (
-                        <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-fg-muted">{review.body}</p>
+                        <div className="mt-2">
+                          <MarkdownSurface source={review.body} />
+                        </div>
                       ) : (
                         <p className="mt-2 text-sm text-fg-subtle">No review body provided.</p>
                       )}
@@ -772,7 +840,9 @@ function PullRequestDetail({
                 </div>
                 <p className="mt-2 text-sm text-fg-muted">{activityLabel(entry)}</p>
                 {entry.body ? (
-                  <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-fg-muted">{entry.body}</p>
+                  <div className="mt-2">
+                    <MarkdownSurface source={entry.body} />
+                  </div>
                 ) : null}
                 {entry.kind === 'edited' && (entry.title || entry.description) ? (
                   <div className="mt-2 rounded-token border border-border bg-panel px-3 py-3 text-sm text-fg-muted">

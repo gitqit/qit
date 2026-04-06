@@ -144,6 +144,7 @@ pub async fn ensure_supervisor(
         .arg(match transport {
             PublicTransport::Ngrok => "ngrok",
             PublicTransport::Tailscale => "tailscale",
+            PublicTransport::Lan => "lan",
             PublicTransport::Local => "local",
         })
         .stdout(Stdio::null())
@@ -180,7 +181,10 @@ pub async fn claim_mount_path(
         .await
         .context("claim route from qit supervisor")?;
     if !response.status().is_success() {
-        bail!("qit supervisor route claim failed with {}", response.status());
+        bail!(
+            "qit supervisor route claim failed with {}",
+            response.status()
+        );
     }
     let payload: ClaimRouteResponse = response
         .json()
@@ -211,7 +215,10 @@ pub async fn register_route(
         .await
         .context("register route with qit supervisor")?;
     if !response.status().is_success() {
-        bail!("qit supervisor route registration failed with {}", response.status());
+        bail!(
+            "qit supervisor route registration failed with {}",
+            response.status()
+        );
     }
     Ok(())
 }
@@ -227,7 +234,10 @@ pub async fn heartbeat_route(entrypoint: &SharedEntrypoint, lease: &RouteLease) 
         .await
         .context("heartbeat qit supervisor route")?;
     if !response.status().is_success() {
-        bail!("qit supervisor route heartbeat failed with {}", response.status());
+        bail!(
+            "qit supervisor route heartbeat failed with {}",
+            response.status()
+        );
     }
     Ok(())
 }
@@ -243,7 +253,10 @@ pub async fn unregister_route(entrypoint: &SharedEntrypoint, lease: &RouteLease)
         .await
         .context("unregister route from qit supervisor")?;
     if !response.status().is_success() {
-        bail!("qit supervisor route unregister failed with {}", response.status());
+        bail!(
+            "qit supervisor route unregister failed with {}",
+            response.status()
+        );
     }
     Ok(())
 }
@@ -256,9 +269,10 @@ pub async fn run_internal_supervisor(
     std::fs::create_dir_all(&data_root)
         .with_context(|| format!("create qit data directory {}", data_root.display()))?;
 
-    let edge_listener = TcpListener::bind(("127.0.0.1", port))
+    let edge_bind_host = supervisor_edge_bind_host(transport);
+    let edge_listener = TcpListener::bind((edge_bind_host, port))
         .await
-        .with_context(|| format!("bind qit supervisor edge listener on 127.0.0.1:{port}"))?;
+        .with_context(|| format!("bind qit supervisor edge listener on {edge_bind_host}:{port}"))?;
     let edge_local_url =
         Url::parse(&format!("http://127.0.0.1:{port}/")).context("build supervisor edge URL")?;
     let endpoint = expose(transport, &edge_local_url).await?;
@@ -276,7 +290,11 @@ pub async fn run_internal_supervisor(
     let discovery = SupervisorDiscovery {
         label: endpoint.label.to_string(),
         local_base_url: edge_local_url.as_str().trim_end_matches('/').to_string(),
-        public_base_url: endpoint.public_url.as_str().trim_end_matches('/').to_string(),
+        public_base_url: endpoint
+            .public_url
+            .as_str()
+            .trim_end_matches('/')
+            .to_string(),
         control_url: control_url.as_str().trim_end_matches('/').to_string(),
         pid: std::process::id(),
     };
@@ -293,9 +311,18 @@ pub async fn run_internal_supervisor(
     let control_app = Router::new()
         .route(&format!("{CONTROL_PREFIX}/health"), get(health))
         .route(&format!("{CONTROL_PREFIX}/claim-route"), post(claim_route))
-        .route(&format!("{CONTROL_PREFIX}/register-route"), post(register_route_handler))
-        .route(&format!("{CONTROL_PREFIX}/heartbeat-route"), post(heartbeat_route_handler))
-        .route(&format!("{CONTROL_PREFIX}/unregister-route"), post(unregister_route_handler))
+        .route(
+            &format!("{CONTROL_PREFIX}/register-route"),
+            post(register_route_handler),
+        )
+        .route(
+            &format!("{CONTROL_PREFIX}/heartbeat-route"),
+            post(heartbeat_route_handler),
+        )
+        .route(
+            &format!("{CONTROL_PREFIX}/unregister-route"),
+            post(unregister_route_handler),
+        )
         .with_state(state.clone());
     let edge_app = Router::new()
         .route("/", get(index))
@@ -325,9 +352,9 @@ pub async fn run_internal_supervisor(
             let now_ms = now_ms();
             let should_shutdown = {
                 let mut routes = janitor_state.routes.write().await;
-                routes.active_routes.retain(|_, route| {
-                    now_ms.saturating_sub(route.last_seen_ms) <= ROUTE_LEASE_MS
-                });
+                routes
+                    .active_routes
+                    .retain(|_, route| now_ms.saturating_sub(route.last_seen_ms) <= ROUTE_LEASE_MS);
                 if routes.active_routes.is_empty() {
                     let idle_started_at = routes.idle_started_at_ms.get_or_insert(now_ms);
                     now_ms.saturating_sub(*idle_started_at) >= IDLE_SHUTDOWN_MS
@@ -350,14 +377,19 @@ pub async fn run_internal_supervisor(
         }
     });
 
-    let control_result = control_task.await.context("join qit supervisor control task")??;
+    let control_result = control_task
+        .await
+        .context("join qit supervisor control task")??;
     let edge_result = edge_task.await.context("join qit supervisor edge task")??;
     let _ = control_result;
     let _ = edge_result;
     let _ = janitor.await;
     let _ = ctrlc.await;
     remove_discovery_file_if_owned(&data_root, discovery.pid);
-    endpoint.shutdown().await.context("shutdown supervisor public endpoint")?;
+    endpoint
+        .shutdown()
+        .await
+        .context("shutdown supervisor public endpoint")?;
     Ok(())
 }
 
@@ -373,9 +405,14 @@ async fn claim_route(
         return Err(StatusCode::BAD_REQUEST);
     }
     let mut routes = state.routes.write().await;
-    let mount_path = allocate_mount_path(&mut routes, &request.workspace_id, &request.preferred_repo_name)
+    let mount_path = allocate_mount_path(
+        &mut routes,
+        &request.workspace_id,
+        &request.preferred_repo_name,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    persist_assignments(&state.data_root, &routes)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    persist_assignments(&state.data_root, &routes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(ClaimRouteResponse {
         mount_path,
         label: state.discovery.label.clone(),
@@ -440,11 +477,7 @@ async fn unregister_route_handler(
 
 async fn index(State(state): State<SupervisorState>) -> Html<String> {
     let routes = state.routes.read().await;
-    let mut items = routes
-        .active_routes
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut items = routes.active_routes.values().cloned().collect::<Vec<_>>();
     items.sort_by(|left, right| left.mount_path.cmp(&right.mount_path));
     let entries = items
         .into_iter()
@@ -518,7 +551,9 @@ fn match_route(routes: &RouteRegistry, path: &str) -> Option<ActiveRoute> {
     routes
         .active_routes
         .values()
-        .filter(|route| path == route.mount_path || path.starts_with(&format!("{}/", route.mount_path)))
+        .filter(|route| {
+            path == route.mount_path || path.starts_with(&format!("{}/", route.mount_path))
+        })
         .max_by_key(|route| route.mount_path.len())
         .cloned()
 }
@@ -565,9 +600,12 @@ fn allocate_mount_path(
 }
 
 fn mount_in_use_by_other(routes: &RouteRegistry, mount_path: &str, workspace_id: &str) -> bool {
-    routes.assignments.iter().any(|(assigned_workspace, assigned_mount)| {
-        assigned_mount == mount_path && assigned_workspace != workspace_id
-    })
+    routes
+        .assignments
+        .iter()
+        .any(|(assigned_workspace, assigned_mount)| {
+            assigned_mount == mount_path && assigned_workspace != workspace_id
+        })
 }
 
 fn load_assignments(data_root: &Path) -> Result<RouteRegistry> {
@@ -610,8 +648,7 @@ fn write_json_file<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
     let temp_path = path.with_extension("tmp");
     std::fs::write(&temp_path, encoded)
         .with_context(|| format!("write {}", temp_path.display()))?;
-    std::fs::rename(&temp_path, &path)
-        .with_context(|| format!("replace {}", path.display()))?;
+    std::fs::rename(&temp_path, &path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
 }
 
@@ -635,8 +672,8 @@ async fn load_healthy_discovery(data_root: &Path) -> Result<Option<SharedEntrypo
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(anyhow!(error).context(format!("read {}", path.display()))),
     };
-    let discovery: SupervisorDiscovery = serde_json::from_slice(&payload)
-        .with_context(|| format!("decode {}", path.display()))?;
+    let discovery: SupervisorDiscovery =
+        serde_json::from_slice(&payload).with_context(|| format!("decode {}", path.display()))?;
     let entrypoint = parse_discovery(discovery)?;
     let response = reqwest::Client::new()
         .get(control_url(&entrypoint.control_url, "/health")?)
@@ -654,8 +691,10 @@ async fn load_healthy_discovery(data_root: &Path) -> Result<Option<SharedEntrypo
 fn parse_discovery(discovery: SupervisorDiscovery) -> Result<SharedEntrypoint> {
     Ok(SharedEntrypoint {
         label: discovery.label,
-        local_base_url: Url::parse(&discovery.local_base_url).context("parse supervisor local URL")?,
-        public_base_url: Url::parse(&discovery.public_base_url).context("parse supervisor public URL")?,
+        local_base_url: Url::parse(&discovery.local_base_url)
+            .context("parse supervisor local URL")?,
+        public_base_url: Url::parse(&discovery.public_base_url)
+            .context("parse supervisor public URL")?,
         control_url: Url::parse(&discovery.control_url).context("parse supervisor control URL")?,
     })
 }
@@ -699,9 +738,17 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn supervisor_edge_bind_host(transport: PublicTransport) -> &'static str {
+    match transport {
+        PublicTransport::Lan => "0.0.0.0",
+        _ => "127.0.0.1",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{allocate_mount_path, RouteRegistry};
+    use super::{allocate_mount_path, supervisor_edge_bind_host, RouteRegistry};
+    use qit_transports::PublicTransport;
 
     #[test]
     fn mount_paths_reuse_saved_assignment() {
@@ -719,5 +766,14 @@ mod tests {
         let second = allocate_mount_path(&mut routes, "ccccdddd-2222", "repo").unwrap();
         assert_eq!(first, "/repo");
         assert_eq!(second, "/repo-ccccdddd");
+    }
+
+    #[test]
+    fn lan_supervisor_binds_on_all_interfaces() {
+        assert_eq!(supervisor_edge_bind_host(PublicTransport::Lan), "0.0.0.0");
+        assert_eq!(
+            supervisor_edge_bind_host(PublicTransport::Local),
+            "127.0.0.1"
+        );
     }
 }

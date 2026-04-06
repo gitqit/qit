@@ -545,7 +545,7 @@ export function SettingsPanel({
                   <div className="space-y-1">
                     <h3 className="text-base font-semibold text-fg">Pending requests</h3>
                     <p className="text-sm leading-6 text-fg-muted">
-                      Approving a request issues a one-time setup code. Share it immediately because it will not be shown again.
+                      Approving a request lets the requester finish sign-in automatically in the same browser. Use “Issue setup code” below only when onboarding someone out-of-band.
                     </p>
                   </div>
                   {settings.access_requests.length ? (
@@ -730,7 +730,7 @@ export function SettingsPanel({
                   )}
                 </div>
               ) : null}
-              {issuedOnboarding ? (
+              {issuedOnboarding && issuedOnboarding.secret ? (
                 <div className="rounded-token border border-success/30 bg-success/10 px-4 py-3 text-sm text-fg">
                   <p className="font-medium">One-time setup code for {issuedOnboarding.email}</p>
                   <p className="mt-1 break-all font-mono text-xs text-fg-muted">{issuedOnboarding.secret}</p>

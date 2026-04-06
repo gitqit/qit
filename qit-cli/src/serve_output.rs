@@ -1,13 +1,21 @@
 use anyhow::{anyhow, Context, Result};
 use qit_domain::{AuthMethod, SessionCredentials};
 use qit_transports::PublicTransport;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use url::Url;
 
 pub fn say(message: &str) {
     println!("{message}");
     let _ = std::io::stdout().flush();
+}
+
+fn section_heading(label: &str) -> String {
+    if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+        format!("\x1b[32m{label}\x1b[0m")
+    } else {
+        label.to_string()
+    }
 }
 
 pub fn repo_name_from_worktree(worktree: &Path) -> String {
@@ -93,9 +101,11 @@ pub fn print_serve_summary(
     reveal_password: bool,
     clone_cmd: &str,
     auto_apply: bool,
+    _vite_dev_api_origin: &str,
+    _repo_mount_path: &str,
 ) {
     println!();
-    println!("Serving");
+    println!("{}", section_heading("Serving"));
     println!("  path: {}", worktree.display());
     println!("  branch: {exported_branch}");
     let auth_labels = auth_methods
@@ -109,18 +119,21 @@ pub fn print_serve_summary(
         println!("  auto-apply: on");
     }
     println!();
-    println!("Web UI");
-    println!("  local: {}", local_browser_url.as_str().trim_end_matches('/'));
+    println!("{}", section_heading("Web UI"));
+    println!(
+        "  local: {}",
+        local_browser_url.as_str().trim_end_matches('/')
+    );
     if local_browser_url != browser_url {
         println!("  public: {}", browser_url.as_str().trim_end_matches('/'));
     }
     println!();
-    println!("Git");
+    println!("{}", section_heading("Git"));
     println!("  repo: {}/", public_url.as_str().trim_end_matches('/'));
     println!("  clone: {clone_cmd}");
     println!();
     if auth_methods.contains(&AuthMethod::BasicAuth) {
-        println!("Session");
+        println!("{}", section_heading("Session"));
         println!("  username: {}", credentials.username);
         if reveal_password {
             println!("  password: {}", credentials.password);
@@ -131,7 +144,7 @@ pub fn print_serve_summary(
             println!("  file: {}", credentials_path.display());
         }
     } else {
-        println!("Accounts");
+        println!("{}", section_heading("Accounts"));
         println!("  shared basic auth is disabled");
         println!("  remote users authenticate with per-user credentials");
     }

@@ -1,0 +1,66 @@
+---
+title: Automating Qit with Personal Access Tokens (PATs)
+description: Create and use Personal Access Tokens for secure, headless Git access in request-based auth mode.
+slug: /guides/personal-access-tokens
+---
+
+# Automating Qit with Personal Access Tokens (PATs)
+
+Personal Access Tokens (PATs) are the recommended way to authenticate Git operations when your workspace is in `request-based` mode. They are more secure than using your account password and can be easily revoked.
+
+## Why use PATs?
+
+- **Headless Access**: Perfect for CI/CD, scripts, and automation where interactive login is impossible.
+- **Security**: You don't have to store your main account password in cleartext in Git configs or scripts.
+- **Revocation**: You can revoke a single PAT without changing your account password.
+
+## Creating a PAT
+
+PAT creation is a self-service action in the Web UI:
+
+1. Log in to the Qit Web UI with your durable account.
+2. Click on your username/email in the top right to open the **User Menu**.
+3. Select **User Settings**.
+4. Find the **Personal Access Tokens** section.
+5. Click **Generate new token**, give it a descriptive label (e.g., "Laptop CLI" or "GitHub Actions"), and click generate.
+6. **Copy the token immediately.** Qit does not store the raw secret and will never show it to you again.
+
+## Using a PAT with Git
+
+When Git prompts for credentials, use your **username** and the **PAT secret** as the password.
+
+### In a Clone Command
+```bash
+git clone http://your-username:qit_pat_... @host/repo
+```
+
+### With a Credential Helper
+If you use a credential helper (like `osxkeychain` or `manager-core`), just enter the PAT when prompted for your password during the first `git push` or `git fetch`.
+
+## Managing PATs via CLI
+
+As an **Operator** (Owner), you can list and revoke PATs for any user using the CLI.
+
+### List Active PATs
+```bash
+qit auth pats ./my-app
+```
+This shows the token IDs, labels, and the usernames they belong to.
+
+### Revoke a PAT
+If a token is compromised or no longer needed:
+```bash
+qit auth pats ./my-app --revoke <token-id-or-prefix>
+```
+Revocation is immediate. Any Git operation using that token will fail with an authentication error.
+
+## Security Best Practices
+
+- **One Token per Use Case**: Create separate tokens for your laptop, your server, and your CI.
+- **Descriptive Labels**: Always label tokens so you know which one to revoke if a specific device is lost.
+- **Never Share Secrets**: Treat your PAT secret like a password. Do not commit it to version control.
+
+## Related Pages
+- [Managing Authentication](/docs/guides/managing-authentication)
+- [Sharing and Auth](/docs/sharing-and-auth)
+- [CLI Reference](/docs/reference/cli)

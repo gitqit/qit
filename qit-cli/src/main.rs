@@ -5,11 +5,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use qit_domain::{
     resolve_pull_request_refs, AccessRequestStatus, AuthActor, AuthMethod, AuthMode, BranchInfo,
-    CreatePullRequest, CreatePullRequestComment, CreatePullRequestReview, CredentialIssuer,
-    PullRequestRecord, PullRequestReviewState, PullRequestStatus, RefComparison, RefDiffFile,
-    RepoAuthState, RepoReadStore, RepoUserRole, RepoUserStatus, RepositorySettings, SessionCredentials, UiRole,
-    UpdatePullRequest, UpdateRepositorySettings, UpsertBranchRule, WorkspaceService, WorkspaceSpec,
-    DEFAULT_BRANCH,
+    CreateIssue, CreateIssueComment, CreatePullRequest, CreatePullRequestComment,
+    CreatePullRequestReview, CredentialIssuer, IssueLabel, IssueLinkRelation, IssueLinkSource,
+    IssueMilestone, IssueRecord, IssueStatus, PullRequestRecord, PullRequestReviewState,
+    PullRequestStatus, RefComparison, RefDiffFile, RepoAuthState, RepoReadStore, RepoUserRole,
+    RepoUserStatus, RepositorySettings, SessionCredentials, UiRole, UpdateIssue, UpdatePullRequest,
+    UpdateRepositorySettings, UpsertBranchRule, UpsertIssueLabel, UpsertIssueMilestone,
+    WorkspaceService, WorkspaceSpec, DEFAULT_BRANCH,
 };
 use qit_git::{GitHttpBackendAdapter, GitRepoStore};
 use qit_http::{GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
@@ -38,6 +40,7 @@ use url::Url;
 enum TransportArg {
     Ngrok,
     Tailscale,
+    Lan,
     Local,
 }
 
@@ -78,6 +81,7 @@ impl From<TransportArg> for PublicTransport {
         match value {
             TransportArg::Ngrok => PublicTransport::Ngrok,
             TransportArg::Tailscale => PublicTransport::Tailscale,
+            TransportArg::Lan => PublicTransport::Lan,
             TransportArg::Local => PublicTransport::Local,
         }
     }
@@ -270,6 +274,11 @@ enum Commands {
         #[arg(last = true)]
         paths: Vec<String>,
     },
+    /// Manage issues using GitHub CLI-style subcommands.
+    Issue {
+        #[command(subcommand)]
+        command: IssueCommands,
+    },
     /// Manage pull requests using GitHub CLI-style subcommands.
     Pr {
         #[command(subcommand)]
@@ -293,6 +302,186 @@ enum PrStateArg {
     Closed,
     Merged,
     All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum IssueStateArg {
+    Open,
+    Closed,
+    All,
+}
+
+#[derive(Subcommand)]
+enum IssueCommands {
+    /// List issues for a served folder.
+    List {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Filter by issue state.
+        #[arg(long, default_value = "open")]
+        state: IssueStateArg,
+    },
+    /// Show an issue summary, metadata, comments, and activity.
+    View {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue number, id, or unique id prefix.
+        issue: String,
+    },
+    /// Create an issue with metadata and optional links.
+    Create {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue title.
+        #[arg(long)]
+        title: String,
+
+        /// Issue body/description. Supports markdown and references like `Related to #12`.
+        #[arg(long, default_value = "")]
+        body: String,
+
+        /// Add one or more labels by name.
+        #[arg(long = "label", action = ArgAction::Append)]
+        labels: Vec<String>,
+
+        /// Assign one or more active users by username.
+        #[arg(long = "assignee", action = ArgAction::Append)]
+        assignees: Vec<String>,
+
+        /// Set the milestone by title, creating it if needed.
+        #[arg(long)]
+        milestone: Option<String>,
+
+        /// Link one or more pull requests by id or unique id prefix.
+        #[arg(long = "link-pr", action = ArgAction::Append)]
+        link_prs: Vec<String>,
+    },
+    /// Edit issue details.
+    Edit {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue number, id, or unique id prefix.
+        issue: String,
+
+        /// Replace the title.
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Replace the body/description.
+        #[arg(long)]
+        body: Option<String>,
+
+        /// Mark the issue open.
+        #[arg(long, conflicts_with = "close")]
+        open: bool,
+
+        /// Mark the issue closed.
+        #[arg(long, conflicts_with = "open")]
+        close: bool,
+    },
+    /// Add a top-level markdown comment to an issue.
+    Comment {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue number, id, or unique id prefix.
+        issue: String,
+
+        /// Comment body.
+        #[arg(long)]
+        body: String,
+
+        /// Display name to record with the comment when no durable identity exists.
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Close an issue.
+    Close {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue number, id, or unique id prefix.
+        issue: String,
+    },
+    /// Reopen an issue.
+    Reopen {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue number, id, or unique id prefix.
+        issue: String,
+    },
+    /// Delete an issue.
+    Delete {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue number, id, or unique id prefix.
+        issue: String,
+    },
+    /// Add or remove labels on an issue.
+    Label {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue number, id, or unique id prefix.
+        issue: String,
+
+        /// Add one or more labels by name.
+        #[arg(long = "add", action = ArgAction::Append)]
+        add: Vec<String>,
+
+        /// Remove one or more labels by name.
+        #[arg(long = "remove", action = ArgAction::Append)]
+        remove: Vec<String>,
+    },
+    /// Assign or unassign users on an issue.
+    Assign {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue number, id, or unique id prefix.
+        issue: String,
+
+        /// Add one or more assignees by username.
+        #[arg(long = "add", action = ArgAction::Append)]
+        add: Vec<String>,
+
+        /// Remove one or more assignees by username.
+        #[arg(long = "remove", action = ArgAction::Append)]
+        remove: Vec<String>,
+    },
+    /// Set or clear the issue milestone.
+    Milestone {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue number, id, or unique id prefix.
+        issue: String,
+
+        /// Set the milestone by title, creating it if needed.
+        #[arg(long, conflicts_with = "clear")]
+        set: Option<String>,
+
+        /// Clear the milestone.
+        #[arg(long, conflicts_with = "set")]
+        clear: bool,
+    },
+    /// Link a pull request to an issue.
+    LinkPr {
+        /// Folder previously published with qit.
+        path: PathBuf,
+
+        /// Issue number, id, or unique id prefix.
+        issue: String,
+
+        /// Pull request id or unique id prefix.
+        pull_request: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -336,7 +525,7 @@ enum PrCommands {
         #[arg(long)]
         title: String,
 
-        /// Pull request body/description.
+        /// Pull request body/description. Supports markdown and references like `Fixes #12`.
         #[arg(long, default_value = "")]
         body: String,
 
@@ -770,6 +959,15 @@ fn default_display_name() -> String {
         .unwrap_or_else(|| "Qit CLI".to_string())
 }
 
+fn cli_issue_actor(author: Option<String>) -> qit_domain::IssueActorInput {
+    qit_domain::IssueActorInput {
+        role: UiRole::Owner,
+        display_name: Some(author.unwrap_or_else(default_display_name)),
+        user_id: None,
+        username: None,
+    }
+}
+
 fn pr_state_matches(pull_request: &PullRequestRecord, state: PrStateArg) -> bool {
     match state {
         PrStateArg::All => true,
@@ -788,11 +986,50 @@ fn sort_pull_requests(pull_requests: &mut [PullRequestRecord]) {
     });
 }
 
+fn issue_state_matches(issue: &IssueRecord, state: IssueStateArg) -> bool {
+    match state {
+        IssueStateArg::All => true,
+        IssueStateArg::Open => issue.status == IssueStatus::Open,
+        IssueStateArg::Closed => issue.status == IssueStatus::Closed,
+    }
+}
+
+fn sort_issues(issues: &mut [IssueRecord]) {
+    issues.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.number.cmp(&left.number))
+    });
+}
+
+fn select_issue<'a>(issues: &'a [IssueRecord], selector: &str) -> Result<&'a IssueRecord> {
+    if let Some(exact) = issues.iter().find(|issue| issue.id == selector) {
+        return Ok(exact);
+    }
+    if let Ok(number) = selector.parse::<u64>() {
+        if let Some(exact) = issues.iter().find(|issue| issue.number == number) {
+            return Ok(exact);
+        }
+    }
+    let mut matches = issues.iter().filter(|issue| issue.id.starts_with(selector));
+    let first = matches
+        .next()
+        .ok_or_else(|| anyhow!("issue `{selector}` was not found"))?;
+    if matches.next().is_some() {
+        bail!("issue selector `{selector}` is ambiguous");
+    }
+    Ok(first)
+}
+
 fn select_pull_request<'a>(
     pull_requests: &'a [PullRequestRecord],
     selector: &str,
 ) -> Result<&'a PullRequestRecord> {
-    if let Some(exact) = pull_requests.iter().find(|pull_request| pull_request.id == selector) {
+    if let Some(exact) = pull_requests
+        .iter()
+        .find(|pull_request| pull_request.id == selector)
+    {
         return Ok(exact);
     }
     let mut matches = pull_requests
@@ -816,7 +1053,9 @@ fn select_by_id_prefix<'a, T>(
     if let Some(exact) = values.iter().find(|value| id_of(value) == selector) {
         return Ok(exact);
     }
-    let mut matches = values.iter().filter(|value| id_of(value).starts_with(selector));
+    let mut matches = values
+        .iter()
+        .filter(|value| id_of(value).starts_with(selector));
     let first = matches
         .next()
         .ok_or_else(|| anyhow!("{noun} `{selector}` was not found"))?;
@@ -837,15 +1076,79 @@ async fn load_pull_requests(
     Ok((workspace, pull_requests))
 }
 
+async fn load_issues(
+    service: &WorkspaceService,
+    path: PathBuf,
+    default_branch: &str,
+) -> Result<(WorkspaceSpec, qit_domain::WorkspaceWebUiState)> {
+    let (workspace, mut web_ui) = service.load_web_ui(path, default_branch)?;
+    sort_issues(&mut web_ui.issues);
+    Ok((workspace, web_ui))
+}
+
+fn issue_label_names(issue: &IssueRecord, labels: &[IssueLabel]) -> Vec<String> {
+    issue
+        .label_ids
+        .iter()
+        .filter_map(|label_id| labels.iter().find(|label| label.id == *label_id))
+        .map(|label| label.name.clone())
+        .collect()
+}
+
+fn issue_assignee_names(issue: &IssueRecord, auth: &RepoAuthState) -> Vec<String> {
+    issue
+        .assignee_user_ids
+        .iter()
+        .filter_map(|user_id| auth.users.iter().find(|user| user.id == *user_id))
+        .map(|user| user.username.clone().unwrap_or_else(|| user.name.clone()))
+        .collect()
+}
+
+fn issue_milestone_title(issue: &IssueRecord, milestones: &[IssueMilestone]) -> Option<String> {
+    issue
+        .milestone_id
+        .as_ref()
+        .and_then(|milestone_id| {
+            milestones
+                .iter()
+                .find(|milestone| milestone.id == *milestone_id)
+        })
+        .map(|milestone| milestone.title.clone())
+}
+
+fn link_relation_label(relation: &IssueLinkRelation) -> &'static str {
+    match relation {
+        IssueLinkRelation::Related => "related",
+        IssueLinkRelation::Closing => "closing",
+    }
+}
+
+fn link_source_label(source: &IssueLinkSource) -> &'static str {
+    match source {
+        IssueLinkSource::Manual => "manual",
+        IssueLinkSource::IssueDescription => "issue body",
+        IssueLinkSource::IssueComment => "issue comment",
+        IssueLinkSource::PullRequestDescription => "PR body",
+        IssueLinkSource::PullRequestComment => "PR comment",
+        IssueLinkSource::PullRequestReview => "PR review",
+    }
+}
+
 async fn load_pull_request_detail(
     service: &WorkspaceService,
     repo_read_store: &dyn RepoReadStore,
     path: PathBuf,
     default_branch: &str,
     selector: &str,
-) -> Result<(WorkspaceSpec, PullRequestRecord, Option<RefComparison>, Option<Vec<RefDiffFile>>)> {
-    let (workspace, pull_requests) = load_pull_requests(service, path, default_branch).await?;
-    let pull_request = select_pull_request(&pull_requests, selector)?.clone();
+) -> Result<(
+    WorkspaceSpec,
+    qit_domain::WorkspaceWebUiState,
+    PullRequestRecord,
+    Option<RefComparison>,
+    Option<Vec<RefDiffFile>>,
+)> {
+    let (workspace, web_ui) = service.load_web_ui(path, default_branch)?;
+    let pull_request = select_pull_request(&web_ui.pull_requests, selector)?.clone();
     let (base_ref, head_ref) =
         resolve_pull_request_refs(repo_read_store, &workspace, &pull_request).await;
     let comparison = repo_read_store
@@ -856,13 +1159,18 @@ async fn load_pull_request_detail(
         .diff_refs(&workspace, &base_ref, &head_ref)
         .await
         .ok();
-    Ok((workspace, pull_request, comparison, diffs))
+    Ok((workspace, web_ui, pull_request, comparison, diffs))
 }
 
-fn print_pr_summary(pull_request: &PullRequestRecord, comparison: Option<&RefComparison>) {
+fn print_pr_summary(
+    pull_request: &PullRequestRecord,
+    issues: &[IssueRecord],
+    pull_requests: &[PullRequestRecord],
+    comparison: Option<&RefComparison>,
+) {
     say(&format!(
         "{} [{}]",
-        pull_request.title, 
+        pull_request.title,
         match pull_request.status {
             PullRequestStatus::Open => "open",
             PullRequestStatus::Closed => "closed",
@@ -888,6 +1196,22 @@ fn print_pr_summary(pull_request: &PullRequestRecord, comparison: Option<&RefCom
             "  merged: {}",
             merged_commit.chars().take(12).collect::<String>()
         ));
+    }
+    let linked_issues =
+        WorkspaceService::linked_issues_for_pull_request(pull_request, issues, pull_requests);
+    if !linked_issues.is_empty() {
+        say("  linked_issues:");
+        for link in linked_issues {
+            if let Some(issue) = issues.iter().find(|issue| issue.id == link.issue_id) {
+                say(&format!(
+                    "    - #{} [{} via {}] {}",
+                    issue.number,
+                    link_relation_label(&link.relation),
+                    link_source_label(&link.source),
+                    issue.title
+                ));
+            }
+        }
     }
     if !pull_request.description.is_empty() {
         say("");
@@ -1005,6 +1329,257 @@ fn print_pr_diff(diffs: &[RefDiffFile]) {
             say(line);
         }
     }
+}
+
+fn print_issue_summary(
+    issue: &IssueRecord,
+    labels: &[IssueLabel],
+    milestones: &[IssueMilestone],
+    auth: &RepoAuthState,
+    issues: &[IssueRecord],
+    pull_requests: &[PullRequestRecord],
+) {
+    say(&format!(
+        "#{} {} [{}]",
+        issue.number,
+        issue.title,
+        match issue.status {
+            IssueStatus::Open => "open",
+            IssueStatus::Closed => "closed",
+        }
+    ));
+    say(&format!(
+        "  id: {}",
+        issue.id.chars().take(12).collect::<String>()
+    ));
+    say(&format!("  author: {}", issue.author.display_name));
+    let label_names = issue_label_names(issue, labels);
+    if !label_names.is_empty() {
+        say(&format!("  labels: {}", label_names.join(", ")));
+    }
+    let assignees = issue_assignee_names(issue, auth);
+    if !assignees.is_empty() {
+        say(&format!("  assignees: {}", assignees.join(", ")));
+    }
+    if let Some(milestone) = issue_milestone_title(issue, milestones) {
+        say(&format!("  milestone: {milestone}"));
+    }
+    let linked_pull_requests =
+        WorkspaceService::linked_pull_requests_for_issue(issue, issues, pull_requests);
+    if !linked_pull_requests.is_empty() {
+        say("  linked_prs:");
+        for link in linked_pull_requests {
+            if let Some(pull_request) = pull_requests
+                .iter()
+                .find(|pull_request| pull_request.id == link.pull_request_id)
+            {
+                say(&format!(
+                    "    - {} [{} via {}] {}",
+                    pull_request.id.chars().take(8).collect::<String>(),
+                    link_relation_label(&link.relation),
+                    link_source_label(&link.source),
+                    pull_request.title
+                ));
+            }
+        }
+    }
+    if !issue.description.is_empty() {
+        say("");
+        say(&issue.description);
+    }
+}
+
+fn print_issue_discussion(issue: &IssueRecord) {
+    if issue.comments.is_empty() {
+        return;
+    }
+    say("");
+    say("Comments");
+    for comment in &issue.comments {
+        say(&format!(
+            "  - {}: {}",
+            comment.actor.display_name, comment.body
+        ));
+    }
+}
+
+fn print_issue_activity(issue: &IssueRecord, labels: &[IssueLabel], milestones: &[IssueMilestone]) {
+    if issue.timeline.is_empty() {
+        return;
+    }
+    say("");
+    say("Activity");
+    for event in issue.timeline.iter().rev() {
+        let message = match event.kind {
+            qit_domain::IssueTimelineEventKind::Opened => "opened the issue".to_string(),
+            qit_domain::IssueTimelineEventKind::Commented => {
+                format!("commented: {}", event.body.clone().unwrap_or_default())
+            }
+            qit_domain::IssueTimelineEventKind::Edited => "edited the issue".to_string(),
+            qit_domain::IssueTimelineEventKind::Closed => "closed the issue".to_string(),
+            qit_domain::IssueTimelineEventKind::Reopened => "reopened the issue".to_string(),
+            qit_domain::IssueTimelineEventKind::LabelsChanged => {
+                if event.labels.is_empty() {
+                    "cleared the labels".to_string()
+                } else {
+                    let names = event
+                        .labels
+                        .iter()
+                        .filter_map(|label_id| labels.iter().find(|label| label.id == *label_id))
+                        .map(|label| label.name.clone())
+                        .collect::<Vec<_>>();
+                    format!("set labels: {}", names.join(", "))
+                }
+            }
+            qit_domain::IssueTimelineEventKind::AssigneesChanged => "updated assignees".to_string(),
+            qit_domain::IssueTimelineEventKind::MilestoneChanged => {
+                if let Some(milestone_id) = &event.milestone_id {
+                    let title = milestones
+                        .iter()
+                        .find(|milestone| milestone.id == *milestone_id)
+                        .map(|milestone| milestone.title.clone())
+                        .unwrap_or_else(|| milestone_id.clone());
+                    format!("set milestone: {title}")
+                } else {
+                    "cleared the milestone".to_string()
+                }
+            }
+            qit_domain::IssueTimelineEventKind::PullRequestLinked => format!(
+                "linked pull request {}",
+                event
+                    .pull_request_id
+                    .clone()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+            ),
+            qit_domain::IssueTimelineEventKind::PullRequestUnlinked => format!(
+                "unlinked pull request {}",
+                event
+                    .pull_request_id
+                    .clone()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+            ),
+            qit_domain::IssueTimelineEventKind::ReactionToggled => format!(
+                "toggled reaction {}",
+                event
+                    .reaction
+                    .as_ref()
+                    .map(|reaction| format!("{reaction:?}").to_ascii_lowercase())
+                    .unwrap_or_else(|| "unknown".into())
+            ),
+        };
+        say(&format!("  - {} {}", event.actor.display_name, message));
+    }
+}
+
+async fn ensure_label_ids(
+    service: &WorkspaceService,
+    path: PathBuf,
+    default_branch: &str,
+    names: &[String],
+) -> Result<Vec<String>> {
+    let (_, web_ui) = service.load_web_ui(path.clone(), default_branch)?;
+    let mut ids = Vec::new();
+    for name in names
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+    {
+        if let Some(existing) = web_ui
+            .issue_settings
+            .labels
+            .iter()
+            .find(|label| label.name.eq_ignore_ascii_case(name))
+        {
+            ids.push(existing.id.clone());
+            continue;
+        }
+        let label = service
+            .upsert_issue_label(
+                path.clone(),
+                default_branch,
+                UpsertIssueLabel {
+                    id: None,
+                    name: name.to_string(),
+                    color: String::new(),
+                    description: String::new(),
+                },
+            )?
+            .1;
+        ids.push(label.id);
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn assignee_ids_from_usernames(
+    web_ui: &qit_domain::WorkspaceWebUiState,
+    usernames: &[String],
+) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for username in usernames
+        .iter()
+        .map(|username| username.trim())
+        .filter(|username| !username.is_empty())
+    {
+        let user = web_ui
+            .auth
+            .users
+            .iter()
+            .find(|user| {
+                user.status == RepoUserStatus::Active
+                    && user
+                        .username
+                        .as_deref()
+                        .is_some_and(|candidate| candidate == username)
+            })
+            .ok_or_else(|| anyhow!("user `{username}` was not found"))?;
+        ids.push(user.id.clone());
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+async fn ensure_milestone_id(
+    service: &WorkspaceService,
+    path: PathBuf,
+    default_branch: &str,
+    title: Option<String>,
+) -> Result<Option<String>> {
+    let Some(title) = title
+        .map(|title| title.trim().to_string())
+        .filter(|title| !title.is_empty())
+    else {
+        return Ok(None);
+    };
+    let (_, web_ui) = service.load_web_ui(path.clone(), default_branch)?;
+    if let Some(existing) = web_ui
+        .issue_settings
+        .milestones
+        .iter()
+        .find(|milestone| milestone.title.eq_ignore_ascii_case(&title))
+    {
+        return Ok(Some(existing.id.clone()));
+    }
+    let milestone = service
+        .upsert_issue_milestone(
+            path,
+            default_branch,
+            UpsertIssueMilestone {
+                id: None,
+                title,
+                description: String::new(),
+            },
+        )?
+        .1;
+    Ok(Some(milestone.id))
 }
 
 #[tokio::main]
@@ -1250,7 +1825,8 @@ async fn main() -> Result<()> {
                     homepage,
                     default_branch: next_default_branch,
                 } => {
-                    let mut final_workspace = service.resolve_workspace(path.clone(), default_branch)?;
+                    let mut final_workspace =
+                        service.resolve_workspace(path.clone(), default_branch)?;
                     if description.is_some() || homepage.is_some() {
                         let (workspace, settings) = service.update_repository_settings(
                             path.clone(),
@@ -1265,8 +1841,9 @@ async fn main() -> Result<()> {
                         print_repository_settings(&final_workspace, &settings);
                     }
                     if let Some(branch_name) = next_default_branch {
-                        let (workspace, outcome) =
-                            service.switch_branch(path, default_branch, &branch_name).await?;
+                        let (workspace, outcome) = service
+                            .switch_branch(path, default_branch, &branch_name)
+                            .await?;
                         final_workspace = workspace;
                         say(&format!(
                             "switched default branch from `{}` to `{}` at `{}`",
@@ -1366,7 +1943,8 @@ async fn main() -> Result<()> {
                     approve,
                     reject,
                 } => {
-                    let (workspace, auth) = service.read_auth_state(path.clone(), default_branch)?;
+                    let (workspace, auth) =
+                        service.read_auth_state(path.clone(), default_branch)?;
                     if let Some(selector) = approve {
                         let request = select_by_id_prefix(
                             &auth.access_requests,
@@ -1381,12 +1959,15 @@ async fn main() -> Result<()> {
                             RepoUserRole::User,
                             &AuthActor::Operator,
                         )?;
-                        say(&format!(
-                            "approved {} <{}>",
-                            request.name, request.email
-                        ));
-                        say("share this one-time setup token with the approved user now:");
-                        say(&format!("  {}", onboarding.secret));
+                        say(&format!("approved {} <{}>", request.name, request.email));
+                        if let Some(secret) = onboarding.secret.as_deref() {
+                            say("share this one-time setup token with the approved user now:");
+                            say(&format!("  {}", secret));
+                        } else {
+                            say(
+                                "no setup code: they can finish from the browser where they requested access.",
+                            );
+                        }
                         return Ok(());
                     }
                     if let Some(selector) = reject {
@@ -1405,7 +1986,10 @@ async fn main() -> Result<()> {
                         say(&format!("rejected {} <{}>", request.name, request.email));
                         return Ok(());
                     }
-                    say(&format!("access requests for {}:", workspace.worktree.display()));
+                    say(&format!(
+                        "access requests for {}:",
+                        workspace.worktree.display()
+                    ));
                     let pending = auth
                         .access_requests
                         .iter()
@@ -1432,32 +2016,62 @@ async fn main() -> Result<()> {
                     revoke,
                     reset_setup,
                 } => {
-                    let (workspace, auth) = service.read_auth_state(path.clone(), default_branch)?;
+                    let (workspace, auth) =
+                        service.read_auth_state(path.clone(), default_branch)?;
                     if let Some(selector) = promote {
-                        let user = select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
-                        service.promote_user(path, default_branch, &user.id, &AuthActor::Operator)?;
+                        let user =
+                            select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
+                        service.promote_user(
+                            path,
+                            default_branch,
+                            &user.id,
+                            &AuthActor::Operator,
+                        )?;
                         say(&format!("promoted {} to owner", user.email));
                         return Ok(());
                     }
                     if let Some(selector) = demote {
-                        let user = select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
-                        service.demote_user(path, default_branch, &user.id, &AuthActor::Operator)?;
+                        let user =
+                            select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
+                        service.demote_user(
+                            path,
+                            default_branch,
+                            &user.id,
+                            &AuthActor::Operator,
+                        )?;
                         say(&format!("demoted {} to user", user.email));
                         return Ok(());
                     }
                     if let Some(selector) = revoke {
-                        let user = select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
-                        service.revoke_user(path, default_branch, &user.id, &AuthActor::Operator)?;
+                        let user =
+                            select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
+                        service.revoke_user(
+                            path,
+                            default_branch,
+                            &user.id,
+                            &AuthActor::Operator,
+                        )?;
                         say(&format!("revoked {}", user.email));
                         return Ok(());
                     }
                     if let Some(selector) = reset_setup {
-                        let user = select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
-                        let (_, _, onboarding) =
-                            service.reset_user_setup(path, default_branch, &user.id, &AuthActor::Operator)?;
+                        let user =
+                            select_by_id_prefix(&auth.users, &selector, |user| &user.id, "user")?;
+                        let (_, _, onboarding) = service.reset_user_setup(
+                            path,
+                            default_branch,
+                            &user.id,
+                            &AuthActor::Operator,
+                        )?;
                         say(&format!("reset setup for {}", user.email));
                         say("share this one-time setup token with the user now:");
-                        say(&format!("  {}", onboarding.secret));
+                        say(&format!(
+                            "  {}",
+                            onboarding
+                                .secret
+                                .as_deref()
+                                .expect("reset issues a setup token")
+                        ));
                         return Ok(());
                     }
                     say(&format!("users for {}:", workspace.worktree.display()));
@@ -1488,7 +2102,8 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
                 AuthCommands::Pats { path, revoke } => {
-                    let (workspace, auth) = service.read_auth_state(path.clone(), default_branch)?;
+                    let (workspace, auth) =
+                        service.read_auth_state(path.clone(), default_branch)?;
                     if let Some(selector) = revoke {
                         let pat = select_by_id_prefix(
                             &auth.personal_access_tokens,
@@ -1500,7 +2115,10 @@ async fn main() -> Result<()> {
                         say(&format!("revoked PAT {}", pat.label));
                         return Ok(());
                     }
-                    say(&format!("personal access tokens for {}:", workspace.worktree.display()));
+                    say(&format!(
+                        "personal access tokens for {}:",
+                        workspace.worktree.display()
+                    ));
                     let active = auth
                         .personal_access_tokens
                         .iter()
@@ -1520,330 +2138,717 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
             },
-            Commands::Pr { command } => {
-                match command {
-                    PrCommands::List { path, state } => {
-                        let (workspace, pull_requests) =
-                            load_pull_requests(service.as_ref(), path, default_branch).await?;
-                        say(&format!("pull requests for {}:", workspace.worktree.display()));
-                        let mut count = 0usize;
-                        for pull_request in pull_requests
-                            .iter()
-                            .filter(|pull_request| pr_state_matches(pull_request, state))
-                        {
-                            count += 1;
-                            say(&format!(
-                                "  {} [{}] {} -> {} ({})",
-                                pull_request.id.chars().take(8).collect::<String>(),
-                                match pull_request.status {
-                                    PullRequestStatus::Open => "open",
-                                    PullRequestStatus::Closed => "closed",
-                                    PullRequestStatus::Merged => "merged",
+            Commands::Issue { command } => match command {
+                IssueCommands::List { path, state } => {
+                    let (workspace, web_ui) =
+                        load_issues(service.as_ref(), path, default_branch).await?;
+                    say(&format!("issues for {}:", workspace.worktree.display()));
+                    let mut count = 0usize;
+                    for issue in web_ui
+                        .issues
+                        .iter()
+                        .filter(|issue| issue_state_matches(issue, state))
+                    {
+                        count += 1;
+                        let linked_count = WorkspaceService::linked_pull_requests_for_issue(
+                            issue,
+                            &web_ui.issues,
+                            &web_ui.pull_requests,
+                        )
+                        .len();
+                        say(&format!(
+                            "  #{} [{}] {}  ({} comment{}, {} linked PR{})",
+                            issue.number,
+                            match issue.status {
+                                IssueStatus::Open => "open",
+                                IssueStatus::Closed => "closed",
+                            },
+                            issue.title,
+                            issue.comments.len(),
+                            if issue.comments.len() == 1 { "" } else { "s" },
+                            linked_count,
+                            if linked_count == 1 { "" } else { "s" }
+                        ));
+                    }
+                    if count == 0 {
+                        say("  no matching issues");
+                    }
+                    return Ok(());
+                }
+                IssueCommands::View { path, issue } => {
+                    let (_workspace, web_ui) =
+                        load_issues(service.as_ref(), path, default_branch).await?;
+                    let issue = select_issue(&web_ui.issues, &issue)?;
+                    print_issue_summary(
+                        issue,
+                        &web_ui.issue_settings.labels,
+                        &web_ui.issue_settings.milestones,
+                        &web_ui.auth,
+                        &web_ui.issues,
+                        &web_ui.pull_requests,
+                    );
+                    print_issue_discussion(issue);
+                    print_issue_activity(
+                        issue,
+                        &web_ui.issue_settings.labels,
+                        &web_ui.issue_settings.milestones,
+                    );
+                    return Ok(());
+                }
+                IssueCommands::Create {
+                    path,
+                    title,
+                    body,
+                    labels,
+                    assignees,
+                    milestone,
+                    link_prs,
+                } => {
+                    let (_, web_ui) =
+                        load_issues(service.as_ref(), path.clone(), default_branch).await?;
+                    let label_ids =
+                        ensure_label_ids(service.as_ref(), path.clone(), default_branch, &labels)
+                            .await?;
+                    let assignee_user_ids = assignee_ids_from_usernames(&web_ui, &assignees)?;
+                    let milestone_id = ensure_milestone_id(
+                        service.as_ref(),
+                        path.clone(),
+                        default_branch,
+                        milestone,
+                    )
+                    .await?;
+                    let mut linked_pull_request_ids = Vec::new();
+                    if !link_prs.is_empty() {
+                        let (_, pull_requests) =
+                            load_pull_requests(service.as_ref(), path.clone(), default_branch)
+                                .await?;
+                        for selector in link_prs {
+                            linked_pull_request_ids
+                                .push(select_pull_request(&pull_requests, &selector)?.id.clone());
+                        }
+                    }
+                    let issue = service
+                        .create_issue(
+                            path,
+                            default_branch,
+                            CreateIssue {
+                                title,
+                                description: body,
+                                label_ids,
+                                assignee_user_ids,
+                                milestone_id,
+                                linked_pull_request_ids,
+                            },
+                            cli_issue_actor(None),
+                        )
+                        .await?
+                        .1;
+                    say(&format!(
+                        "created issue #{} ({})",
+                        issue.number, issue.title
+                    ));
+                    return Ok(());
+                }
+                IssueCommands::Edit {
+                    path,
+                    issue,
+                    title,
+                    body,
+                    open,
+                    close,
+                } => {
+                    let (_, web_ui) =
+                        load_issues(service.as_ref(), path.clone(), default_branch).await?;
+                    let issue = select_issue(&web_ui.issues, &issue)?;
+                    let updated = service
+                        .update_issue(
+                            path,
+                            default_branch,
+                            &issue.id,
+                            UpdateIssue {
+                                title,
+                                description: body,
+                                status: if open {
+                                    Some(IssueStatus::Open)
+                                } else if close {
+                                    Some(IssueStatus::Closed)
+                                } else {
+                                    None
                                 },
+                            },
+                            cli_issue_actor(None),
+                        )
+                        .await?
+                        .1;
+                    say(&format!(
+                        "updated issue #{} [{}]",
+                        updated.number,
+                        match updated.status {
+                            IssueStatus::Open => "open",
+                            IssueStatus::Closed => "closed",
+                        }
+                    ));
+                    return Ok(());
+                }
+                IssueCommands::Comment {
+                    path,
+                    issue,
+                    body,
+                    author,
+                } => {
+                    let (_, web_ui) =
+                        load_issues(service.as_ref(), path.clone(), default_branch).await?;
+                    let issue = select_issue(&web_ui.issues, &issue)?;
+                    service
+                        .comment_issue(
+                            path,
+                            default_branch,
+                            &issue.id,
+                            CreateIssueComment {
+                                display_name: author.clone(),
+                                body,
+                            },
+                            cli_issue_actor(author),
+                        )
+                        .await?;
+                    say(&format!("added comment to issue #{}", issue.number));
+                    return Ok(());
+                }
+                IssueCommands::Close { path, issue } => {
+                    let (_, web_ui) =
+                        load_issues(service.as_ref(), path.clone(), default_branch).await?;
+                    let issue = select_issue(&web_ui.issues, &issue)?;
+                    service
+                        .update_issue(
+                            path,
+                            default_branch,
+                            &issue.id,
+                            UpdateIssue {
+                                title: None,
+                                description: None,
+                                status: Some(IssueStatus::Closed),
+                            },
+                            cli_issue_actor(None),
+                        )
+                        .await?;
+                    say(&format!("closed issue #{}", issue.number));
+                    return Ok(());
+                }
+                IssueCommands::Reopen { path, issue } => {
+                    let (_, web_ui) =
+                        load_issues(service.as_ref(), path.clone(), default_branch).await?;
+                    let issue = select_issue(&web_ui.issues, &issue)?;
+                    service
+                        .update_issue(
+                            path,
+                            default_branch,
+                            &issue.id,
+                            UpdateIssue {
+                                title: None,
+                                description: None,
+                                status: Some(IssueStatus::Open),
+                            },
+                            cli_issue_actor(None),
+                        )
+                        .await?;
+                    say(&format!("reopened issue #{}", issue.number));
+                    return Ok(());
+                }
+                IssueCommands::Delete { path, issue } => {
+                    let (_, web_ui) =
+                        load_issues(service.as_ref(), path.clone(), default_branch).await?;
+                    let issue = select_issue(&web_ui.issues, &issue)?;
+                    service
+                        .delete_issue(path, default_branch, &issue.id)
+                        .await?;
+                    say("deleted issue");
+                    return Ok(());
+                }
+                IssueCommands::Label {
+                    path,
+                    issue,
+                    add,
+                    remove,
+                } => {
+                    let (_, web_ui) =
+                        load_issues(service.as_ref(), path.clone(), default_branch).await?;
+                    let issue = select_issue(&web_ui.issues, &issue)?;
+                    let mut next_label_ids = issue.label_ids.clone();
+                    let add_ids =
+                        ensure_label_ids(service.as_ref(), path.clone(), default_branch, &add)
+                            .await?;
+                    for label_id in add_ids {
+                        if !next_label_ids.iter().any(|existing| existing == &label_id) {
+                            next_label_ids.push(label_id);
+                        }
+                    }
+                    for name in remove
+                        .iter()
+                        .map(|name| name.trim())
+                        .filter(|name| !name.is_empty())
+                    {
+                        let label = web_ui
+                            .issue_settings
+                            .labels
+                            .iter()
+                            .find(|label| label.name.eq_ignore_ascii_case(name))
+                            .ok_or_else(|| anyhow!("label `{name}` was not found"))?;
+                        next_label_ids.retain(|label_id| label_id != &label.id);
+                    }
+                    service
+                        .set_issue_labels(
+                            path,
+                            default_branch,
+                            &issue.id,
+                            next_label_ids,
+                            cli_issue_actor(None),
+                        )
+                        .await?;
+                    say("updated issue labels");
+                    return Ok(());
+                }
+                IssueCommands::Assign {
+                    path,
+                    issue,
+                    add,
+                    remove,
+                } => {
+                    let (_, web_ui) =
+                        load_issues(service.as_ref(), path.clone(), default_branch).await?;
+                    let issue = select_issue(&web_ui.issues, &issue)?;
+                    let mut next_assignee_ids = issue.assignee_user_ids.clone();
+                    let add_ids = assignee_ids_from_usernames(&web_ui, &add)?;
+                    for user_id in add_ids {
+                        if !next_assignee_ids
+                            .iter()
+                            .any(|existing| existing == &user_id)
+                        {
+                            next_assignee_ids.push(user_id);
+                        }
+                    }
+                    for username in remove
+                        .iter()
+                        .map(|username| username.trim())
+                        .filter(|username| !username.is_empty())
+                    {
+                        let user = web_ui
+                            .auth
+                            .users
+                            .iter()
+                            .find(|user| {
+                                user.username
+                                    .as_deref()
+                                    .is_some_and(|candidate| candidate == username)
+                            })
+                            .ok_or_else(|| anyhow!("user `{username}` was not found"))?;
+                        next_assignee_ids.retain(|user_id| user_id != &user.id);
+                    }
+                    service
+                        .set_issue_assignees(
+                            path,
+                            default_branch,
+                            &issue.id,
+                            next_assignee_ids,
+                            cli_issue_actor(None),
+                        )
+                        .await?;
+                    say("updated issue assignees");
+                    return Ok(());
+                }
+                IssueCommands::Milestone {
+                    path,
+                    issue,
+                    set,
+                    clear,
+                } => {
+                    let (_, web_ui) =
+                        load_issues(service.as_ref(), path.clone(), default_branch).await?;
+                    let issue = select_issue(&web_ui.issues, &issue)?;
+                    let milestone_id = if clear {
+                        None
+                    } else {
+                        ensure_milestone_id(service.as_ref(), path.clone(), default_branch, set)
+                            .await?
+                    };
+                    service
+                        .set_issue_milestone(
+                            path,
+                            default_branch,
+                            &issue.id,
+                            milestone_id,
+                            cli_issue_actor(None),
+                        )
+                        .await?;
+                    say("updated issue milestone");
+                    return Ok(());
+                }
+                IssueCommands::LinkPr {
+                    path,
+                    issue,
+                    pull_request,
+                } => {
+                    let (_, web_ui) =
+                        load_issues(service.as_ref(), path.clone(), default_branch).await?;
+                    let issue = select_issue(&web_ui.issues, &issue)?;
+                    let (_, pull_requests) =
+                        load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                    let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                    service
+                        .link_issue_pull_request(
+                            path,
+                            default_branch,
+                            &issue.id,
+                            &pull_request.id,
+                            cli_issue_actor(None),
+                        )
+                        .await?;
+                    say("linked pull request");
+                    return Ok(());
+                }
+            },
+            Commands::Pr { command } => match command {
+                PrCommands::List { path, state } => {
+                    let (workspace, pull_requests) =
+                        load_pull_requests(service.as_ref(), path, default_branch).await?;
+                    say(&format!(
+                        "pull requests for {}:",
+                        workspace.worktree.display()
+                    ));
+                    let mut count = 0usize;
+                    for pull_request in pull_requests
+                        .iter()
+                        .filter(|pull_request| pr_state_matches(pull_request, state))
+                    {
+                        count += 1;
+                        say(&format!(
+                            "  {} [{}] {} -> {} ({})",
+                            pull_request.id.chars().take(8).collect::<String>(),
+                            match pull_request.status {
+                                PullRequestStatus::Open => "open",
+                                PullRequestStatus::Closed => "closed",
+                                PullRequestStatus::Merged => "merged",
+                            },
+                            pull_request.source_branch,
+                            pull_request.target_branch,
+                            pull_request.title
+                        ));
+                    }
+                    if count == 0 {
+                        say("  no matching pull requests");
+                    }
+                    return Ok(());
+                }
+                PrCommands::View { path, pull_request } => {
+                    let (_workspace, web_ui, pull_request, comparison, diffs) =
+                        load_pull_request_detail(
+                            service.as_ref(),
+                            repo_store.as_ref(),
+                            path,
+                            default_branch,
+                            &pull_request,
+                        )
+                        .await?;
+                    print_pr_summary(
+                        &pull_request,
+                        &web_ui.issues,
+                        &web_ui.pull_requests,
+                        comparison.as_ref(),
+                    );
+                    print_pr_discussion(&pull_request);
+                    print_pr_activity(&pull_request);
+                    if let Some(diffs) = diffs {
+                        say("");
+                        say("Files");
+                        for file in diffs {
+                            say(&format!(
+                                "  - {} [{}] +{} -{}",
+                                file.path, file.status, file.additions, file.deletions
+                            ));
+                        }
+                    }
+                    return Ok(());
+                }
+                PrCommands::Diff { path, pull_request } => {
+                    let (_workspace, _web_ui, pull_request, _comparison, diffs) =
+                        load_pull_request_detail(
+                            service.as_ref(),
+                            repo_store.as_ref(),
+                            path,
+                            default_branch,
+                            &pull_request,
+                        )
+                        .await?;
+                    say(&format!("diff for {}", pull_request.title));
+                    if let Some(diffs) = diffs {
+                        print_pr_diff(&diffs);
+                    } else {
+                        say("no diff available");
+                    }
+                    return Ok(());
+                }
+                PrCommands::Status { path } => {
+                    let (workspace, pull_requests) =
+                        load_pull_requests(service.as_ref(), path, default_branch).await?;
+                    let current_branch_prs = pull_requests
+                        .iter()
+                        .filter(|pull_request| {
+                            pull_request.status == PullRequestStatus::Open
+                                && pull_request.source_branch == workspace.checked_out_branch
+                        })
+                        .collect::<Vec<_>>();
+                    let target_branch_prs = pull_requests
+                        .iter()
+                        .filter(|pull_request| {
+                            pull_request.status == PullRequestStatus::Open
+                                && pull_request.target_branch == workspace.exported_branch
+                        })
+                        .collect::<Vec<_>>();
+                    say(&format!("current branch: {}", workspace.checked_out_branch));
+                    if current_branch_prs.is_empty() {
+                        say("  no open pull request for the current branch");
+                    } else {
+                        for pull_request in current_branch_prs {
+                            say(&format!(
+                                "  {} -> {} {}",
                                 pull_request.source_branch,
                                 pull_request.target_branch,
                                 pull_request.title
                             ));
                         }
-                        if count == 0 {
-                            say("  no matching pull requests");
+                    }
+                    say(&format!("served branch: {}", workspace.exported_branch));
+                    if target_branch_prs.is_empty() {
+                        say("  no open pull requests targeting the served branch");
+                    } else {
+                        for pull_request in target_branch_prs {
+                            say(&format!(
+                                "  {} -> {} {}",
+                                pull_request.source_branch,
+                                pull_request.target_branch,
+                                pull_request.title
+                            ));
                         }
-                        return Ok(());
                     }
-                    PrCommands::View { path, pull_request } => {
-                        let (_workspace, pull_request, comparison, diffs) = load_pull_request_detail(
-                            service.as_ref(),
-                            repo_store.as_ref(),
-                            path,
-                            default_branch,
-                            &pull_request,
-                        )
-                        .await?;
-                        print_pr_summary(&pull_request, comparison.as_ref());
-                        print_pr_discussion(&pull_request);
-                        print_pr_activity(&pull_request);
-                        if let Some(diffs) = diffs {
-                            say("");
-                            say("Files");
-                            for file in diffs {
-                                say(&format!(
-                                    "  - {} [{}] +{} -{}",
-                                    file.path, file.status, file.additions, file.deletions
-                                ));
-                            }
-                        }
-                        return Ok(());
-                    }
-                    PrCommands::Diff { path, pull_request } => {
-                        let (_workspace, pull_request, _comparison, diffs) = load_pull_request_detail(
-                            service.as_ref(),
-                            repo_store.as_ref(),
-                            path,
-                            default_branch,
-                            &pull_request,
-                        )
-                        .await?;
-                        say(&format!("diff for {}", pull_request.title));
-                        if let Some(diffs) = diffs {
-                            print_pr_diff(&diffs);
-                        } else {
-                            say("no diff available");
-                        }
-                        return Ok(());
-                    }
-                    PrCommands::Status { path } => {
-                        let (workspace, pull_requests) =
-                            load_pull_requests(service.as_ref(), path, default_branch).await?;
-                        let current_branch_prs = pull_requests
-                            .iter()
-                            .filter(|pull_request| {
-                                pull_request.status == PullRequestStatus::Open
-                                    && pull_request.source_branch == workspace.checked_out_branch
-                            })
-                            .collect::<Vec<_>>();
-                        let target_branch_prs = pull_requests
-                            .iter()
-                            .filter(|pull_request| {
-                                pull_request.status == PullRequestStatus::Open
-                                    && pull_request.target_branch == workspace.exported_branch
-                            })
-                            .collect::<Vec<_>>();
-                        say(&format!("current branch: {}", workspace.checked_out_branch));
-                        if current_branch_prs.is_empty() {
-                            say("  no open pull request for the current branch");
-                        } else {
-                            for pull_request in current_branch_prs {
-                                say(&format!(
-                                    "  {} -> {} {}",
-                                    pull_request.source_branch, pull_request.target_branch, pull_request.title
-                                ));
-                            }
-                        }
-                        say(&format!("served branch: {}", workspace.exported_branch));
-                        if target_branch_prs.is_empty() {
-                            say("  no open pull requests targeting the served branch");
-                        } else {
-                            for pull_request in target_branch_prs {
-                                say(&format!(
-                                    "  {} -> {} {}",
-                                    pull_request.source_branch, pull_request.target_branch, pull_request.title
-                                ));
-                            }
-                        }
-                        return Ok(());
-                    }
-                    PrCommands::Create {
-                        path,
-                        title,
-                        body,
-                        head,
-                        base,
-                    } => {
-                        let (workspace, _) =
-                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
-                        let pull_request = service
-                            .create_pull_request(
-                                path,
-                                default_branch,
-                                CreatePullRequest {
-                                    title,
-                                    description: body,
-                                    source_branch: head.unwrap_or_else(|| workspace.checked_out_branch.clone()),
-                                    target_branch: base.unwrap_or_else(|| workspace.exported_branch.clone()),
-                                },
-                                UiRole::Owner,
-                            )
-                            .await?
-                            .1;
-                        say(&format!(
-                            "created pull request {} {} -> {} ({})",
-                            pull_request.id.chars().take(8).collect::<String>(),
-                            pull_request.source_branch,
-                            pull_request.target_branch,
-                            pull_request.title
-                        ));
-                        return Ok(());
-                    }
-                    PrCommands::Edit {
-                        path,
-                        pull_request,
-                        title,
-                        body,
-                        open,
-                        close,
-                    } => {
-                        let (_, pull_requests) =
-                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
-                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
-                        let updated = service
-                            .update_pull_request(
-                                path,
-                                default_branch,
-                                &pull_request.id,
-                                UpdatePullRequest {
-                                    title,
-                                    description: body,
-                                    status: if open {
-                                        Some(PullRequestStatus::Open)
-                                    } else if close {
-                                        Some(PullRequestStatus::Closed)
-                                    } else {
-                                        None
-                                    },
-                                },
-                                UiRole::Owner,
-                            )
-                            .await?
-                            .1;
-                        say(&format!(
-                            "updated pull request {} [{}]",
-                            updated.id.chars().take(8).collect::<String>(),
-                            match updated.status {
-                                PullRequestStatus::Open => "open",
-                                PullRequestStatus::Closed => "closed",
-                                PullRequestStatus::Merged => "merged",
-                            }
-                        ));
-                        return Ok(());
-                    }
-                    PrCommands::Comment {
-                        path,
-                        pull_request,
-                        body,
-                        author,
-                    } => {
-                        let (_, pull_requests) =
-                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
-                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
-                        service
-                            .comment_pull_request(
-                                path,
-                                default_branch,
-                                &pull_request.id,
-                                CreatePullRequestComment {
-                                    display_name: author.unwrap_or_else(default_display_name),
-                                    body,
-                                },
-                                UiRole::Owner,
-                            )
-                            .await?;
-                        say("comment added");
-                        return Ok(());
-                    }
-                    PrCommands::Review {
-                        path,
-                        pull_request,
-                        approve,
-                        request_changes,
-                        comment: _comment,
-                        body,
-                        author,
-                    } => {
-                        let (_, pull_requests) =
-                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
-                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
-                        let state = if approve {
-                            PullRequestReviewState::Approved
-                        } else if request_changes {
-                            PullRequestReviewState::ChangesRequested
-                        } else {
-                            PullRequestReviewState::Commented
-                        };
-                        service
-                            .review_pull_request(
-                                path,
-                                default_branch,
-                                &pull_request.id,
-                                CreatePullRequestReview {
-                                    display_name: author.unwrap_or_else(default_display_name),
-                                    body,
-                                    state: state.clone(),
-                                },
-                                UiRole::Owner,
-                            )
-                            .await?;
-                        say(&format!(
-                            "submitted {} review",
-                            match state {
-                                PullRequestReviewState::Approved => "approved",
-                                PullRequestReviewState::ChangesRequested => "changes_requested",
-                                PullRequestReviewState::Commented => "comment",
-                            }
-                        ));
-                        return Ok(());
-                    }
-                    PrCommands::Merge { path, pull_request } => {
-                        let (_, pull_requests) =
-                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
-                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
-                        let merged = service
-                            .merge_pull_request(path, default_branch, &pull_request.id)
-                            .await?
-                            .1;
-                        say(&format!(
-                            "merged pull request {} at {}",
-                            merged.id.chars().take(8).collect::<String>(),
-                            merged
-                                .merged_commit
-                                .unwrap_or_else(|| "unknown".into())
-                                .chars()
-                                .take(12)
-                                .collect::<String>()
-                        ));
-                        return Ok(());
-                    }
-                    PrCommands::Close { path, pull_request } => {
-                        let (_, pull_requests) =
-                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
-                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
-                        service
-                            .update_pull_request(
-                                path,
-                                default_branch,
-                                &pull_request.id,
-                                UpdatePullRequest {
-                                    title: None,
-                                    description: None,
-                                    status: Some(PullRequestStatus::Closed),
-                                },
-                                UiRole::Owner,
-                            )
-                            .await?;
-                        say("closed pull request");
-                        return Ok(());
-                    }
-                    PrCommands::Reopen { path, pull_request } => {
-                        let (_, pull_requests) =
-                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
-                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
-                        service
-                            .update_pull_request(
-                                path,
-                                default_branch,
-                                &pull_request.id,
-                                UpdatePullRequest {
-                                    title: None,
-                                    description: None,
-                                    status: Some(PullRequestStatus::Open),
-                                },
-                                UiRole::Owner,
-                            )
-                            .await?;
-                        say("reopened pull request");
-                        return Ok(());
-                    }
-                    PrCommands::Delete { path, pull_request } => {
-                        let (_, pull_requests) =
-                            load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
-                        let pull_request = select_pull_request(&pull_requests, &pull_request)?;
-                        service
-                            .delete_pull_request(path, default_branch, &pull_request.id)
-                            .await?;
-                        say("deleted pull request");
-                        return Ok(());
-                    }
+                    return Ok(());
                 }
-            }
+                PrCommands::Create {
+                    path,
+                    title,
+                    body,
+                    head,
+                    base,
+                } => {
+                    let (workspace, _) =
+                        load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                    let pull_request = service
+                        .create_pull_request(
+                            path,
+                            default_branch,
+                            CreatePullRequest {
+                                title,
+                                description: body,
+                                source_branch: head
+                                    .unwrap_or_else(|| workspace.checked_out_branch.clone()),
+                                target_branch: base
+                                    .unwrap_or_else(|| workspace.exported_branch.clone()),
+                            },
+                            UiRole::Owner,
+                        )
+                        .await?
+                        .1;
+                    say(&format!(
+                        "created pull request {} {} -> {} ({})",
+                        pull_request.id.chars().take(8).collect::<String>(),
+                        pull_request.source_branch,
+                        pull_request.target_branch,
+                        pull_request.title
+                    ));
+                    return Ok(());
+                }
+                PrCommands::Edit {
+                    path,
+                    pull_request,
+                    title,
+                    body,
+                    open,
+                    close,
+                } => {
+                    let (_, pull_requests) =
+                        load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                    let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                    let updated = service
+                        .update_pull_request(
+                            path,
+                            default_branch,
+                            &pull_request.id,
+                            UpdatePullRequest {
+                                title,
+                                description: body,
+                                status: if open {
+                                    Some(PullRequestStatus::Open)
+                                } else if close {
+                                    Some(PullRequestStatus::Closed)
+                                } else {
+                                    None
+                                },
+                            },
+                            UiRole::Owner,
+                        )
+                        .await?
+                        .1;
+                    say(&format!(
+                        "updated pull request {} [{}]",
+                        updated.id.chars().take(8).collect::<String>(),
+                        match updated.status {
+                            PullRequestStatus::Open => "open",
+                            PullRequestStatus::Closed => "closed",
+                            PullRequestStatus::Merged => "merged",
+                        }
+                    ));
+                    return Ok(());
+                }
+                PrCommands::Comment {
+                    path,
+                    pull_request,
+                    body,
+                    author,
+                } => {
+                    let (_, pull_requests) =
+                        load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                    let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                    service
+                        .comment_pull_request(
+                            path,
+                            default_branch,
+                            &pull_request.id,
+                            CreatePullRequestComment {
+                                display_name: author.unwrap_or_else(default_display_name),
+                                body,
+                            },
+                            UiRole::Owner,
+                        )
+                        .await?;
+                    say("comment added");
+                    return Ok(());
+                }
+                PrCommands::Review {
+                    path,
+                    pull_request,
+                    approve,
+                    request_changes,
+                    comment: _comment,
+                    body,
+                    author,
+                } => {
+                    let (_, pull_requests) =
+                        load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                    let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                    let state = if approve {
+                        PullRequestReviewState::Approved
+                    } else if request_changes {
+                        PullRequestReviewState::ChangesRequested
+                    } else {
+                        PullRequestReviewState::Commented
+                    };
+                    service
+                        .review_pull_request(
+                            path,
+                            default_branch,
+                            &pull_request.id,
+                            CreatePullRequestReview {
+                                display_name: author.unwrap_or_else(default_display_name),
+                                body,
+                                state: state.clone(),
+                            },
+                            UiRole::Owner,
+                        )
+                        .await?;
+                    say(&format!(
+                        "submitted {} review",
+                        match state {
+                            PullRequestReviewState::Approved => "approved",
+                            PullRequestReviewState::ChangesRequested => "changes_requested",
+                            PullRequestReviewState::Commented => "comment",
+                        }
+                    ));
+                    return Ok(());
+                }
+                PrCommands::Merge { path, pull_request } => {
+                    let (_, pull_requests) =
+                        load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                    let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                    let merged = service
+                        .merge_pull_request(
+                            path,
+                            default_branch,
+                            &pull_request.id,
+                            cli_issue_actor(None),
+                        )
+                        .await?
+                        .1;
+                    say(&format!(
+                        "merged pull request {} at {}",
+                        merged.id.chars().take(8).collect::<String>(),
+                        merged
+                            .merged_commit
+                            .unwrap_or_else(|| "unknown".into())
+                            .chars()
+                            .take(12)
+                            .collect::<String>()
+                    ));
+                    return Ok(());
+                }
+                PrCommands::Close { path, pull_request } => {
+                    let (_, pull_requests) =
+                        load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                    let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                    service
+                        .update_pull_request(
+                            path,
+                            default_branch,
+                            &pull_request.id,
+                            UpdatePullRequest {
+                                title: None,
+                                description: None,
+                                status: Some(PullRequestStatus::Closed),
+                            },
+                            UiRole::Owner,
+                        )
+                        .await?;
+                    say("closed pull request");
+                    return Ok(());
+                }
+                PrCommands::Reopen { path, pull_request } => {
+                    let (_, pull_requests) =
+                        load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                    let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                    service
+                        .update_pull_request(
+                            path,
+                            default_branch,
+                            &pull_request.id,
+                            UpdatePullRequest {
+                                title: None,
+                                description: None,
+                                status: Some(PullRequestStatus::Open),
+                            },
+                            UiRole::Owner,
+                        )
+                        .await?;
+                    say("reopened pull request");
+                    return Ok(());
+                }
+                PrCommands::Delete { path, pull_request } => {
+                    let (_, pull_requests) =
+                        load_pull_requests(service.as_ref(), path.clone(), default_branch).await?;
+                    let pull_request = select_pull_request(&pull_requests, &pull_request)?;
+                    service
+                        .delete_pull_request(path, default_branch, &pull_request.id)
+                        .await?;
+                    say("deleted pull request");
+                    return Ok(());
+                }
+            },
         }
     }
 
@@ -1868,7 +2873,11 @@ async fn run_shared_serve(
     let workspace = prepared.workspace.clone();
     let credentials = prepared.credentials.clone();
     let requested_auth_methods = if !cli.auth_methods.is_empty() {
-        cli.auth_methods.iter().copied().map(Into::into).collect::<Vec<_>>()
+        cli.auth_methods
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect::<Vec<_>>()
     } else if let Some(mode) = cli.auth_mode.map(Into::into) {
         RepoAuthState::methods_for_mode(&mode)
     } else {
@@ -1921,7 +2930,10 @@ async fn run_shared_serve(
         .context("bind qit worker listener")?;
     let upstream_url = Url::parse(&format!(
         "http://127.0.0.1:{}/",
-        listener.local_addr().context("read qit worker addr")?.port()
+        listener
+            .local_addr()
+            .context("read qit worker addr")?
+            .port()
     ))
     .context("build qit worker URL")?;
     let worker_app = build_worker_app(
@@ -1964,6 +2976,7 @@ async fn run_shared_serve(
     let shared_transport = match shared_entrypoint.label.as_str() {
         "NGROK" => PublicTransport::Ngrok,
         "TAILSCALE" => PublicTransport::Tailscale,
+        "LAN" => PublicTransport::Lan,
         _ => PublicTransport::Local,
     };
     let clone_cmd = clone_command(&clone_url, shared_transport);
@@ -1980,6 +2993,11 @@ async fn run_shared_serve(
         reveal_password,
         &clone_cmd,
         cli.auto_apply,
+        shared_entrypoint
+            .local_base_url
+            .as_str()
+            .trim_end_matches('/'),
+        &route_lease.mount_path,
     );
     println!("Ctrl+C to stop.");
     println!();

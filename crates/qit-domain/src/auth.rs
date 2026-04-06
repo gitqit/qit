@@ -339,7 +339,9 @@ impl From<&PatRecord> for PatRecordView {
 pub struct IssuedOnboarding {
     pub user_id: String,
     pub email: String,
-    pub secret: String,
+    /// One-time `qit_setup…` code for manual owner onboarding. Absent when access was approved via request (requester finishes with their `qit_request…` receipt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
     pub expires_at_ms: u64,
 }
 
@@ -408,7 +410,8 @@ fn parse_secret<'a>(secret: &'a str, prefix: &str) -> Option<(&'a str, &'a str)>
     let actual_prefix = parts.next()?;
     let id = parts.next()?;
     let raw_secret = parts.next()?;
-    (actual_prefix == prefix && !id.is_empty() && !raw_secret.is_empty()).then_some((id, raw_secret))
+    (actual_prefix == prefix && !id.is_empty() && !raw_secret.is_empty())
+        .then_some((id, raw_secret))
 }
 
 pub(crate) fn issue_onboarding_secret(id: &str) -> Result<(String, String), DomainError> {

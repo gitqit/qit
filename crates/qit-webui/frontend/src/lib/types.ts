@@ -6,8 +6,27 @@ export type RepoUserStatus = 'pending_request' | 'approved_pending_setup' | 'act
 export type AccessRequestStatus = 'pending' | 'approved' | 'rejected' | 'revoked'
 
 export type PullRequestStatus = 'open' | 'merged' | 'closed'
+export type IssueStatus = 'open' | 'closed'
+export type IssueLinkRelation = 'related' | 'closing'
+export type IssueLinkSource =
+  | 'manual'
+  | 'issue_description'
+  | 'issue_comment'
+  | 'pull_request_description'
+  | 'pull_request_comment'
+  | 'pull_request_review'
 
 export type PullRequestReviewState = 'commented' | 'approved' | 'changes_requested'
+
+export type IssueReactionContent =
+  | 'thumbs_up'
+  | 'thumbs_down'
+  | 'laugh'
+  | 'hooray'
+  | 'confused'
+  | 'heart'
+  | 'rocket'
+  | 'eyes'
 
 export type PullRequestActivityKind =
   | 'opened'
@@ -17,6 +36,21 @@ export type PullRequestActivityKind =
   | 'closed'
   | 'reopened'
   | 'merged'
+
+export type IssueTimelineEventKind =
+  | 'opened'
+  | 'commented'
+  | 'edited'
+  | 'closed'
+  | 'reopened'
+  | 'labels_changed'
+  | 'assignees_changed'
+  | 'milestone_changed'
+  | 'pull_request_linked'
+  | 'pull_request_unlinked'
+  | 'reaction_toggled'
+
+export type IssueTimelineTarget = 'issue' | 'comment'
 
 export type TreeEntryKind = 'tree' | 'blob'
 
@@ -117,7 +151,8 @@ export interface PatRecordView {
 export interface IssuedOnboarding {
   user_id: string
   email: string
-  secret: string
+  /** Present for manual setup codes only; omitted after access-request approval. */
+  secret?: string | null
   expires_at_ms: number
 }
 
@@ -233,6 +268,107 @@ export interface PullRequestRecord {
   activities: PullRequestActivity[]
 }
 
+export interface IssueActor {
+  role: UiRole
+  display_name: string
+  user_id: string | null
+  username: string | null
+}
+
+export interface IssueReactionSummary {
+  content: IssueReactionContent
+  count: number
+  reacted: boolean
+}
+
+export interface IssueReactionRecord {
+  id: string
+  content: IssueReactionContent
+  actor: IssueActor
+  created_at_ms: number
+}
+
+export interface IssueComment {
+  id: string
+  actor: IssueActor
+  body: string
+  created_at_ms: number
+  updated_at_ms: number
+  reactions: IssueReactionRecord[]
+}
+
+export interface IssueTimelineEvent {
+  id: string
+  kind: IssueTimelineEventKind
+  actor: IssueActor
+  body: string | null
+  title: string | null
+  description: string | null
+  labels: string[]
+  assignee_user_ids: string[]
+  milestone_id: string | null
+  pull_request_id: string | null
+  reaction: IssueReactionContent | null
+  target: IssueTimelineTarget | null
+  target_id: string | null
+  created_at_ms: number
+}
+
+export interface IssueLinkedPullRequest {
+  pull_request_id: string
+  relation: IssueLinkRelation
+  source: IssueLinkSource
+  linked_at_ms: number
+}
+
+export interface IssueLabel {
+  id: string
+  name: string
+  color: string
+  description: string
+  created_at_ms: number
+  updated_at_ms: number
+}
+
+export interface IssueMilestone {
+  id: string
+  title: string
+  description: string
+  created_at_ms: number
+  updated_at_ms: number
+}
+
+export interface IssueRecord {
+  id: string
+  number: number
+  title: string
+  description: string
+  status: IssueStatus
+  author: IssueActor
+  created_at_ms: number
+  updated_at_ms: number
+  closed_at_ms: number | null
+  label_ids: string[]
+  assignee_user_ids: string[]
+  milestone_id: string | null
+  linked_pull_requests: IssueLinkedPullRequest[]
+  reactions: IssueReactionRecord[]
+  comments: IssueComment[]
+  timeline: IssueTimelineEvent[]
+}
+
+export interface IssueLinkedPullRequestView {
+  relation: IssueLinkRelation
+  source: IssueLinkSource
+  pull_request: PullRequestRecord
+}
+
+export interface PullRequestLinkedIssueView {
+  relation: IssueLinkRelation
+  source: IssueLinkSource
+  issue: IssueRecord
+}
+
 export interface PullRequestActivity {
   id: string
   kind: PullRequestActivityKind
@@ -307,8 +443,40 @@ export interface PullRequestDetailResponse {
   pull_request: PullRequestRecord
   comparison: RefComparison | null
   diffs: RefDiffFile[] | null
+  linked_issues: PullRequestLinkedIssueView[]
   comments: PullRequestComment[]
   reviews: PullRequestReview[]
   review_summary: PullRequestReviewSummary
   activity: PullRequestActivity[]
+}
+
+export interface IssueAssigneeView {
+  id: string
+  name: string
+  username: string
+  role: RepoUserRole
+}
+
+export interface IssueMetadataResponse {
+  labels: IssueLabel[]
+  milestones: IssueMilestone[]
+  assignees: IssueAssigneeView[]
+}
+
+export interface IssueCommentResponse {
+  comment: IssueComment
+  reaction_summary: IssueReactionSummary[]
+}
+
+export interface IssueDetailResponse {
+  issue: IssueRecord
+  comments: IssueCommentResponse[]
+  timeline: IssueTimelineEvent[]
+  linked_pull_requests: IssueLinkedPullRequestView[]
+  reaction_summary: IssueReactionSummary[]
+  metadata: IssueMetadataResponse
+}
+
+export interface IssuesResponse {
+  issues: IssueRecord[]
 }

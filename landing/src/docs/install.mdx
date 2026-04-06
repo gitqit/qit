@@ -1,26 +1,44 @@
 ---
 title: Install Qit
-description: Download a release binary or build Qit from source so you can share a folder in one command.
+description: Install Qit with Homebrew, download a release binary, or build from source so you can share a folder in one command.
 slug: /install
+section: Get started
 sidebar_label: Install
 sidebar_position: 1
 ---
 
 # Install Qit
 
-Qit is designed to be fast to try: download a release, point it at a folder, and get a temporary authenticated Git remote plus a local Web UI.
+Qit is designed to be fast to try: install it in one command, point it at a folder, and get a temporary authenticated Git remote plus a local Web UI.
 
-## Download a release
+## Install with Homebrew
 
-The default path is to use a published binary from the [Qit releases](https://github.com/flynnemon/qit/releases) page.
+If you use Homebrew on macOS or Linux, this is the fastest path:
 
-1. Download the archive for your platform.
-2. Extract the `qit` binary somewhere on your `PATH`.
-3. Confirm the binary is available:
+```bash
+brew tap flynnemon/qit
+brew install qit
+```
+
+If you prefer a single command, Homebrew can install directly from the tap:
+
+```bash
+brew install flynnemon/qit/qit
+```
+
+Confirm the binary is available:
 
 ```bash
 qit --help
 ```
+
+## Download a release
+
+If you do not use Homebrew, install from the [Qit releases](https://github.com/flynnemon/qit/releases) page instead.
+
+1. Download the archive for your platform.
+2. Extract the `qit` binary somewhere on your `PATH`.
+3. Confirm the binary is available with `qit --help`.
 
 ## Build from source
 
@@ -38,7 +56,8 @@ cargo build --release
 - A normal project folder you want to share.
 - Git installed on the host machine.
 - A recent browser if you want to use the local Web UI.
+- An ngrok token if you want Qit's default public transport out of the box.
 
 ## Next step
 
-Once Qit is installed, continue to the [quick start](/docs/quick-start).
+Once Qit is installed, continue to the [quick start](/docs/quick-start) for a fast local session or the [first collaboration tutorial](/docs/tutorials/first-collaboration) for the full workflow.

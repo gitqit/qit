@@ -19,10 +19,12 @@ import { BrandLogo } from '../atoms/BrandLogo'
 import { Badge, Button, Panel } from '../atoms/Controls'
 import { SectionHeader, TextInput } from '../molecules/Fields'
 import { CreateBranchModal } from '../organisms/CreateBranchModal'
+import { CreateIssueModal } from '../organisms/CreateIssueModal'
 import { CreatePullRequestModal } from '../organisms/CreatePullRequestModal'
 import { BranchesPanel } from '../organisms/panels/BranchesPanel'
 import { CodePanel } from '../organisms/panels/CodePanel'
 import { CommitsPanel } from '../organisms/panels/CommitsPanel'
+import { IssuesPanel } from '../organisms/panels/IssuesPanel'
 import { PullRequestsPanel } from '../organisms/panels/PullRequestsPanel'
 import { SettingsPanel } from '../organisms/panels/SettingsPanel'
 import { UserSettingsPanel } from '../organisms/panels/UserSettingsPanel'
@@ -37,6 +39,9 @@ import type {
   BranchInfo,
   CommitDetail,
   CommitHistory,
+  IssueMetadataResponse,
+  IssueReactionContent,
+  IssueRecord,
   PullRequestRecord,
   RefDiffFile,
   SettingsResponse,
@@ -328,7 +333,7 @@ export function LoginPage({
           : 'Use the shared session credentials printed when the server started.'
         : 'Use your repo username and password if your account is already active.',
       ctaHint: supportsRequestAccess
-        ? 'New here? Request access first. If an owner already sent you a setup code, switch tabs and redeem it there.'
+        ? 'New here? Request access first. After approval, sign-in continues on the Request access tab. Use “Use setup code” only for a manual invite.'
         : supportsSetupToken
           ? 'Already have a setup code from an owner? Redeem it once, then sign in normally after that.'
           : 'Sign in with the credentials available for this repository.',
@@ -336,7 +341,8 @@ export function LoginPage({
     request: {
       title: 'Request access',
       subtitle: 'Tell the owner who you are so they can approve a per-user account.',
-      ctaHint: 'This tab stays here while approval status updates. If an owner already gave you a setup code, switch tabs and redeem it there.',
+      ctaHint:
+        'Stay on this tab while approval is pending. After approval, Qit finishes sign-in here automatically. Use “Use setup code” only if an owner invited you with a manual setup code.',
     },
     setup: {
       title: 'Use setup code',
@@ -358,7 +364,7 @@ export function LoginPage({
           title="Access this repository"
           detail={
             supportsRequestAccess
-              ? 'Use your repo account if you already have one. New collaborators can request approval here and wait for an owner to share a one-time setup code.'
+              ? 'Use your repo account if you already have one. New collaborators can request approval here; after approval, sign-in continues automatically in this browser.'
               : supportsSetupToken
                 ? 'Use your repo account if it is already active, or redeem a one-time setup code from an owner.'
                 : 'Use the shared session credentials printed when the server started.'
@@ -539,9 +545,13 @@ export function DashboardPage({
   codePath,
   codeTree,
   activeBlob,
+  issues,
+  issueMetadata,
   pullRequests,
+  highlightedIssueId,
   highlightedPullRequestId,
   selectedBranch,
+  selectedIssueId,
   selectedPullRequestId,
   loadingMoreCommits,
   onOpenTreeEntry,
@@ -571,6 +581,21 @@ export function DashboardPage({
   onRevokePat,
   onLogout,
   onDeleteBranch,
+  onCreateIssue,
+  onUpdateIssue,
+  onDeleteIssue,
+  onCommentIssue,
+  onReactIssue,
+  onReactIssueComment,
+  onSetIssueLabels,
+  onSetIssueAssignees,
+  onSetIssueMilestone,
+  onLinkIssuePullRequest,
+  onUnlinkIssuePullRequest,
+  onUpsertIssueLabel,
+  onDeleteIssueLabel,
+  onUpsertIssueMilestone,
+  onDeleteIssueMilestone,
   onCreatePullRequest,
   onUpdatePullRequest,
   onDeletePullRequest,
@@ -578,6 +603,8 @@ export function DashboardPage({
   onReviewPullRequest,
   onMergePullRequest,
   onViewBranchCode,
+  onSelectIssue,
+  onClearSelectedIssue,
   onSelectPullRequest,
   onClearSelectedPullRequest,
 }: {
@@ -601,9 +628,13 @@ export function DashboardPage({
   codePath: string
   codeTree: TreeEntry[]
   activeBlob: BlobContent | null
+  issues: IssueRecord[]
+  issueMetadata: IssueMetadataResponse
   pullRequests: PullRequestRecord[]
+  highlightedIssueId: string | null
   highlightedPullRequestId: string | null
   selectedBranch: string | null
+  selectedIssueId: string | null
   selectedPullRequestId: string | null
   loadingMoreCommits: boolean
   onOpenTreeEntry: (entry: TreeEntry) => Promise<void>
@@ -640,6 +671,51 @@ export function DashboardPage({
   onRevokePat: (id: string) => Promise<void>
   onLogout: () => Promise<void>
   onDeleteBranch: (name: string) => Promise<void>
+  onCreateIssue: (payload: {
+    title: string
+    description: string
+    display_name?: string | null
+    label_ids: string[]
+    assignee_user_ids: string[]
+    milestone_id: string | null
+    linked_pull_request_ids: string[]
+  }) => Promise<IssueRecord>
+  onUpdateIssue: (
+    id: string,
+    payload: { title?: string; description?: string; status?: 'open' | 'closed' },
+  ) => Promise<IssueRecord>
+  onDeleteIssue: (id: string) => Promise<IssueRecord>
+  onCommentIssue: (
+    id: string,
+    payload: { display_name?: string | null; body: string },
+  ) => Promise<IssueRecord>
+  onReactIssue: (
+    id: string,
+    payload: { content: IssueReactionContent; display_name?: string | null },
+  ) => Promise<IssueRecord>
+  onReactIssueComment: (
+    id: string,
+    commentId: string,
+    payload: { content: IssueReactionContent; display_name?: string | null },
+  ) => Promise<IssueRecord>
+  onSetIssueLabels: (id: string, labelIds: string[]) => Promise<IssueRecord>
+  onSetIssueAssignees: (id: string, assigneeUserIds: string[]) => Promise<IssueRecord>
+  onSetIssueMilestone: (id: string, milestoneId: string | null) => Promise<IssueRecord>
+  onLinkIssuePullRequest: (id: string, pullRequestId: string) => Promise<IssueRecord>
+  onUnlinkIssuePullRequest: (id: string, pullRequestId: string) => Promise<IssueRecord>
+  onUpsertIssueLabel: (payload: {
+    id?: string
+    name: string
+    color?: string
+    description?: string
+  }) => Promise<void>
+  onDeleteIssueLabel: (id: string) => Promise<void>
+  onUpsertIssueMilestone: (payload: {
+    id?: string
+    title: string
+    description?: string
+  }) => Promise<void>
+  onDeleteIssueMilestone: (id: string) => Promise<void>
   onCreatePullRequest: (payload: {
     title: string
     description: string
@@ -661,10 +737,13 @@ export function DashboardPage({
   ) => Promise<PullRequestRecord>
   onMergePullRequest: (id: string) => Promise<void>
   onViewBranchCode: (name: string) => void
+  onSelectIssue: (id: string) => void
+  onClearSelectedIssue: () => void
   onSelectPullRequest: (id: string) => void
   onClearSelectedPullRequest: () => void
 }) {
   const [createBranchOpen, setCreateBranchOpen] = useState(false)
+  const [createIssueOpen, setCreateIssueOpen] = useState(false)
   const [createPullRequestOpen, setCreatePullRequestOpen] = useState(false)
   const [selectedTabId, setSelectedTabId] = useState(() => getQueryParam(window.location.search, 'tab') ?? 'code')
   const supportsRequestAccess = bootstrap.auth_methods.includes('request_access')
@@ -733,6 +812,12 @@ export function DashboardPage({
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
   }, [])
+
+  useEffect(() => {
+    if (selectedIssueId && selectedTabId !== 'issues') {
+      setSelectedTabId('issues')
+    }
+  }, [selectedIssueId, selectedTabId])
 
   useEffect(() => {
     if (selectedPullRequestId && selectedTabId !== 'pull-requests') {
@@ -829,6 +914,41 @@ export function DashboardPage({
         ),
       },
       {
+        id: 'issues',
+        icon: shellTabIcons.issues,
+        label: 'Issues',
+        count: issues.length,
+        content: (
+          <IssuesPanel
+            bootstrap={bootstrap}
+            canCreate={true}
+            canManage={canEdit}
+            highlightedIssueId={highlightedIssueId}
+            issues={issues}
+            metadata={issueMetadata}
+            onBack={onClearSelectedIssue}
+            onComment={onCommentIssue}
+            onCreate={() => setCreateIssueOpen(true)}
+            onDelete={onDeleteIssue}
+            onDeleteLabel={onDeleteIssueLabel}
+            onDeleteMilestone={onDeleteIssueMilestone}
+            onLinkPullRequest={onLinkIssuePullRequest}
+            onReact={onReactIssue}
+            onReactComment={onReactIssueComment}
+            onSelect={onSelectIssue}
+            onSetAssignees={onSetIssueAssignees}
+            onSetLabels={onSetIssueLabels}
+            onSetMilestone={onSetIssueMilestone}
+            onUnlinkPullRequest={onUnlinkIssuePullRequest}
+            onUpdate={onUpdateIssue}
+            onUpsertLabel={onUpsertIssueLabel}
+            onUpsertMilestone={onUpsertIssueMilestone}
+            pullRequests={pullRequests}
+            selectedIssueId={selectedIssueId}
+          />
+        ),
+      },
+      {
         id: 'pull-requests',
         icon: shellTabIcons['pull-requests'],
         label: 'Pull requests',
@@ -908,8 +1028,11 @@ export function DashboardPage({
       codePath,
       codeTree,
       commitDetail,
+      highlightedIssueId,
       highlightedPullRequestId,
       history,
+      issueMetadata,
+      issues,
       loadingCommitDetail,
       loadingMoreCommits,
       latestCommit,
@@ -917,33 +1040,50 @@ export function DashboardPage({
       onBrowseCommitTree,
       onCheckoutBranch,
       onBrowseTree,
+      onCommentIssue,
       onCommentPullRequest,
       onClearSelectedCommit,
+      onClearSelectedIssue,
       onClearSelectedPullRequest,
       onDeleteBranch,
       onDeleteBranchRule,
+      onDeleteIssue,
+      onDeleteIssueLabel,
+      onDeleteIssueMilestone,
       onDeletePullRequest,
+      onLinkIssuePullRequest,
       onLoadCommitTreePath,
       onLoadTreePath,
       onLoadMoreCommits,
       onMergePullRequest,
       onOpenCommitTreeEntry,
+      onReactIssue,
+      onReactIssueComment,
+      onSelectIssue,
       onSelectPullRequest,
       onReviewPullRequest,
       onOpenTreeEntry,
       onCreatePat,
       onIssueSetupToken,
       onSelectCommit,
+      onSetIssueAssignees,
+      onSetIssueLabels,
+      onSetIssueMilestone,
       onSwitchBranch,
       onUpdateBranchRule,
+      onUpdateIssue,
       onUpdateSettings,
       onUpdatePullRequest,
+      onUnlinkIssuePullRequest,
+      onUpsertIssueLabel,
+      onUpsertIssueMilestone,
       onViewBranchCode,
       onRevokePat,
       pullRequests,
       readme,
       selectedBranch,
       selectedCommit,
+      selectedIssueId,
       selectedPullRequestId,
       selectedCommitId,
       settings,
@@ -981,6 +1121,15 @@ export function DashboardPage({
         onClose={() => setCreateBranchOpen(false)}
         onCreateBranch={onCreateBranch}
         open={createBranchOpen}
+      />
+
+      <CreateIssueModal
+        bootstrap={bootstrap}
+        metadata={issueMetadata}
+        onClose={() => setCreateIssueOpen(false)}
+        onCreateIssue={onCreateIssue}
+        open={createIssueOpen}
+        pullRequests={pullRequests}
       />
 
       <CreatePullRequestModal

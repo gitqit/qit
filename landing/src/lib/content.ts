@@ -120,7 +120,7 @@ export const faqContent = [
   {
     question: 'Can I expose Qit beyond localhost?',
     answer:
-      'Yes. Qit supports local, ngrok, and Tailscale-based transport adapters so you can choose between local-only collaboration and broader access.',
+      'Yes. Qit supports local, LAN, ngrok, and Tailscale-based transport adapters so you can choose between same-machine use, local-network sharing, and broader access.',
   },
   {
     question: 'Is this replacing GitHub or a full multi-user forge?',

@@ -7,6 +7,8 @@ import type {
   BranchInfo,
   CommitDetail,
   CommitHistory,
+  IssueMetadataResponse,
+  IssueRecord,
   PullRequestRecord,
   RefDiffFile,
   SettingsResponse,
@@ -21,6 +23,45 @@ const ACCESS_REQUEST_STORAGE_KEY = 'qit.pendingAccessRequest'
 type PendingAccessReceipt = {
   id: string
   secret: string
+  email: string
+}
+
+function randomLowerAlnum(len: number): string {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
+  const bytes = new Uint8Array(len)
+  crypto.getRandomValues(bytes)
+  let out = ''
+  for (let i = 0; i < len; i++) {
+    out += alphabet[bytes[i]! % alphabet.length]!
+  }
+  return out
+}
+
+function generateOnboardingPassword(): string {
+  return randomLowerAlnum(24)
+}
+
+function baseUsernameFromEmail(email: string): string {
+  const at = email.indexOf('@')
+  const local = (at >= 0 ? email.slice(0, at) : email).toLowerCase()
+  const cleaned = local
+    .replace(/[^a-z0-9._-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+  let base = cleaned.slice(0, 32)
+  if (base.length < 3) {
+    base = `usr_${randomLowerAlnum(10)}`.slice(0, 32)
+  }
+  return base
+}
+
+function usernameCandidatesForAccessRequest(email: string): string[] {
+  const base = baseUsernameFromEmail(email.trim())
+  const candidates = [base]
+  for (let i = 0; i < 8; i++) {
+    candidates.push(`${base.slice(0, 24)}_${randomLowerAlnum(4)}`.slice(0, 32))
+  }
+  return candidates
 }
 
 function isReadmeEntry(entry: TreeEntry) {
@@ -40,7 +81,11 @@ function readPendingAccessReceipt(): PendingAccessReceipt | null {
     }
     const parsed = JSON.parse(raw) as Partial<PendingAccessReceipt>
     return typeof parsed.id === 'string' && typeof parsed.secret === 'string'
-      ? { id: parsed.id, secret: parsed.secret }
+      ? {
+          id: parsed.id,
+          secret: parsed.secret,
+          email: typeof parsed.email === 'string' ? parsed.email : '',
+        }
       : null
   } catch {
     return null
@@ -90,6 +135,13 @@ function App() {
   const [commitActivePath, setCommitActivePath] = useState<string | null>(null)
   const [commitBlob, setCommitBlob] = useState<BlobContent | null>(null)
   const [commitDiff, setCommitDiff] = useState<RefDiffFile | null>(null)
+  const [issues, setIssues] = useState<IssueRecord[]>([])
+  const [issueMetadata, setIssueMetadata] = useState<IssueMetadataResponse>({
+    labels: [],
+    milestones: [],
+    assignees: [],
+  })
+  const [selectedIssueId, setSelectedIssueId] = useState<string | null>(() => getQueryParam(window.location.search, 'issue'))
   const [pullRequests, setPullRequests] = useState<PullRequestRecord[]>([])
   const [selectedPullRequestId, setSelectedPullRequestId] = useState<string | null>(() => getQueryParam(window.location.search, 'pr'))
   const [loading, setLoading] = useState(true)
@@ -100,6 +152,7 @@ function App() {
   const [setupMessage, setSetupMessage] = useState<string | null>(null)
   const [requestReceipt, setRequestReceipt] = useState<PendingAccessReceipt | null>(() => readPendingAccessReceipt())
   const [toastMessage, setToastMessage] = useState<string | null>(null)
+  const [highlightedIssueId, setHighlightedIssueId] = useState<string | null>(null)
   const [highlightedPullRequestId, setHighlightedPullRequestId] = useState<string | null>(null)
 
   const actor = bootstrap?.actor ?? null
@@ -143,28 +196,38 @@ function App() {
       setCommitActivePath(null)
       setCommitBlob(null)
       setCommitDiff(null)
+      setIssues([])
+      setIssueMetadata({ labels: [], milestones: [], assignees: [] })
+      setSelectedIssueId(null)
       setPullRequests([])
       setSelectedPullRequestId(null)
       return
     }
 
-    const [nextSettings, nextBranches, nextPullRequests] = await Promise.all([
+    const [nextSettings, nextBranches, nextIssues, nextIssueMetadata, nextPullRequests] = await Promise.all([
       api.settings(),
       api.branches(),
+      api.issues(),
+      api.issueMetadata(),
       api.pullRequests(),
     ])
 
     setSettings(nextSettings)
     setBranches(nextBranches)
+    setIssues(nextIssues)
+    setIssueMetadata(nextIssueMetadata)
     setPullRequests(nextPullRequests)
 
+    const nextSelectedIssueId =
+      selectedIssueId && nextIssues.some((issue) => issue.id === selectedIssueId) ? selectedIssueId : null
     const nextSelectedPullRequestId =
       selectedPullRequestId && nextPullRequests.some((pullRequest) => pullRequest.id === selectedPullRequestId)
         ? selectedPullRequestId
         : null
 
-    if (nextSelectedPullRequestId) {
-      setSelectedPullRequestId(nextSelectedPullRequestId)
+    if (nextSelectedIssueId) {
+      setSelectedIssueId(nextSelectedIssueId)
+      setSelectedPullRequestId(null)
       setSelectedCommitId(null)
       setCommitDetail(null)
       setLoadingCommitDetail(false)
@@ -178,8 +241,25 @@ function App() {
       return
     }
 
+    if (nextSelectedPullRequestId) {
+      setSelectedPullRequestId(nextSelectedPullRequestId)
+      setSelectedIssueId(null)
+      setSelectedCommitId(null)
+      setCommitDetail(null)
+      setLoadingCommitDetail(false)
+      setCommitTreeCache({})
+      setCommitReadme(null)
+      setCommitCodePath('')
+      setCommitCodeTree([])
+      setCommitActivePath(null)
+      setCommitBlob(null)
+      setCommitDiff(null)
+      return
+    }
+
+    setSelectedIssueId(null)
     setSelectedPullRequestId(null)
-  }, [selectedPullRequestId])
+  }, [selectedIssueId, selectedPullRequestId])
 
   useEffect(() => {
     const run = async () => {
@@ -231,7 +311,45 @@ function App() {
 
         if (progress.status === 'approved') {
           setAuthError(null)
-          setRequestMessage('Request approved. Ask the owner for your one-time setup code, then use the setup code tab.')
+          setRequestMessage('Request approved. Finishing sign-in…')
+          const receipt = requestReceipt
+          if (!receipt) {
+            return
+          }
+          const password = generateOnboardingPassword()
+          const candidates = usernameCandidatesForAccessRequest(receipt.email)
+          let completed = false
+          let lastError: unknown
+          for (const username of candidates) {
+            try {
+              await api.completeOnboarding(receipt.secret, username, password)
+              completed = true
+              break
+            } catch (error) {
+              lastError = error
+            }
+          }
+          if (!completed) {
+            setAuthError(
+              lastError instanceof Error
+                ? lastError.message
+                : 'Automatic sign-in failed after approval.',
+            )
+            setRequestMessage(
+              'Your request was approved, but automatic sign-in failed. Ask an owner for a one-time setup code and use the “Use setup code” tab.',
+            )
+            return
+          }
+          writePendingAccessReceipt(null)
+          setRequestReceipt(null)
+          setRequestMessage(null)
+          setSetupMessage(null)
+          setError(null)
+          try {
+            await loadAppState()
+          } catch (loadError) {
+            setError(loadError instanceof Error ? loadError.message : 'failed to load UI state')
+          }
           return
         }
 
@@ -267,7 +385,19 @@ function App() {
         window.clearTimeout(timeoutId)
       }
     }
-  }, [actor, bootstrap, requestReceipt])
+  }, [actor, bootstrap, loadAppState, requestReceipt])
+
+  useEffect(() => {
+    if (!highlightedIssueId) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setHighlightedIssueId(null)
+    }, 5000)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [highlightedIssueId])
 
   useEffect(() => {
     if (!highlightedPullRequestId) {
@@ -285,14 +415,16 @@ function App() {
     syncUrlState({
       branch: selectedBranch,
       commit: selectedCommitId,
+      issue: selectedIssueId,
       pr: selectedPullRequestId,
     })
-  }, [selectedBranch, selectedCommitId, selectedPullRequestId, syncUrlState])
+  }, [selectedBranch, selectedCommitId, selectedIssueId, selectedPullRequestId, syncUrlState])
 
   useEffect(() => {
     const handlePopState = () => {
       setSelectedBranch(getQueryParam(window.location.search, 'branch'))
       setSelectedCommitId(getQueryParam(window.location.search, 'commit'))
+      setSelectedIssueId(getQueryParam(window.location.search, 'issue'))
       setSelectedPullRequestId(getQueryParam(window.location.search, 'pr'))
     }
 
@@ -688,7 +820,7 @@ function App() {
           setSetupMessage(null)
           try {
             const submitted = await api.requestAccess(name, email)
-            const receipt = { id: submitted.request.id, secret: submitted.secret }
+            const receipt = { id: submitted.request.id, secret: submitted.secret, email: submitted.request.email }
             writePendingAccessReceipt(receipt)
             setRequestReceipt(receipt)
             setRequestMessage('Access request sent. Waiting for the owner to approve…')
@@ -741,10 +873,14 @@ function App() {
         codePath={codePath}
         codeTree={codeTree}
         history={history}
+        highlightedIssueId={highlightedIssueId}
         highlightedPullRequestId={highlightedPullRequestId}
+        issueMetadata={issueMetadata}
+        issues={issues}
         loadingCommitDetail={loadingCommitDetail}
         loadingMoreCommits={loadingMoreCommits}
         selectedBranch={selectedBranchExists ? selectedBranch : null}
+        selectedIssueId={selectedIssueId}
         selectedPullRequestId={selectedPullRequestId}
         treeCache={treeCache}
         onCheckoutBranch={async (name) => {
@@ -767,7 +903,11 @@ function App() {
         }}
         onApproveAccessRequest={async (id) => {
           const issued = await api.approveAccessRequest(id)
-          setToastMessage(`Approved ${issued.email}. Share the one-time setup code now.`)
+          setToastMessage(
+            issued.secret
+              ? `Approved ${issued.email}. Share the one-time setup code now.`
+              : `Approved ${issued.email}. They can finish signing in from their pending request browser tab.`,
+          )
           await refresh()
           return issued
         }}
@@ -820,6 +960,20 @@ function App() {
           setToastMessage('PAT revoked.')
           await refresh()
         }}
+        onCreateIssue={async (payload) => {
+          const createdIssue = await api.createIssue(payload)
+          setIssues((current) => {
+            const nextIssues = current.filter((issue) => issue.id !== createdIssue.id)
+            return [createdIssue, ...nextIssues]
+          })
+          setSelectedIssueId(createdIssue.id)
+          setHighlightedIssueId(createdIssue.id)
+          setToastMessage(`Issue #${createdIssue.number} created.`)
+          void refresh().catch((loadError) => {
+            setError(loadError instanceof Error ? loadError.message : 'failed to refresh UI state')
+          })
+          return createdIssue
+        }}
         onCreatePullRequest={async (payload) => {
           const createdPullRequest = await api.createPullRequest(payload)
           setPullRequests((current) => {
@@ -838,6 +992,25 @@ function App() {
           await api.deleteBranch(name)
           await refresh()
         }}
+        onDeleteIssue={async (id) => {
+          const deletedIssue = await api.deleteIssue(id)
+          if (selectedIssueId === id) {
+            setSelectedIssueId(null)
+          }
+          setToastMessage(`Issue #${deletedIssue.number} deleted.`)
+          await refresh()
+          return deletedIssue
+        }}
+        onDeleteIssueLabel={async (id) => {
+          await api.deleteIssueLabel(id)
+          setToastMessage('Issue label deleted.')
+          await refresh()
+        }}
+        onDeleteIssueMilestone={async (id) => {
+          await api.deleteIssueMilestone(id)
+          setToastMessage('Issue milestone deleted.')
+          await refresh()
+        }}
         onDeletePullRequest={async (id) => {
           const deletedPullRequest = await api.deletePullRequest(id)
           if (selectedPullRequestId === id) {
@@ -850,6 +1023,21 @@ function App() {
         onMergePullRequest={async (id) => {
           await api.mergePullRequest(id)
           await refresh()
+        }}
+        onCommentIssue={async (id, payload) => {
+          const updatedIssue = await api.commentIssue(id, payload)
+          await refresh()
+          return updatedIssue
+        }}
+        onReactIssue={async (id, payload) => {
+          const updatedIssue = await api.reactIssue(id, payload)
+          await refresh()
+          return updatedIssue
+        }}
+        onReactIssueComment={async (id, commentId, payload) => {
+          const updatedIssue = await api.reactIssueComment(id, commentId, payload)
+          await refresh()
+          return updatedIssue
         }}
         onReviewPullRequest={async (id, payload) => {
           const updatedPullRequest = await api.reviewPullRequest(id, payload)
@@ -907,14 +1095,16 @@ function App() {
         }}
         onViewBranchCode={(name) => {
           const nextBranch = name === bootstrap.checked_out_branch ? null : name
-          pushUrlState({ branch: nextBranch, commit: null, pr: null, tab: 'code' })
+          pushUrlState({ branch: nextBranch, commit: null, issue: null, pr: null, tab: 'code' })
           setSelectedCommitId(null)
           setCommitDetail(null)
+          setSelectedIssueId(null)
           setSelectedPullRequestId(null)
           setSelectedBranch(nextBranch)
         }}
         onSelectCommit={(commit) => {
-          pushUrlState({ commit, pr: null })
+          pushUrlState({ commit, issue: null, pr: null })
+          setSelectedIssueId(null)
           setSelectedPullRequestId(null)
           setSelectedCommitId(commit)
         }}
@@ -922,10 +1112,22 @@ function App() {
           pushUrlState({ commit: null })
           setSelectedCommitId(null)
         }}
-        onSelectPullRequest={(id) => {
-          pushUrlState({ commit: null, pr: id })
+        onSelectIssue={(id) => {
+          pushUrlState({ commit: null, issue: id, pr: null })
           setSelectedCommitId(null)
           setCommitDetail(null)
+          setSelectedPullRequestId(null)
+          setSelectedIssueId(id)
+        }}
+        onClearSelectedIssue={() => {
+          pushUrlState({ issue: null })
+          setSelectedIssueId(null)
+        }}
+        onSelectPullRequest={(id) => {
+          pushUrlState({ commit: null, issue: null, pr: id })
+          setSelectedCommitId(null)
+          setCommitDetail(null)
+          setSelectedIssueId(null)
           setSelectedPullRequestId(id)
         }}
         onClearSelectedPullRequest={() => {
@@ -942,6 +1144,39 @@ function App() {
           setToastMessage(`Default branch switched to "${name}".`)
           await refresh()
         }}
+        onSetIssueLabels={async (id, labelIds) => {
+          const updatedIssue = await api.setIssueLabels(id, labelIds)
+          await refresh()
+          return updatedIssue
+        }}
+        onSetIssueAssignees={async (id, assigneeUserIds) => {
+          const updatedIssue = await api.setIssueAssignees(id, assigneeUserIds)
+          await refresh()
+          return updatedIssue
+        }}
+        onSetIssueMilestone={async (id, milestoneId) => {
+          const updatedIssue = await api.setIssueMilestone(id, milestoneId)
+          await refresh()
+          return updatedIssue
+        }}
+        onLinkIssuePullRequest={async (id, pullRequestId) => {
+          const updatedIssue = await api.linkIssuePullRequest(id, pullRequestId)
+          await refresh()
+          return updatedIssue
+        }}
+        onUnlinkIssuePullRequest={async (id, pullRequestId) => {
+          const updatedIssue = await api.unlinkIssuePullRequest(id, pullRequestId)
+          await refresh()
+          return updatedIssue
+        }}
+        onUpsertIssueLabel={async (payload) => {
+          await api.upsertIssueLabel(payload)
+          await refresh()
+        }}
+        onUpsertIssueMilestone={async (payload) => {
+          await api.upsertIssueMilestone(payload)
+          await refresh()
+        }}
         onUpdateBranchRule={async (payload) => {
           await api.upsertBranchRule(payload)
           setToastMessage(`Branch rule "${payload.pattern}" saved.`)
@@ -956,6 +1191,11 @@ function App() {
           const updatedPullRequest = await api.updatePullRequest(id, payload)
           await refresh()
           return updatedPullRequest
+        }}
+        onUpdateIssue={async (id, payload) => {
+          const updatedIssue = await api.updateIssue(id, payload)
+          await refresh()
+          return updatedIssue
         }}
         pullRequests={pullRequests}
         readme={readme}

@@ -1,21 +1,21 @@
 import { useEffect, useState } from 'react'
 
-const STORAGE_KEY = 'qit.pull_request.display_name'
+const DEFAULT_STORAGE_KEY = 'qit.pull_request.display_name'
 
-export function usePersistentDisplayName() {
+export function usePersistentDisplayName(storageKey = DEFAULT_STORAGE_KEY) {
   const [displayName, setDisplayName] = useState(() => {
     if (typeof window === 'undefined') {
       return ''
     }
-    return window.localStorage.getItem(STORAGE_KEY) ?? ''
+    return window.localStorage.getItem(storageKey) ?? ''
   })
 
   useEffect(() => {
     if (typeof window === 'undefined') {
       return
     }
-    window.localStorage.setItem(STORAGE_KEY, displayName)
-  }, [displayName])
+    window.localStorage.setItem(storageKey, displayName)
+  }, [displayName, storageKey])
 
   return [displayName, setDisplayName] as const
 }

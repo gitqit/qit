@@ -10,13 +10,16 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use qit_domain::{
     AccessRequestView, AuthActor, AuthMethod, AuthMode, AuthenticatedPrincipal, BlobContent,
-    BranchInfo, CommitDetail, CommitHistory, CommitRefDecoration, CommitRefKind,
-    CreatePullRequest, CreatePullRequestComment, CreatePullRequestReview, DomainError,
-    PatRecordView, PullRequestActivityRecord, PullRequestRecord, PullRequestReviewRecord,
-    PullRequestReviewState, PullRequestReviewSummary, PullRequestStatus, RefComparison, RefDiffFile,
-    RepoReadStore, RepoUserRole, RepoUserView, RepositorySettings, SessionCredentials, UiRole,
-    UpdatePullRequest, UpdateRepositorySettings, UpsertBranchRule, WorkspaceService, WorkspaceSpec,
-    WorkspaceWebUiState,
+    BranchInfo, CommitDetail, CommitHistory, CommitRefDecoration, CommitRefKind, CreateIssue,
+    CreateIssueComment, CreatePullRequest, CreatePullRequestComment, CreatePullRequestReview,
+    DomainError, IssueActor, IssueActorInput, IssueCommentRecord, IssueLabel, IssueLinkRelation,
+    IssueLinkSource, IssueMilestone, IssueReactionContent, IssueReactionSummary, IssueRecord,
+    IssueStatus, IssueTimelineEvent, PatRecordView, PullRequestActivityRecord, PullRequestRecord,
+    PullRequestReviewRecord, PullRequestReviewState, PullRequestReviewSummary, PullRequestStatus,
+    RefComparison, RefDiffFile, RepoReadStore, RepoUserRole, RepoUserStatus, RepoUserView,
+    RepositorySettings, SessionCredentials, UiRole, UpdateIssue, UpdatePullRequest,
+    UpdateRepositorySettings, UpsertBranchRule, UpsertIssueLabel, UpsertIssueMilestone,
+    WorkspaceService, WorkspaceSpec, WorkspaceWebUiState,
 };
 use rand::distributions::{Alphanumeric, DistString};
 use serde::{Deserialize, Serialize};
@@ -36,8 +39,7 @@ const CHUNK_VENDOR_JS: &[u8] = include_bytes!("../frontend/dist/assets/chunk-ven
 const CHUNK_VENDOR_UI_JS: &[u8] = include_bytes!("../frontend/dist/assets/chunk-vendor-ui.js");
 const CHUNK_VENDOR_MARKDOWN_JS: &[u8] =
     include_bytes!("../frontend/dist/assets/chunk-vendor-markdown.js");
-const CHUNK_VENDOR_TREE_JS: &[u8] =
-    include_bytes!("../frontend/dist/assets/chunk-vendor-tree.js");
+const CHUNK_VENDOR_TREE_JS: &[u8] = include_bytes!("../frontend/dist/assets/chunk-vendor-tree.js");
 const CHUNK_VENDOR_MONACO_JS: &[u8] =
     include_bytes!("../frontend/dist/assets/chunk-vendor-monaco.js");
 const CHUNK_MONACO_CODE_SURFACE_JS: &[u8] =
@@ -143,6 +145,49 @@ struct PullRequestsResponse {
 }
 
 #[derive(Serialize)]
+struct IssuesResponse {
+    issues: Vec<IssueRecord>,
+}
+
+#[derive(Serialize)]
+struct IssueAssigneeView {
+    id: String,
+    name: String,
+    username: String,
+    role: RepoUserRole,
+}
+
+#[derive(Serialize)]
+struct IssueMetadataResponse {
+    labels: Vec<IssueLabel>,
+    milestones: Vec<IssueMilestone>,
+    assignees: Vec<IssueAssigneeView>,
+}
+
+#[derive(Serialize)]
+struct IssueCommentResponse {
+    comment: IssueCommentRecord,
+    reaction_summary: Vec<IssueReactionSummary>,
+}
+
+#[derive(Serialize)]
+struct IssueDetailResponse {
+    issue: IssueRecord,
+    comments: Vec<IssueCommentResponse>,
+    timeline: Vec<IssueTimelineEvent>,
+    linked_pull_requests: Vec<IssueLinkedPullRequestView>,
+    reaction_summary: Vec<IssueReactionSummary>,
+    metadata: IssueMetadataResponse,
+}
+
+#[derive(Serialize)]
+struct IssueLinkedPullRequestView {
+    relation: IssueLinkRelation,
+    source: IssueLinkSource,
+    pull_request: PullRequestRecord,
+}
+
+#[derive(Serialize)]
 struct TreeResponse {
     entries: Vec<qit_domain::TreeEntry>,
 }
@@ -157,10 +202,18 @@ struct PullRequestDetailResponse {
     pull_request: PullRequestRecord,
     comparison: Option<RefComparison>,
     diffs: Option<Vec<RefDiffFile>>,
+    linked_issues: Vec<PullRequestLinkedIssueView>,
     comments: Vec<qit_domain::PullRequestCommentRecord>,
     reviews: Vec<PullRequestReviewRecord>,
     review_summary: PullRequestReviewSummary,
     activity: Vec<PullRequestActivityRecord>,
+}
+
+#[derive(Serialize)]
+struct PullRequestLinkedIssueView {
+    relation: IssueLinkRelation,
+    source: IssueLinkSource,
+    issue: IssueRecord,
 }
 
 #[derive(Serialize)]
@@ -265,6 +318,90 @@ struct PullRequestReviewRequest {
     display_name: String,
     body: String,
     state: PullRequestReviewState,
+}
+
+#[derive(Deserialize)]
+struct IssueCreateRequest {
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    label_ids: Vec<String>,
+    #[serde(default)]
+    assignee_user_ids: Vec<String>,
+    #[serde(default)]
+    milestone_id: Option<String>,
+    #[serde(default)]
+    linked_pull_request_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct IssueUpdateRequest {
+    title: Option<String>,
+    description: Option<String>,
+    status: Option<IssueStatusRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IssueStatusRequest {
+    Open,
+    Closed,
+}
+
+#[derive(Deserialize)]
+struct IssueCommentRequest {
+    #[serde(default)]
+    display_name: Option<String>,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct IssueReactionRequest {
+    content: IssueReactionContent,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IssueLabelsRequest {
+    label_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct IssueAssigneesRequest {
+    assignee_user_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct IssueMilestoneRequest {
+    #[serde(default)]
+    milestone_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IssueLinkPullRequestRequest {
+    pull_request_id: String,
+}
+
+#[derive(Deserialize)]
+struct IssueLabelUpsertRequest {
+    id: Option<String>,
+    name: String,
+    #[serde(default)]
+    color: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct IssueMilestoneUpsertRequest {
+    id: Option<String>,
+    title: String,
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Deserialize)]
@@ -383,7 +520,10 @@ impl WebUiServer {
             .route(&format!("{mount}/api/session/login"), post(login))
             .route(&format!("{mount}/api/session/logout"), post(logout))
             .route(&format!("{mount}/api/auth/mode"), post(update_auth_mode))
-            .route(&format!("{mount}/api/access-requests"), post(create_access_request))
+            .route(
+                &format!("{mount}/api/access-requests"),
+                post(create_access_request),
+            )
             .route(
                 &format!("{mount}/api/access-requests/status"),
                 post(read_access_request_status),
@@ -396,21 +536,39 @@ impl WebUiServer {
                 &format!("{mount}/api/access-requests/{{id}}/reject"),
                 post(reject_access_request),
             )
-            .route(&format!("{mount}/api/users/setup-token"), post(issue_setup_token))
-            .route(&format!("{mount}/api/onboarding/complete"), post(complete_onboarding))
+            .route(
+                &format!("{mount}/api/users/setup-token"),
+                post(issue_setup_token),
+            )
+            .route(
+                &format!("{mount}/api/onboarding/complete"),
+                post(complete_onboarding),
+            )
             .route(
                 &format!("{mount}/api/settings"),
                 get(get_settings).patch(update_settings),
             )
-            .route(&format!("{mount}/api/users/{{id}}/promote"), post(promote_user))
-            .route(&format!("{mount}/api/users/{{id}}/demote"), post(demote_user))
-            .route(&format!("{mount}/api/users/{{id}}/revoke"), post(revoke_user))
+            .route(
+                &format!("{mount}/api/users/{{id}}/promote"),
+                post(promote_user),
+            )
+            .route(
+                &format!("{mount}/api/users/{{id}}/demote"),
+                post(demote_user),
+            )
+            .route(
+                &format!("{mount}/api/users/{{id}}/revoke"),
+                post(revoke_user),
+            )
             .route(
                 &format!("{mount}/api/users/{{id}}/reset-setup"),
                 post(reset_user_setup),
             )
             .route(&format!("{mount}/api/profile/pats"), post(create_pat))
-            .route(&format!("{mount}/api/profile/pats/{{id}}"), delete(revoke_pat))
+            .route(
+                &format!("{mount}/api/profile/pats/{{id}}"),
+                delete(revoke_pat),
+            )
             .route(
                 &format!("{mount}/api/settings/branch-rules"),
                 put(upsert_branch_rule),
@@ -444,7 +602,9 @@ impl WebUiServer {
             )
             .route(
                 &format!("{mount}/api/pull-requests/{{id}}"),
-                get(read_pull_request).patch(update_pull_request).delete(delete_pull_request),
+                get(read_pull_request)
+                    .patch(update_pull_request)
+                    .delete(delete_pull_request),
             )
             .route(
                 &format!("{mount}/api/pull-requests/{{id}}/comments"),
@@ -457,6 +617,63 @@ impl WebUiServer {
             .route(
                 &format!("{mount}/api/pull-requests/{{id}}/merge"),
                 post(merge_pull_request),
+            )
+            .route(
+                &format!("{mount}/api/issues"),
+                get(list_issues).post(create_issue),
+            )
+            .route(&format!("{mount}/api/issues/meta"), get(issue_metadata))
+            .route(
+                &format!("{mount}/api/issues/labels"),
+                put(upsert_issue_label),
+            )
+            .route(
+                &format!("{mount}/api/issues/labels/{{id}}"),
+                delete(delete_issue_label),
+            )
+            .route(
+                &format!("{mount}/api/issues/milestones"),
+                put(upsert_issue_milestone),
+            )
+            .route(
+                &format!("{mount}/api/issues/milestones/{{id}}"),
+                delete(delete_issue_milestone),
+            )
+            .route(
+                &format!("{mount}/api/issues/{{id}}"),
+                get(read_issue).patch(update_issue).delete(delete_issue),
+            )
+            .route(
+                &format!("{mount}/api/issues/{{id}}/comments"),
+                post(comment_issue),
+            )
+            .route(
+                &format!("{mount}/api/issues/{{id}}/reactions"),
+                post(react_issue),
+            )
+            .route(
+                &format!("{mount}/api/issues/{{id}}/comments/{{comment_id}}/reactions"),
+                post(react_issue_comment),
+            )
+            .route(
+                &format!("{mount}/api/issues/{{id}}/labels"),
+                put(set_issue_labels),
+            )
+            .route(
+                &format!("{mount}/api/issues/{{id}}/assignees"),
+                put(set_issue_assignees),
+            )
+            .route(
+                &format!("{mount}/api/issues/{{id}}/milestone"),
+                put(set_issue_milestone),
+            )
+            .route(
+                &format!("{mount}/api/issues/{{id}}/links/pull-requests"),
+                post(link_issue_pull_request),
+            )
+            .route(
+                &format!("{mount}/api/issues/{{id}}/links/pull-requests/{{pull_request_id}}"),
+                delete(unlink_issue_pull_request),
             )
             .with_state(state)
     }
@@ -477,7 +694,13 @@ impl WebUiServer {
     fn repo_og_svg(&self) -> String {
         let repo = self.repo_name();
         let title_lines = split_repo_name(&repo);
-        let title_font_size = if title_lines.iter().map(|line| line.chars().count()).max().unwrap_or(0) > 20 {
+        let title_font_size = if title_lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            > 20
+        {
             54
         } else {
             64
@@ -581,7 +804,6 @@ impl WebUiServer {
             )
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     }
-
 }
 
 fn settings_response(
@@ -648,15 +870,126 @@ fn auth_actor_from_session(session: &ResolvedSession) -> AuthActor {
     }
 }
 
+fn issue_actor_input_from_session(
+    session: &ResolvedSession,
+    display_name: Option<String>,
+) -> IssueActorInput {
+    IssueActorInput {
+        role: session.actor.clone(),
+        display_name,
+        user_id: session
+            .principal
+            .as_ref()
+            .map(|principal| principal.user_id.clone()),
+        username: session
+            .principal
+            .as_ref()
+            .map(|principal| principal.username.clone()),
+    }
+}
+
+fn issue_viewer_actor(session: Option<&ResolvedSession>) -> Option<IssueActor> {
+    session.map(|session| IssueActor {
+        role: session.actor.clone(),
+        display_name: session
+            .principal
+            .as_ref()
+            .map(|principal| principal.name.clone())
+            .unwrap_or_else(|| match session.actor {
+                UiRole::Owner => "Owner".into(),
+                UiRole::User => "Viewer".into(),
+            }),
+        user_id: session
+            .principal
+            .as_ref()
+            .map(|principal| principal.user_id.clone()),
+        username: session
+            .principal
+            .as_ref()
+            .map(|principal| principal.username.clone()),
+    })
+}
+
+fn issue_metadata_response(web_ui: &WorkspaceWebUiState) -> IssueMetadataResponse {
+    IssueMetadataResponse {
+        labels: web_ui.issue_settings.labels.clone(),
+        milestones: web_ui.issue_settings.milestones.clone(),
+        assignees: web_ui
+            .auth
+            .users
+            .iter()
+            .filter(|user| user.status == RepoUserStatus::Active)
+            .filter_map(|user| {
+                user.username.as_ref().map(|username| IssueAssigneeView {
+                    id: user.id.clone(),
+                    name: user.name.clone(),
+                    username: username.clone(),
+                    role: user.role.clone(),
+                })
+            })
+            .collect(),
+    }
+}
+
+fn issue_linked_pull_request_views(
+    issue: &IssueRecord,
+    web_ui: &WorkspaceWebUiState,
+) -> Vec<IssueLinkedPullRequestView> {
+    WorkspaceService::linked_pull_requests_for_issue(issue, &web_ui.issues, &web_ui.pull_requests)
+        .into_iter()
+        .filter_map(|link| {
+            web_ui
+                .pull_requests
+                .iter()
+                .find(|pull_request| pull_request.id == link.pull_request_id)
+                .cloned()
+                .map(|pull_request| IssueLinkedPullRequestView {
+                    relation: link.relation,
+                    source: link.source,
+                    pull_request,
+                })
+        })
+        .collect()
+}
+
+fn pull_request_linked_issue_views(
+    pull_request: &PullRequestRecord,
+    web_ui: &WorkspaceWebUiState,
+) -> Vec<PullRequestLinkedIssueView> {
+    WorkspaceService::linked_issues_for_pull_request(
+        pull_request,
+        &web_ui.issues,
+        &web_ui.pull_requests,
+    )
+    .into_iter()
+    .filter_map(|link| {
+        web_ui
+            .issues
+            .iter()
+            .find(|issue| issue.id == link.issue_id)
+            .cloned()
+            .map(|issue| PullRequestLinkedIssueView {
+                relation: link.relation,
+                source: link.source,
+                issue,
+            })
+    })
+    .collect()
+}
+
 fn domain_status(error: &DomainError) -> StatusCode {
     match error {
         DomainError::InvalidPullRequest(_)
+        | DomainError::InvalidIssue(_)
         | DomainError::InvalidSettings(_)
         | DomainError::BranchRuleViolation(_)
         | DomainError::InvalidAuth(_)
         | DomainError::ExportedBranchConflict { .. } => StatusCode::BAD_REQUEST,
         DomainError::AccessRequestNotFound(_)
         | DomainError::UserNotFound(_)
+        | DomainError::IssueNotFound(_)
+        | DomainError::IssueLabelNotFound(_)
+        | DomainError::IssueMilestoneNotFound(_)
         | DomainError::PatNotFound(_)
         | DomainError::MissingSidecar(_) => StatusCode::NOT_FOUND,
         DomainError::InvalidOnboardingToken | DomainError::AuthenticationFailed => {
@@ -710,7 +1043,7 @@ fn split_repo_name(repo: &str) -> Vec<String> {
         .iter()
         .enumerate()
         .take(target + 1)
-        .filter_map(|(index, ch)| matches!(ch, '-' | '_' | '.' | ' ') .then_some(index + 1))
+        .filter_map(|(index, ch)| matches!(ch, '-' | '_' | '.' | ' ').then_some(index + 1))
         .last()
         .unwrap_or(target);
 
@@ -749,17 +1082,22 @@ fn static_asset(asset_path: &str) -> Option<(&'static str, &'static [u8])> {
     match asset_path {
         "app.js" => Some(("text/javascript; charset=utf-8", APP_JS)),
         "app.css" => Some(("text/css; charset=utf-8", APP_CSS)),
-        "chunk-rolldown-runtime.js" => Some(("text/javascript; charset=utf-8", CHUNK_ROLLDOWN_RUNTIME_JS)),
+        "chunk-rolldown-runtime.js" => {
+            Some(("text/javascript; charset=utf-8", CHUNK_ROLLDOWN_RUNTIME_JS))
+        }
         "chunk-vendor.js" => Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_JS)),
         "chunk-vendor-ui.js" => Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_UI_JS)),
         "chunk-vendor-markdown.js" => {
             Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_MARKDOWN_JS))
         }
         "chunk-vendor-tree.js" => Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_TREE_JS)),
-        "chunk-vendor-monaco.js" => Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_MONACO_JS)),
-        "chunk-MonacoCodeSurface.js" => {
-            Some(("text/javascript; charset=utf-8", CHUNK_MONACO_CODE_SURFACE_JS))
+        "chunk-vendor-monaco.js" => {
+            Some(("text/javascript; charset=utf-8", CHUNK_VENDOR_MONACO_JS))
         }
+        "chunk-MonacoCodeSurface.js" => Some((
+            "text/javascript; charset=utf-8",
+            CHUNK_MONACO_CODE_SURFACE_JS,
+        )),
         "qit-logo-on-dark.png" => Some(("image/png", QIT_LOGO_ON_DARK)),
         "qit-logo-on-light.png" => Some(("image/png", QIT_LOGO_ON_LIGHT)),
         _ => None,
@@ -770,7 +1108,10 @@ async fn asset(AxumPath(asset_path): AxumPath<String>) -> Result<impl IntoRespon
     let Some((content_type, body)) = static_asset(&asset_path) else {
         return Err(StatusCode::NOT_FOUND);
     };
-    Ok(([(CONTENT_TYPE, HeaderValue::from_static(content_type))], body))
+    Ok((
+        [(CONTENT_TYPE, HeaderValue::from_static(content_type))],
+        body,
+    ))
 }
 
 async fn qit_og_image(State(state): State<Arc<WebUiServer>>) -> impl IntoResponse {
@@ -790,10 +1131,13 @@ async fn bootstrap(
     let (workspace, web_ui) = state.latest_workspace()?;
     let session = state.current_session(&headers).await?;
     let auth_mode = web_ui.auth.mode.clone();
-    let git_credentials_visible = state.can_view_git_credentials(session.as_ref(), &web_ui.auth.methods);
+    let git_credentials_visible =
+        state.can_view_git_credentials(session.as_ref(), &web_ui.auth.methods);
     Ok(Json(BootstrapResponse {
         actor: session.as_ref().map(|session| session.actor.clone()),
-        principal: session.as_ref().and_then(|session| session.principal.clone()),
+        principal: session
+            .as_ref()
+            .and_then(|session| session.principal.clone()),
         repo_name: state.repo_name(),
         worktree: workspace.worktree.display().to_string(),
         exported_branch: workspace.exported_branch,
@@ -833,7 +1177,10 @@ async fn login(
     state.allow_login_attempt(&headers).await?;
     let (_, auth) = state
         .workspace_service
-        .read_auth_state(state.workspace.worktree.clone(), &state.workspace.exported_branch)
+        .read_auth_state(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+        )
         .map_err(|error| domain_status(&error))?;
     let session_record = if auth.has_method(&AuthMethod::BasicAuth)
         && credentials_match(&body.username, &body.password, &state.credentials)
@@ -844,15 +1191,12 @@ async fn login(
             expires_at_ms: WebUiServer::now_ms().saturating_add(SESSION_TTL_MS),
         }
     } else {
-        let (_, principal) = match state
-            .workspace_service
-            .authenticate_web_user(
-                state.workspace.worktree.clone(),
-                &state.workspace.exported_branch,
-                &body.username,
-                &body.password,
-            )
-        {
+        let (_, principal) = match state.workspace_service.authenticate_web_user(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &body.username,
+            &body.password,
+        ) {
             Ok(value) => value,
             Err(error) => {
                 if matches!(error, DomainError::AuthenticationFailed) {
@@ -1517,14 +1861,18 @@ async fn read_pull_request(
     let (workspace, web_ui) = state.latest_workspace()?;
     let Some(pull_request) = web_ui
         .pull_requests
-        .into_iter()
+        .iter()
         .find(|pull_request| pull_request.id == id)
+        .cloned()
     else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let (base_ref, head_ref) =
-        qit_domain::resolve_pull_request_refs(state.repo_read_store.as_ref(), &workspace, &pull_request)
-            .await;
+    let (base_ref, head_ref) = qit_domain::resolve_pull_request_refs(
+        state.repo_read_store.as_ref(),
+        &workspace,
+        &pull_request,
+    )
+    .await;
 
     let comparison_result = state
         .repo_read_store
@@ -1536,6 +1884,7 @@ async fn read_pull_request(
         .await;
     let comparison = comparison_result.ok();
     let diffs = diffs_result.ok();
+    let linked_issues = pull_request_linked_issue_views(&pull_request, &web_ui);
     let comments = WorkspaceService::pull_request_comments(&pull_request);
     let reviews = WorkspaceService::pull_request_reviews(&pull_request);
     let review_summary = WorkspaceService::pull_request_review_summary(&pull_request);
@@ -1545,6 +1894,7 @@ async fn read_pull_request(
         pull_request,
         comparison,
         diffs,
+        linked_issues,
         comments,
         reviews,
         review_summary,
@@ -1680,17 +2030,422 @@ async fn merge_pull_request(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<PullRequestRecord>, StatusCode> {
-    state.require_owner(&headers).await?;
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let (_, pull_request) = state
         .workspace_service
         .merge_pull_request(
             state.workspace.worktree.clone(),
             &state.workspace.exported_branch,
             &id,
+            issue_actor_input_from_session(&session, None),
         )
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok(Json(pull_request))
+}
+
+async fn list_issues(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+) -> Result<Json<IssuesResponse>, StatusCode> {
+    state.require_actor(&headers).await?;
+    let (_, web_ui) = state.latest_workspace()?;
+    Ok(Json(IssuesResponse {
+        issues: web_ui.issues,
+    }))
+}
+
+async fn issue_metadata(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+) -> Result<Json<IssueMetadataResponse>, StatusCode> {
+    state.require_actor(&headers).await?;
+    let (_, web_ui) = state.latest_workspace()?;
+    Ok(Json(issue_metadata_response(&web_ui)))
+}
+
+async fn read_issue(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<IssueDetailResponse>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    let (_, web_ui) = state.latest_workspace()?;
+    let issue = web_ui
+        .issues
+        .iter()
+        .find(|issue| issue.id == id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let viewer_actor = issue_viewer_actor(Some(&session));
+    let comments = issue
+        .comments
+        .iter()
+        .cloned()
+        .map(|comment| IssueCommentResponse {
+            reaction_summary: WorkspaceService::issue_comment_reaction_summary(
+                &comment,
+                viewer_actor.as_ref(),
+            ),
+            comment,
+        })
+        .collect();
+    let linked_pull_requests = issue_linked_pull_request_views(&issue, &web_ui);
+    Ok(Json(IssueDetailResponse {
+        reaction_summary: WorkspaceService::issue_reaction_summary(&issue, viewer_actor.as_ref()),
+        comments,
+        timeline: issue.timeline.clone(),
+        linked_pull_requests,
+        metadata: issue_metadata_response(&web_ui),
+        issue,
+    }))
+}
+
+async fn create_issue(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    Json(body): Json<IssueCreateRequest>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    let (_, issue) = state
+        .workspace_service
+        .create_issue(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            CreateIssue {
+                title: body.title,
+                description: body.description,
+                label_ids: body.label_ids,
+                assignee_user_ids: body.assignee_user_ids,
+                milestone_id: body.milestone_id,
+                linked_pull_request_ids: body.linked_pull_request_ids,
+            },
+            issue_actor_input_from_session(&session, body.display_name),
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn update_issue(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<IssueUpdateRequest>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    let status = body.status.map(|status| match status {
+        IssueStatusRequest::Open => IssueStatus::Open,
+        IssueStatusRequest::Closed => IssueStatus::Closed,
+    });
+    let (_, issue) = state
+        .workspace_service
+        .update_issue(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            UpdateIssue {
+                title: body.title,
+                description: body.description,
+                status,
+            },
+            issue_actor_input_from_session(&session, None),
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn delete_issue(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    state.require_owner(&headers).await?;
+    let (_, issue) = state
+        .workspace_service
+        .delete_issue(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn comment_issue(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<IssueCommentRequest>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    let (_, issue) = state
+        .workspace_service
+        .comment_issue(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            CreateIssueComment {
+                display_name: body.display_name.clone(),
+                body: body.body,
+            },
+            issue_actor_input_from_session(&session, body.display_name),
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn react_issue(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<IssueReactionRequest>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    let (_, issue) = state
+        .workspace_service
+        .toggle_issue_reaction(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            body.content,
+            issue_actor_input_from_session(&session, body.display_name),
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn react_issue_comment(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath((id, comment_id)): AxumPath<(String, String)>,
+    Json(body): Json<IssueReactionRequest>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    let (_, issue) = state
+        .workspace_service
+        .toggle_issue_comment_reaction(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            &comment_id,
+            body.content,
+            issue_actor_input_from_session(&session, body.display_name),
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn set_issue_labels(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<IssueLabelsRequest>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, issue) = state
+        .workspace_service
+        .set_issue_labels(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            body.label_ids,
+            issue_actor_input_from_session(&session, None),
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn set_issue_assignees(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<IssueAssigneesRequest>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, issue) = state
+        .workspace_service
+        .set_issue_assignees(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            body.assignee_user_ids,
+            issue_actor_input_from_session(&session, None),
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn set_issue_milestone(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<IssueMilestoneRequest>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, issue) = state
+        .workspace_service
+        .set_issue_milestone(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            body.milestone_id,
+            issue_actor_input_from_session(&session, None),
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn link_issue_pull_request(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<IssueLinkPullRequestRequest>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, issue) = state
+        .workspace_service
+        .link_issue_pull_request(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            &body.pull_request_id,
+            issue_actor_input_from_session(&session, None),
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn unlink_issue_pull_request(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath((id, pull_request_id)): AxumPath<(String, String)>,
+) -> Result<Json<IssueRecord>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, issue) = state
+        .workspace_service
+        .unlink_issue_pull_request(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            &pull_request_id,
+            issue_actor_input_from_session(&session, None),
+        )
+        .await
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(issue))
+}
+
+async fn upsert_issue_label(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    Json(body): Json<IssueLabelUpsertRequest>,
+) -> Result<Json<IssueLabel>, StatusCode> {
+    state.require_owner(&headers).await?;
+    let (_, label) = state
+        .workspace_service
+        .upsert_issue_label(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            UpsertIssueLabel {
+                id: body.id,
+                name: body.name,
+                color: body.color,
+                description: body.description,
+            },
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(label))
+}
+
+async fn delete_issue_label(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<IssueLabel>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, label) = state
+        .workspace_service
+        .delete_issue_label(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            issue_actor_input_from_session(&session, None),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(label))
+}
+
+async fn upsert_issue_milestone(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    Json(body): Json<IssueMilestoneUpsertRequest>,
+) -> Result<Json<IssueMilestone>, StatusCode> {
+    state.require_owner(&headers).await?;
+    let (_, milestone) = state
+        .workspace_service
+        .upsert_issue_milestone(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            UpsertIssueMilestone {
+                id: body.id,
+                title: body.title,
+                description: body.description,
+            },
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(milestone))
+}
+
+async fn delete_issue_milestone(
+    State(state): State<Arc<WebUiServer>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<IssueMilestone>, StatusCode> {
+    let session = state.require_session(&headers).await?;
+    if session.actor != UiRole::Owner {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (_, milestone) = state
+        .workspace_service
+        .delete_issue_milestone(
+            state.workspace.worktree.clone(),
+            &state.workspace.exported_branch,
+            &id,
+            issue_actor_input_from_session(&session, None),
+        )
+        .map_err(|error| domain_status(&error))?;
+    Ok(Json(milestone))
 }
 
 #[cfg(test)]
@@ -2164,7 +2919,11 @@ mod tests {
         let localhost = SocketAddr::from(([127, 0, 0, 1], 3000));
         let response = app
             .clone()
-            .oneshot(request_with_remote("/repo/api/bootstrap", localhost, "127.0.0.1:8080"))
+            .oneshot(request_with_remote(
+                "/repo/api/bootstrap",
+                localhost,
+                "127.0.0.1:8080",
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2193,7 +2952,11 @@ mod tests {
         let remote = SocketAddr::from(([10, 0, 0, 2], 3000));
         let bootstrap = app
             .clone()
-            .oneshot(request_with_remote("/repo/api/bootstrap", remote, "demo.ngrok.app"))
+            .oneshot(request_with_remote(
+                "/repo/api/bootstrap",
+                remote,
+                "demo.ngrok.app",
+            ))
             .await
             .unwrap();
         let payload: BootstrapResponse =
@@ -2241,7 +3004,8 @@ mod tests {
         authenticated_bootstrap
             .extensions_mut()
             .insert(ConnectInfo(remote));
-        let authenticated_bootstrap_response = app.clone().oneshot(authenticated_bootstrap).await.unwrap();
+        let authenticated_bootstrap_response =
+            app.clone().oneshot(authenticated_bootstrap).await.unwrap();
         assert_eq!(authenticated_bootstrap_response.status(), StatusCode::OK);
         let authenticated_bootstrap: BootstrapResponse = serde_json::from_slice(
             &authenticated_bootstrap_response
@@ -2355,6 +3119,8 @@ mod tests {
             WorkspaceWebUiState {
                 pull_requests: Vec::new(),
                 repository: RepositorySettings::default(),
+                issue_settings: Default::default(),
+                issues: Vec::new(),
                 auth: qit_domain::RepoAuthState {
                     mode: qit_domain::AuthMode::RequestBased,
                     ..Default::default()
@@ -2369,14 +3135,21 @@ mod tests {
             .uri("/repo/api/access-requests")
             .header(HOST, "demo.ngrok.app")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"Alice","email":"alice@example.com"}"#))
+            .body(Body::from(
+                r#"{"name":"Alice","email":"alice@example.com"}"#,
+            ))
             .unwrap();
         let mut request = request;
         request.extensions_mut().insert(ConnectInfo(remote));
         let request_response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(request_response.status(), StatusCode::OK);
         let request: qit_domain::SubmittedAccessRequest = serde_json::from_slice(
-            &request_response.into_body().collect().await.unwrap().to_bytes(),
+            &request_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
         assert!(request.secret.starts_with("qit_request."));
@@ -2393,14 +3166,22 @@ mod tests {
         let status_response = app.clone().oneshot(status).await.unwrap();
         assert_eq!(status_response.status(), StatusCode::OK);
         let status: qit_domain::AccessRequestProgress = serde_json::from_slice(
-            &status_response.into_body().collect().await.unwrap().to_bytes(),
+            &status_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
         assert_eq!(status.status, qit_domain::AccessRequestStatus::Pending);
 
         let approve = Request::builder()
             .method("POST")
-            .uri(format!("/repo/api/access-requests/{}/approve", request.request.id))
+            .uri(format!(
+                "/repo/api/access-requests/{}/approve",
+                request.request.id
+            ))
             .header(HOST, "127.0.0.1:8080")
             .body(Body::empty())
             .unwrap();
@@ -2409,10 +3190,15 @@ mod tests {
         let approve_response = app.clone().oneshot(approve).await.unwrap();
         assert_eq!(approve_response.status(), StatusCode::OK);
         let onboarding: qit_domain::IssuedOnboarding = serde_json::from_slice(
-            &approve_response.into_body().collect().await.unwrap().to_bytes(),
+            &approve_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
-        assert!(onboarding.secret.starts_with("qit_setup."));
+        assert!(onboarding.secret.is_none());
 
         let complete = Request::builder()
             .method("POST")
@@ -2450,7 +3236,12 @@ mod tests {
         let settings_response = app.clone().oneshot(settings).await.unwrap();
         assert_eq!(settings_response.status(), StatusCode::OK);
         let settings: serde_json::Value = serde_json::from_slice(
-            &settings_response.into_body().collect().await.unwrap().to_bytes(),
+            &settings_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
         assert_eq!(settings["current_user"]["username"], "alice");
@@ -2468,7 +3259,12 @@ mod tests {
         let create_pat_response = app.clone().oneshot(create_pat).await.unwrap();
         assert_eq!(create_pat_response.status(), StatusCode::OK);
         let pat: qit_domain::IssuedPat = serde_json::from_slice(
-            &create_pat_response.into_body().collect().await.unwrap().to_bytes(),
+            &create_pat_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
         assert!(pat.secret.starts_with("qit_pat."));
@@ -2545,7 +3341,12 @@ mod tests {
             chunk_response.headers().get(CONTENT_TYPE).unwrap(),
             HeaderValue::from_static("text/javascript; charset=utf-8")
         );
-        let chunk_body = chunk_response.into_body().collect().await.unwrap().to_bytes();
+        let chunk_body = chunk_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
         assert!(!chunk_body.is_empty());
 
         let og_response = app
@@ -2562,7 +3363,13 @@ mod tests {
             HeaderValue::from_static("image/svg+xml; charset=utf-8")
         );
         let og_body = String::from_utf8(
-            og_response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+            og_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
         )
         .unwrap();
         assert!(og_body.contains("host"));
@@ -2588,7 +3395,9 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(body.contains(r#"<link rel="icon" type="image/png" href="/repo/assets/qit-logo-on-dark.png" />"#));
+        assert!(body.contains(
+            r#"<link rel="icon" type="image/png" href="/repo/assets/qit-logo-on-dark.png" />"#
+        ));
         assert!(body.contains(r#"<meta property="og:image" content="/repo/assets/qit-og.svg" />"#));
         assert!(body.contains(r#"<meta property="og:image:type" content="image/svg+xml" />"#));
         assert!(body.contains(r#"<meta property="og:image:width" content="1200" />"#));
@@ -2619,6 +3428,8 @@ mod tests {
                     activities: Vec::new(),
                 }],
                 repository: RepositorySettings::default(),
+                issue_settings: Default::default(),
+                issues: Vec::new(),
                 auth: basic_auth_state(),
             },
         );
@@ -2677,6 +3488,8 @@ mod tests {
             WorkspaceWebUiState {
                 pull_requests: Vec::new(),
                 repository: RepositorySettings::default(),
+                issue_settings: Default::default(),
+                issues: Vec::new(),
                 auth: basic_auth_state(),
             },
         );
@@ -2684,7 +3497,11 @@ mod tests {
 
         let settings = app
             .clone()
-            .oneshot(request_with_remote("/repo/api/settings", localhost, "127.0.0.1:8080"))
+            .oneshot(request_with_remote(
+                "/repo/api/settings",
+                localhost,
+                "127.0.0.1:8080",
+            ))
             .await
             .unwrap();
         assert_eq!(settings.status(), StatusCode::OK);
@@ -2726,8 +3543,7 @@ mod tests {
         let added = app.clone().oneshot(add_rule).await.unwrap();
         assert_eq!(added.status(), StatusCode::OK);
         let added: serde_json::Value =
-            serde_json::from_slice(&added.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
+            serde_json::from_slice(&added.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(added["repository"]["branch_rules"][0]["pattern"], "main");
         assert_eq!(
             added["repository"]["branch_rules"][0]["required_approvals"],
@@ -2747,7 +3563,13 @@ mod tests {
         let deleted: serde_json::Value =
             serde_json::from_slice(&deleted.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
-        assert_eq!(deleted["repository"]["branch_rules"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            deleted["repository"]["branch_rules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -2768,7 +3590,13 @@ mod tests {
             HeaderValue::from_static("text/plain; charset=utf-8")
         );
         let body = String::from_utf8(
-            response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
         )
         .unwrap();
         assert_eq!(body, "hello");
@@ -2794,7 +3622,12 @@ mod tests {
         create_pr.extensions_mut().insert(ConnectInfo(remote));
         let create_response = app.clone().oneshot(create_pr).await.unwrap();
         let created: PullRequestRecord = serde_json::from_slice(
-            &create_response.into_body().collect().await.unwrap().to_bytes(),
+            &create_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
 
@@ -2804,7 +3637,9 @@ mod tests {
             .header(HOST, "demo.ngrok.app")
             .header("content-type", "application/json")
             .header("cookie", cookie.clone())
-            .body(Body::from("{\"display_name\":\"Casey\",\"body\":\"Please add tests.\"}"))
+            .body(Body::from(
+                "{\"display_name\":\"Casey\",\"body\":\"Please add tests.\"}",
+            ))
             .unwrap();
         let mut comment = comment;
         comment.extensions_mut().insert(ConnectInfo(remote));
@@ -2861,7 +3696,12 @@ mod tests {
         detail.extensions_mut().insert(ConnectInfo(remote));
         let detail_response = app.clone().oneshot(detail).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(
-            &detail_response.into_body().collect().await.unwrap().to_bytes(),
+            &detail_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
         assert_eq!(payload["comments"][0]["display_name"], "Casey");
@@ -2888,7 +3728,12 @@ mod tests {
         create_pr.extensions_mut().insert(ConnectInfo(remote));
         let create_response = app.clone().oneshot(create_pr).await.unwrap();
         let created: PullRequestRecord = serde_json::from_slice(
-            &create_response.into_body().collect().await.unwrap().to_bytes(),
+            &create_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
 
@@ -2897,13 +3742,20 @@ mod tests {
             .uri(format!("/repo/api/pull-requests/{}", created.id))
             .header(HOST, "127.0.0.1:8080")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"title":"Owner PR updated","status":"closed"}"#))
+            .body(Body::from(
+                r#"{"title":"Owner PR updated","status":"closed"}"#,
+            ))
             .unwrap();
         let mut close = close;
         close.extensions_mut().insert(ConnectInfo(remote));
         let close_response = app.clone().oneshot(close).await.unwrap();
         let closed: PullRequestRecord = serde_json::from_slice(
-            &close_response.into_body().collect().await.unwrap().to_bytes(),
+            &close_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
         assert_eq!(closed.title, "Owner PR updated");
@@ -2920,7 +3772,12 @@ mod tests {
         reopen.extensions_mut().insert(ConnectInfo(remote));
         let reopen_response = app.clone().oneshot(reopen).await.unwrap();
         let reopened: PullRequestRecord = serde_json::from_slice(
-            &reopen_response.into_body().collect().await.unwrap().to_bytes(),
+            &reopen_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
         assert_eq!(reopened.status, qit_domain::PullRequestStatus::Open);
@@ -2947,6 +3804,150 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&list.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert!(payload["pull_requests"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn issues_support_metadata_comments_and_owner_updates() {
+        let app = app(true, false);
+        let remote = SocketAddr::from(([127, 0, 0, 1], 3000));
+
+        let label = Request::builder()
+            .method("PUT")
+            .uri("/repo/api/issues/labels")
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"bug","color":"cf222e","description":"Bug work"}"#,
+            ))
+            .unwrap();
+        let mut label = label;
+        label.extensions_mut().insert(ConnectInfo(remote));
+        let label_response = app.clone().oneshot(label).await.unwrap();
+        assert_eq!(label_response.status(), StatusCode::OK);
+        let label_body = label_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let label: qit_domain::IssueLabel = serde_json::from_slice(&label_body).unwrap();
+
+        let milestone = Request::builder()
+            .method("PUT")
+            .uri("/repo/api/issues/milestones")
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"title":"v1","description":"First release"}"#,
+            ))
+            .unwrap();
+        let mut milestone = milestone;
+        milestone.extensions_mut().insert(ConnectInfo(remote));
+        let milestone_response = app.clone().oneshot(milestone).await.unwrap();
+        assert_eq!(milestone_response.status(), StatusCode::OK);
+        let milestone_body = milestone_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let milestone: qit_domain::IssueMilestone =
+            serde_json::from_slice(&milestone_body).unwrap();
+
+        let create_issue = Request::builder()
+            .method("POST")
+            .uri("/repo/api/issues")
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"title":"Broken flow","description":"Need a fix","label_ids":["{}"],"milestone_id":"{}"}}"#,
+                label.id, milestone.id
+            )))
+            .unwrap();
+        let mut create_issue = create_issue;
+        create_issue.extensions_mut().insert(ConnectInfo(remote));
+        let create_issue_response = app.clone().oneshot(create_issue).await.unwrap();
+        let issue: qit_domain::IssueRecord = serde_json::from_slice(
+            &create_issue_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+
+        let comment = Request::builder()
+            .method("POST")
+            .uri(format!("/repo/api/issues/{}/comments", issue.id))
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"body":"Looking into this now."}"#))
+            .unwrap();
+        let mut comment = comment;
+        comment.extensions_mut().insert(ConnectInfo(remote));
+        let comment_response = app.clone().oneshot(comment).await.unwrap();
+        assert_eq!(comment_response.status(), StatusCode::OK);
+
+        let react = Request::builder()
+            .method("POST")
+            .uri(format!("/repo/api/issues/{}/reactions", issue.id))
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"content":"thumbs_up"}"#))
+            .unwrap();
+        let mut react = react;
+        react.extensions_mut().insert(ConnectInfo(remote));
+        let react_response = app.clone().oneshot(react).await.unwrap();
+        assert_eq!(react_response.status(), StatusCode::OK);
+
+        let close = Request::builder()
+            .method("PATCH")
+            .uri(format!("/repo/api/issues/{}", issue.id))
+            .header(HOST, "127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"title":"Broken login flow","status":"closed"}"#,
+            ))
+            .unwrap();
+        let mut close = close;
+        close.extensions_mut().insert(ConnectInfo(remote));
+        let close_response = app.clone().oneshot(close).await.unwrap();
+        let closed: qit_domain::IssueRecord = serde_json::from_slice(
+            &close_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(closed.status, qit_domain::IssueStatus::Closed);
+
+        let detail = Request::builder()
+            .uri(format!("/repo/api/issues/{}", issue.id))
+            .header(HOST, "127.0.0.1:8080")
+            .body(Body::empty())
+            .unwrap();
+        let mut detail = detail;
+        detail.extensions_mut().insert(ConnectInfo(remote));
+        let detail_response = app.clone().oneshot(detail).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(
+            &detail_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(payload["issue"]["title"], "Broken login flow");
+        assert_eq!(payload["reaction_summary"][0]["count"], 1);
+        assert_eq!(
+            payload["comments"][0]["comment"]["body"],
+            "Looking into this now."
+        );
+        assert!(payload["timeline"].as_array().unwrap().len() >= 3);
     }
 
     #[tokio::test]

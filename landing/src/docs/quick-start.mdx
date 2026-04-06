@@ -2,6 +2,7 @@
 title: Quick Start
 description: Start a Qit session for any folder and hand collaborators a standard Git clone command.
 slug: /quick-start
+section: Get started
 sidebar_label: Quick start
 sidebar_position: 2
 ---
@@ -12,10 +13,10 @@ Qit serves a folder without converting the host tree into a normal Git working c
 
 ## Serve a folder
 
-Run Qit with the path you want to share:
+Run Qit with the path you want to share. This example opts into the simplest immediate-sharing auth mode so the startup summary includes working Git credentials:
 
 ```bash
-qit ./my-app
+qit --transport local --auth-mode shared-session ./my-app
 ```
 
 Typical startup output includes:
@@ -24,6 +25,7 @@ Typical startup output includes:
 Serving
   path: ./my-app
   branch: main
+  auth: basic-auth
   transport: local
 
 Web UI
@@ -48,6 +50,8 @@ git clone http://127.0.0.1:8080/my-app
 
 If you prefer not to print the password in the terminal, start Qit with `--hidden-pass`. That keeps the password in a local credentials file and leaves the suggested clone command uncredentialed.
 
+If you want durable per-user accounts instead of one shared password, use [request-based auth](/docs/guides/managing-authentication).
+
 They can then use normal Git commands such as `git fetch`, `git pull`, and `git push`.
 
 ## Review before applying
@@ -56,5 +60,8 @@ Pushes land in the sidecar repository first. That means you can inspect changes 
 
 ## Keep reading
 
+- [First collaboration tutorial](/docs/tutorials/first-collaboration)
+- [CLI reference](/docs/reference/cli)
+- [The sidecar model](/docs/concepts/sidecar-model)
 - [Sharing and auth](/docs/sharing-and-auth)
 - [FAQ](/docs/faq)

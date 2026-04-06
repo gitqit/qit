@@ -91,6 +91,14 @@ impl GitHttpBackend for GitHttpBackendAdapter {
     }
 }
 
+/// True when any normal path component is `.git`. Libgit2 rejects index entries whose relative path
+/// includes a `.git` directory (for example a nested repository under `vendor/other-repo/.git/config`).
+fn path_has_dot_git_dir_component(path: &Path) -> bool {
+    use std::path::Component;
+    path.components()
+        .any(|component| matches!(component, Component::Normal(part) if part == ".git"))
+}
+
 #[derive(Clone)]
 struct ManagedWorkspace {
     _workspace_id: WorkspaceId,
@@ -470,12 +478,7 @@ impl ManagedWorkspace {
             if rel.as_os_str().is_empty() {
                 continue;
             }
-            if rel
-                .components()
-                .next()
-                .map(|component| component.as_os_str() == ".git")
-                .unwrap_or(false)
-            {
+            if path_has_dot_git_dir_component(rel) {
                 continue;
             }
             if entry.file_type().map(|file| file.is_dir()).unwrap_or(false) {
@@ -1602,6 +1605,50 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_skips_nested_dot_git_directories() {
+        let base = tempfile::tempdir().unwrap();
+        let worktree = base.path().join("wt");
+        let sidecar = base.path().join("side.git");
+        fs::create_dir_all(worktree.join("nested-repo/.git")).unwrap();
+        fs::write(
+            worktree.join("nested-repo/.git/config"),
+            "[core]\nrepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        fs::write(worktree.join("nested-repo/README.md"), "# nested\n").unwrap();
+        fs::write(worktree.join("visible.txt"), "v").unwrap();
+
+        let workspace = WorkspaceSpec {
+            id: WorkspaceId(Uuid::nil()),
+            worktree: worktree.clone(),
+            sidecar,
+            exported_branch: "main".into(),
+            checked_out_branch: "main".into(),
+        };
+        let managed = ManagedWorkspace::init(&workspace).unwrap();
+        let repo = managed.open_repo().unwrap();
+        let head = repo.find_reference("refs/heads/main").unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        let tree = commit.tree().unwrap();
+        let names: Vec<String> = tree
+            .iter()
+            .map(|entry| entry.name().unwrap().to_string())
+            .collect();
+
+        assert!(names.contains(&"visible.txt".to_string()));
+        assert!(names.contains(&"nested-repo".to_string()));
+        let nested = tree
+            .get_name("nested-repo")
+            .unwrap()
+            .to_object(&repo)
+            .unwrap()
+            .peel_to_tree()
+            .unwrap();
+        assert!(nested.get_name("README.md").is_some());
+        assert!(nested.get_name(".git").is_none());
+    }
+
+    #[test]
     fn snapshot_keeps_vendor_directories_as_user_content() {
         let base = tempfile::tempdir().unwrap();
         let worktree = base.path().join("wt");
@@ -2184,7 +2231,13 @@ mod tests {
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].path, "removed.md");
         assert_eq!(diffs[0].status, "deleted");
-        assert_eq!(diffs[0].original.as_ref().and_then(|blob| blob.text.as_deref()), Some("present on main\n"));
+        assert_eq!(
+            diffs[0]
+                .original
+                .as_ref()
+                .and_then(|blob| blob.text.as_deref()),
+            Some("present on main\n")
+        );
         assert!(diffs[0].modified.is_none());
     }
 }

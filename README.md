@@ -54,7 +54,7 @@ cargo run --manifest-path Cargo.toml -p qit -- --transport local ./my-app
 5. generate a fresh session username and password
 6. print the repo URL, session username and password, and a clone command
 
-Clone from another machine or terminal:
+Clone from another terminal, or from another machine when you use `--transport lan`, `--transport ngrok`, or `--transport tailscale`:
 
 ```bash
 git clone http://127.0.0.1:8080/my-app
@@ -75,6 +75,7 @@ Choose a transport:
 ```bash
 cargo run -p qit -- --transport ngrok ./my-app
 cargo run -p qit -- --transport tailscale ./my-app
+cargo run -p qit -- --transport lan ./my-app
 cargo run -p qit -- --transport local ./my-app
 ```
 
@@ -178,3 +179,21 @@ Run the full rewrite test suite:
 ```bash
 cargo test --workspace
 ```
+
+## Development
+
+### Web UI
+
+To run the Web UI with hot reloading during development:
+
+1. Start the `qit` server (e.g., `cargo run -p qit -- ./my-app`)
+2. In a new terminal, navigate to the frontend directory:
+   ```bash
+   cd crates/qit-webui/frontend
+   ```
+3. Run the development server, pointing it to your local `qit` instance:
+   ```bash
+   QIT_DEV_API=http://127.0.0.1:8080 QIT_DEV_MOUNT=/my-app npm run dev
+   ```
+
+Replace `http://127.0.0.1:8080` with your actual local URL and `/my-app` with the mount path shown in the `qit` startup output.

@@ -159,14 +159,28 @@ function mockApi(
       return
     }
 
-    if (pathname.includes('/api/access-requests/') && method === 'POST') {
+    if (pathname.includes('/api/access-requests/') && pathname.endsWith('/approve') && method === 'POST') {
       await route.fulfill({
         contentType: 'application/json',
         body: JSON.stringify({
           user_id: 'user-1',
           email: 'alice@example.com',
-          secret: 'qit_setup.test.secret',
-          expires_at_ms: Date.now() + 60_000,
+          expires_at_ms: 0,
+        }),
+      })
+      return
+    }
+
+    if (pathname.includes('/api/access-requests/') && pathname.endsWith('/reject') && method === 'POST') {
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          id: 'request-1',
+          name: 'Alice',
+          email: 'alice@example.com',
+          status: 'rejected',
+          created_at_ms: Date.now(),
+          reviewed_at_ms: Date.now(),
         }),
       })
       return
@@ -451,7 +465,9 @@ test('owner access alerts show pending requests with actions', async ({ page }) 
   await expect(page.getByRole('menuitem', { name: 'Reject' })).toBeVisible()
 
   await page.getByRole('menuitem', { name: 'Approve' }).click()
-  await expect(page.getByText('Approved alice@example.com. Share the one-time onboarding token now.')).toBeVisible()
+  await expect(
+    page.getByText('Approved alice@example.com. They can finish signing in from their pending request browser tab.'),
+  ).toBeVisible()
 })
 
 test('clicking a branch opens the code view for that branch state', async ({ page }) => {
@@ -520,23 +536,6 @@ test('approved request moves setup forward in the same browser', async ({ page }
     await route.fallback()
   })
 
-  await page.route('**/api/onboarding/complete', async (route) => {
-    if (route.request().method() === 'POST') {
-      const payload = route.request().postDataJSON() as {
-        token: string
-        username: string
-        password: string
-      }
-      expect(payload.token).toBe('qit_request.test.secret')
-      await route.fulfill({
-        contentType: 'application/json',
-        body: JSON.stringify('user'),
-      })
-      return
-    }
-    await route.fallback()
-  })
-
   await page.goto('/')
   await page.getByRole('button', { name: 'Request access', exact: true }).click()
   await page.getByLabel('Name').fill('Alice')
@@ -544,10 +543,7 @@ test('approved request moves setup forward in the same browser', async ({ page }
   await page.getByRole('button', { name: 'Send request' }).click()
 
   await expect(page.getByText('Access request sent. Waiting for the owner to approve…')).toBeVisible()
-  await expect(page.getByText('Approval arrived in this browser. You can finish setup without pasting an onboarding token.')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'demo-repo' })).toBeVisible({ timeout: 15_000 })
+  expect(statusChecks).toBeGreaterThanOrEqual(2)
   await expect(page.getByLabel('Onboarding token')).toHaveCount(0)
-
-  await page.getByLabel('Username').fill('alice')
-  await page.getByLabel('Password').fill('very-secret-pass')
-  await page.getByRole('button', { name: 'Finish setup' }).click()
 })

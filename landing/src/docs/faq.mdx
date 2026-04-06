@@ -2,8 +2,9 @@
 title: FAQ
 description: Common questions about how Qit serves folders, handles auth, and applies incoming changes.
 slug: /faq
+section: Troubleshooting
 sidebar_label: FAQ
-sidebar_position: 4
+sidebar_position: 82
 ---
 
 # FAQ
@@ -14,7 +15,7 @@ No. Qit is built for normal folders. It snapshots the folder into a hidden sidec
 
 ## How do collaborators connect to a session?
 
-They use standard Git tooling against the served URL. For shared sessions, hand over the temporary username and password that Qit prints at startup.
+They use standard Git tooling against the served URL. In shared-session mode, hand over the temporary username and password that Qit prints at startup. In request-based mode, each collaborator uses their own durable username plus password or personal access token.
 
 ## Where do pushes land?
 
@@ -22,7 +23,11 @@ Pushes update the sidecar repository first. That keeps the host folder safe unti
 
 ## Can I expose Qit beyond localhost?
 
-Yes. Qit supports local, ngrok, and Tailscale-oriented transport flows so you can choose between local-only collaboration and a broader share link.
+Yes. Qit supports `local`, `lan`, `ngrok`, and `tailscale` transport flows so you can choose between same-machine use, local-network sharing, and broader remote access.
+
+## Where is the real command reference?
+
+Use the [CLI reference](/docs/reference/cli) for exact command syntax, flags, environment variables, and command behavior. The getting-started pages intentionally omit most switches.
 
 ## Is Qit trying to replace GitHub?
 

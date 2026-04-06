@@ -55,7 +55,9 @@ pub(crate) fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
         return text.is_empty();
     }
     match pattern[0] {
-        b'*' => glob_match(&pattern[1..], text) || (!text.is_empty() && glob_match(pattern, &text[1..])),
+        b'*' => {
+            glob_match(&pattern[1..], text) || (!text.is_empty() && glob_match(pattern, &text[1..]))
+        }
         b'?' => !text.is_empty() && glob_match(&pattern[1..], &text[1..]),
         byte => !text.is_empty() && byte == text[0] && glob_match(&pattern[1..], &text[1..]),
     }

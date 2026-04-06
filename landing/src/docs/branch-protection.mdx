@@ -1,0 +1,89 @@
+---
+title: Configuring Branch Protection Rules
+description: Learn how to protect your sidecar branches with pull request requirements, approvals, and push restrictions.
+slug: /guides/branch-protection
+---
+
+# Configuring Branch Protection Rules
+
+Branch protection rules allow you to enforce workflows on your sidecar branches. Since Qit uses a sidecar model, these rules govern what can be pushed to the sidecar repository and what can be merged into your served branches.
+
+## Available Protections
+
+Qit supports several protection flags that can be applied to any branch pattern:
+
+| Flag | Effect |
+| :--- | :--- |
+| `--require-pr` | Prevents direct pushes to the branch. Changes must come through a pull request. |
+| `--approvals <N>` | Requires at least `N` approvals from other users before a pull request can be merged. |
+| `--dismiss-stale` | Automatically dismisses existing approvals when new commits are pushed to a pull request's source branch. |
+| `--block-force-push` | Rejects non-fast-forward pushes to the branch. |
+| `--block-delete` | Prevents the branch from being deleted. |
+
+## Managing Rules via CLI
+
+Use the `qit settings rule` command to manage protections for a workspace.
+
+### Add or Update a Rule
+
+To protect the `main` branch by requiring pull requests and 2 approvals:
+
+```bash
+qit settings rule ./my-app --pattern "main" --require-pr --approvals 2
+```
+
+### Protect Multiple Branches
+
+You can use globs (using `*` and `?`) to protect multiple branches at once. For example, to block force-pushes on all release branches:
+
+```bash
+qit settings rule ./my-app --pattern "release/*" --block-force-push
+```
+
+### View Current Rules
+
+To see all active rules for a workspace:
+
+```bash
+qit settings view ./my-app
+```
+
+### Delete a Rule
+
+To remove protections for a specific pattern:
+
+```bash
+qit settings rule ./my-app --delete "release/*"
+```
+
+## Managing Rules via Web UI
+
+1. Open the Qit Web UI for your session.
+2. Navigate to the **Settings** tab.
+3. Find the **Branch Rules** section.
+4. Use the interface to add, edit, or remove rules.
+
+## How Rules are Applied
+
+- **Pattern Matching**: When a push or merge is attempted, Qit checks the branch name against all defined patterns.
+- **Precedence**: If multiple patterns match a branch, the protections are **additive**. For example, if `main` matches both `main` and `*`, it will inherit protections from both rules.
+- **Enforcement**: Rules are enforced at the sidecar repository level. If a rule is violated, the Git push or the `qit pr merge` command will fail with a descriptive error message.
+
+## Common Workflows
+
+### The "Standard" Protected Main
+Most teams should protect their primary branch to ensure code review:
+```bash
+qit settings rule ./my-app --pattern "main" --require-pr --approvals 1 --block-force-push
+```
+
+### Strict Release Branches
+For stable releases, you might want to prevent any deletion or force-pushes:
+```bash
+qit settings rule ./my-app --pattern "v*" --block-force-push --block-delete
+```
+
+## Related Pages
+- [The Sidecar Model](/docs/concepts/sidecar-model)
+- [CLI Reference](/docs/reference/cli)
+- [Pull Request Commands](/docs/reference/cli#pull-request-commands)

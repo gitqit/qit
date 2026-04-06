@@ -9,14 +9,18 @@ export type DocFrontmatter = {
   title: string
   description: string
   slug: string
+  section?: string
   sidebar_label?: string
   sidebar_position?: number
+  sidebar_hidden?: boolean
 }
 
 export type DocEntry = DocFrontmatter & {
   id: string
   href: string
+  section: string
   sidebarLabel: string
+  sidebarHidden: boolean
   Component: ComponentType<DocComponentProps>
 }
 
@@ -53,6 +57,32 @@ function readOptionalNumberField(data: Record<string, unknown>, key: keyof DocFr
   return value
 }
 
+function readOptionalStringField(data: Record<string, unknown>, key: keyof DocFrontmatter) {
+  const value = data[key]
+  if (value === undefined) {
+    return undefined
+  }
+
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`Expected docs frontmatter field "${key}" to be a non-empty string when present.`)
+  }
+
+  return value.trim()
+}
+
+function readOptionalBooleanField(data: Record<string, unknown>, key: keyof DocFrontmatter) {
+  const value = data[key]
+  if (value === undefined) {
+    return false
+  }
+
+  if (typeof value !== 'boolean') {
+    throw new Error(`Expected docs frontmatter field "${key}" to be a boolean when present.`)
+  }
+
+  return value
+}
+
 function parseDoc(path: string, module: DocModule): DocEntry {
   const frontmatter = module.frontmatter
   if (!frontmatter) {
@@ -67,6 +97,7 @@ function parseDoc(path: string, module: DocModule): DocEntry {
 
   const title = readStringField(frontmatter, 'title')
   const description = readStringField(frontmatter, 'description')
+  const section = readOptionalStringField(frontmatter, 'section') ?? 'Other'
   const sidebarLabel = typeof frontmatter.sidebar_label === 'string' && frontmatter.sidebar_label.trim().length > 0
     ? frontmatter.sidebar_label.trim()
     : title
@@ -76,9 +107,12 @@ function parseDoc(path: string, module: DocModule): DocEntry {
     title,
     description,
     slug,
+    section,
     sidebar_label: typeof frontmatter.sidebar_label === 'string' ? frontmatter.sidebar_label : undefined,
     sidebar_position: readOptionalNumberField(frontmatter, 'sidebar_position'),
     sidebarLabel,
+    sidebar_hidden: readOptionalBooleanField(frontmatter, 'sidebar_hidden'),
+    sidebarHidden: readOptionalBooleanField(frontmatter, 'sidebar_hidden'),
     href: `/docs/${slug}`,
     Component: module.default,
   }
@@ -106,7 +140,23 @@ for (const doc of docs) {
   seenSlugs.add(doc.slug)
 }
 
-export const defaultDoc = docs[0] ?? null
+export const visibleDocs = docs.filter((doc) => !doc.sidebarHidden)
+
+export const docsBySection = visibleDocs.reduce<Array<{ section: string, docs: DocEntry[] }>>((groups, doc) => {
+  const existing = groups.find((group) => group.section === doc.section)
+  if (existing) {
+    existing.docs.push(doc)
+    return groups
+  }
+
+  groups.push({
+    section: doc.section,
+    docs: [doc],
+  })
+  return groups
+}, [])
+
+export const defaultDoc = visibleDocs[0] ?? docs[0] ?? null
 
 export function getDocBySlug(slug: string) {
   const normalizedSlug = normalizeSlug(slug)
@@ -114,13 +164,13 @@ export function getDocBySlug(slug: string) {
 }
 
 export function getAdjacentDocs(slug: string) {
-  const index = docs.findIndex((doc) => doc.slug === normalizeSlug(slug))
+  const index = visibleDocs.findIndex((doc) => doc.slug === normalizeSlug(slug))
   if (index === -1) {
     return { previous: null, next: null }
   }
 
   return {
-    previous: docs[index - 1] ?? null,
-    next: docs[index + 1] ?? null,
+    previous: visibleDocs[index - 1] ?? null,
+    next: visibleDocs[index + 1] ?? null,
   }
 }

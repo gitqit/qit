@@ -1,20 +1,28 @@
 mod auth;
 mod branch_rules;
+mod issues;
 
-pub use auth::{
-    AccessRequest, AccessRequestProgress, AccessRequestStatus, AccessRequestView,
-    AuthActivityKind, AuthActivityRecord, AuthActor, AuthActorKind, AuthMethod, AuthMode,
-    AuthenticatedPrincipal, IssuedOnboarding, IssuedPat, PatRecord, PatRecordView, RepoAuthState,
-    RepoUser, RepoUserRole, RepoUserStatus, RepoUserView, SubmittedAccessRequest,
-    ONBOARDING_TOKEN_TTL_MS,
-};
 use async_trait::async_trait;
 use auth::{
     hash_secret, issue_access_request_secret, issue_onboarding_secret, issue_pat_secret,
     parse_access_request_secret, parse_onboarding_secret, parse_pat_secret, verify_secret,
 };
+pub use auth::{
+    AccessRequest, AccessRequestProgress, AccessRequestStatus, AccessRequestView, AuthActivityKind,
+    AuthActivityRecord, AuthActor, AuthActorKind, AuthMethod, AuthMode, AuthenticatedPrincipal,
+    IssuedOnboarding, IssuedPat, PatRecord, PatRecordView, RepoAuthState, RepoUser, RepoUserRole,
+    RepoUserStatus, RepoUserView, SubmittedAccessRequest, ONBOARDING_TOKEN_TTL_MS,
+};
 use fs2::FileExt;
 use git2::Repository;
+pub use issues::{
+    CreateIssue, CreateIssueComment, IssueActor, IssueActorInput, IssueCommentRecord, IssueLabel,
+    IssueLinkRelation, IssueLinkSource, IssueLinkedPullRequest, IssueMilestone,
+    IssueReactionContent, IssueReactionRecord, IssueReactionSummary, IssueRecord, IssueSettings,
+    IssueStatus, IssueTimelineEvent, IssueTimelineEventKind, IssueTimelineTarget,
+    LinkedIssueReference, LinkedPullRequestReference, UpdateIssue, UpsertIssueLabel,
+    UpsertIssueMilestone,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -294,6 +302,10 @@ pub struct WorkspaceWebUiState {
     #[serde(default)]
     pub repository: RepositorySettings,
     #[serde(default)]
+    pub issue_settings: IssueSettings,
+    #[serde(default)]
+    pub issues: Vec<IssueRecord>,
+    #[serde(default)]
     pub auth: RepoAuthState,
 }
 
@@ -413,6 +425,8 @@ pub enum DomainError {
     Repository(#[source] RepositoryError),
     #[error("invalid pull request state: {0}")]
     InvalidPullRequest(String),
+    #[error("invalid issue state: {0}")]
+    InvalidIssue(String),
     #[error("invalid repository settings: {0}")]
     InvalidSettings(String),
     #[error("branch rule blocked the operation: {0}")]
@@ -423,6 +437,12 @@ pub enum DomainError {
     AccessRequestNotFound(String),
     #[error("user not found: {0}")]
     UserNotFound(String),
+    #[error("issue not found: {0}")]
+    IssueNotFound(String),
+    #[error("issue label not found: {0}")]
+    IssueLabelNotFound(String),
+    #[error("issue milestone not found: {0}")]
+    IssueMilestoneNotFound(String),
     #[error("personal access token not found: {0}")]
     PatNotFound(String),
     #[error("onboarding token is invalid or expired")]
@@ -651,7 +671,17 @@ impl WorkspaceService {
     fn normalize_required(value: &str, field: &str) -> Result<String, DomainError> {
         let normalized = value.trim();
         if normalized.is_empty() {
-            return Err(DomainError::InvalidPullRequest(format!("{field} is required")));
+            return Err(DomainError::InvalidPullRequest(format!(
+                "{field} is required"
+            )));
+        }
+        Ok(normalized.to_string())
+    }
+
+    fn normalize_issue_required(value: &str, field: &str) -> Result<String, DomainError> {
+        let normalized = value.trim();
+        if normalized.is_empty() {
+            return Err(DomainError::InvalidIssue(format!("{field} is required")));
         }
         Ok(normalized.to_string())
     }
@@ -660,7 +690,79 @@ impl WorkspaceService {
         value.trim().to_string()
     }
 
-    fn normalize_auth_required(value: &str, field: &str, max_len: usize) -> Result<String, DomainError> {
+    fn normalize_issue_actor(actor: IssueActorInput) -> Result<IssueActor, DomainError> {
+        let fallback = match actor.role {
+            UiRole::Owner => "Owner",
+            UiRole::User => "Viewer",
+        };
+        let display_name = actor
+            .display_name
+            .as_deref()
+            .map(Self::normalize_optional)
+            .filter(|value| !value.is_empty())
+            .or_else(|| actor.username.as_deref().map(Self::normalize_optional))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| fallback.to_string());
+        if display_name.len() > 120 {
+            return Err(DomainError::InvalidIssue(
+                "display name must be 120 characters or fewer".into(),
+            ));
+        }
+        Ok(IssueActor {
+            role: actor.role,
+            display_name,
+            user_id: actor
+                .user_id
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            username: actor
+                .username
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        })
+    }
+
+    fn stable_issue_actor_key(actor: &IssueActor) -> Option<String> {
+        actor
+            .user_id
+            .as_ref()
+            .map(|value| format!("user:{value}"))
+            .or_else(|| {
+                actor
+                    .username
+                    .as_ref()
+                    .map(|value| format!("username:{value}"))
+            })
+    }
+
+    fn interaction_issue_actor_key(actor: &IssueActor) -> String {
+        Self::stable_issue_actor_key(actor).unwrap_or_else(|| {
+            format!(
+                "role:{:?}:{}",
+                actor.role,
+                actor.display_name.trim().to_ascii_lowercase()
+            )
+        })
+    }
+
+    fn can_manage_issue(actor: &IssueActor, issue: &IssueRecord) -> bool {
+        if actor.role == UiRole::Owner {
+            return true;
+        }
+        match (
+            Self::stable_issue_actor_key(actor),
+            Self::stable_issue_actor_key(&issue.author),
+        ) {
+            (Some(actor_key), Some(author_key)) => actor_key == author_key,
+            _ => false,
+        }
+    }
+
+    fn normalize_auth_required(
+        value: &str,
+        field: &str,
+        max_len: usize,
+    ) -> Result<String, DomainError> {
         let normalized = value.trim();
         if normalized.is_empty() {
             return Err(DomainError::InvalidAuth(format!("{field} is required")));
@@ -688,10 +790,9 @@ impl WorkspaceService {
                 "username must be at least 3 characters".into(),
             ));
         }
-        if !normalized
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
-        {
+        if !normalized.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        }) {
             return Err(DomainError::InvalidAuth(
                 "username may only contain lowercase letters, digits, '.', '_' and '-'".into(),
             ));
@@ -706,13 +807,17 @@ impl WorkspaceService {
     fn owner_count(auth: &RepoAuthState) -> usize {
         auth.users
             .iter()
-            .filter(|user| user.role == RepoUserRole::Owner && user.status != RepoUserStatus::Revoked)
+            .filter(|user| {
+                user.role == RepoUserRole::Owner && user.status != RepoUserStatus::Revoked
+            })
             .count()
     }
 
     fn ensure_not_last_owner(auth: &RepoAuthState, user_id: &str) -> Result<(), DomainError> {
         let is_owner = auth.users.iter().any(|user| {
-            user.id == user_id && user.role == RepoUserRole::Owner && user.status != RepoUserStatus::Revoked
+            user.id == user_id
+                && user.role == RepoUserRole::Owner
+                && user.status != RepoUserStatus::Revoked
         });
         if is_owner && Self::owner_count(auth) <= 1 {
             return Err(DomainError::InvalidAuth(
@@ -813,7 +918,10 @@ impl WorkspaceService {
         Ok(())
     }
 
-    fn find_user_mut<'a>(auth: &'a mut RepoAuthState, user_id: &str) -> Result<&'a mut RepoUser, DomainError> {
+    fn find_user_mut<'a>(
+        auth: &'a mut RepoAuthState,
+        user_id: &str,
+    ) -> Result<&'a mut RepoUser, DomainError> {
         auth.users
             .iter_mut()
             .find(|user| user.id == user_id)
@@ -888,7 +996,7 @@ impl WorkspaceService {
         Ok(IssuedOnboarding {
             user_id: user.id,
             email: user.email,
-            secret,
+            secret: Some(secret),
             expires_at_ms,
         })
     }
@@ -968,7 +1076,779 @@ impl WorkspaceService {
         })
     }
 
-    pub fn pull_request_comments(pull_request: &PullRequestRecord) -> Vec<PullRequestCommentRecord> {
+    fn default_issue_label_color(name: &str) -> String {
+        let palette = [
+            "1d76db", "8250df", "bf3989", "cf222e", "fb8c00", "9a6700", "2da44e", "0a7ea4",
+        ];
+        let hash = name.bytes().fold(0usize, |accumulator, byte| {
+            accumulator.wrapping_add(byte as usize)
+        });
+        palette[hash % palette.len()].to_string()
+    }
+
+    fn normalize_issue_label(
+        label: UpsertIssueLabel,
+        existing_id: Option<&str>,
+        now_ms: u64,
+    ) -> Result<IssueLabel, DomainError> {
+        let name = Self::normalize_issue_required(&label.name, "label name")?;
+        if name.len() > 40 {
+            return Err(DomainError::InvalidIssue(
+                "label name must be 40 characters or fewer".into(),
+            ));
+        }
+        let description = Self::normalize_optional(&label.description);
+        if description.len() > 200 {
+            return Err(DomainError::InvalidIssue(
+                "label description must be 200 characters or fewer".into(),
+            ));
+        }
+        let mut color = label
+            .color
+            .trim()
+            .trim_start_matches('#')
+            .to_ascii_lowercase();
+        if color.is_empty() {
+            color = Self::default_issue_label_color(&name);
+        }
+        if color.len() != 6 || !color.chars().all(|character| character.is_ascii_hexdigit()) {
+            return Err(DomainError::InvalidIssue(
+                "label color must be a 6-character hex value".into(),
+            ));
+        }
+        Ok(IssueLabel {
+            id: label
+                .id
+                .or_else(|| existing_id.map(ToString::to_string))
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            name,
+            color,
+            description,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+    }
+
+    fn normalize_issue_milestone(
+        milestone: UpsertIssueMilestone,
+        existing_id: Option<&str>,
+        now_ms: u64,
+    ) -> Result<IssueMilestone, DomainError> {
+        let title = Self::normalize_issue_required(&milestone.title, "milestone title")?;
+        if title.len() > 80 {
+            return Err(DomainError::InvalidIssue(
+                "milestone title must be 80 characters or fewer".into(),
+            ));
+        }
+        let description = Self::normalize_optional(&milestone.description);
+        if description.len() > 500 {
+            return Err(DomainError::InvalidIssue(
+                "milestone description must be 500 characters or fewer".into(),
+            ));
+        }
+        Ok(IssueMilestone {
+            id: milestone
+                .id
+                .or_else(|| existing_id.map(ToString::to_string))
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            title,
+            description,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+    }
+
+    fn normalize_issue_settings(settings: IssueSettings) -> Result<IssueSettings, DomainError> {
+        let mut normalized = IssueSettings {
+            next_issue_number: settings.next_issue_number.max(1),
+            labels: Vec::with_capacity(settings.labels.len()),
+            milestones: Vec::with_capacity(settings.milestones.len()),
+        };
+        let now_ms = Self::now_ms();
+        for label in settings.labels {
+            let mut normalized_label = Self::normalize_issue_label(
+                UpsertIssueLabel {
+                    id: Some(label.id.clone()),
+                    name: label.name,
+                    color: label.color,
+                    description: label.description,
+                },
+                Some(&label.id),
+                now_ms,
+            )?;
+            normalized_label.created_at_ms = label.created_at_ms;
+            normalized_label.updated_at_ms = label.updated_at_ms;
+            normalized.labels.push(normalized_label);
+        }
+        normalized.labels.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        });
+        for pair in normalized.labels.windows(2) {
+            if pair[0].name.eq_ignore_ascii_case(&pair[1].name) {
+                return Err(DomainError::InvalidIssue(format!(
+                    "duplicate issue label `{}`",
+                    pair[0].name
+                )));
+            }
+        }
+        for milestone in settings.milestones {
+            let mut normalized_milestone = Self::normalize_issue_milestone(
+                UpsertIssueMilestone {
+                    id: Some(milestone.id.clone()),
+                    title: milestone.title,
+                    description: milestone.description,
+                },
+                Some(&milestone.id),
+                now_ms,
+            )?;
+            normalized_milestone.created_at_ms = milestone.created_at_ms;
+            normalized_milestone.updated_at_ms = milestone.updated_at_ms;
+            normalized.milestones.push(normalized_milestone);
+        }
+        normalized.milestones.sort_by(|left, right| {
+            left.title
+                .to_ascii_lowercase()
+                .cmp(&right.title.to_ascii_lowercase())
+        });
+        for pair in normalized.milestones.windows(2) {
+            if pair[0].title.eq_ignore_ascii_case(&pair[1].title) {
+                return Err(DomainError::InvalidIssue(format!(
+                    "duplicate issue milestone `{}`",
+                    pair[0].title
+                )));
+            }
+        }
+        Ok(normalized)
+    }
+
+    fn push_issue_timeline_event(
+        issue: &mut IssueRecord,
+        kind: IssueTimelineEventKind,
+        actor: IssueActor,
+        body: Option<String>,
+        title: Option<String>,
+        description: Option<String>,
+        labels: Vec<String>,
+        assignee_user_ids: Vec<String>,
+        milestone_id: Option<String>,
+        pull_request_id: Option<String>,
+        reaction: Option<IssueReactionContent>,
+        target: Option<IssueTimelineTarget>,
+        target_id: Option<String>,
+        created_at_ms: u64,
+    ) {
+        issue.timeline.push(IssueTimelineEvent {
+            id: Uuid::new_v4().to_string(),
+            kind,
+            actor,
+            body,
+            title,
+            description,
+            labels,
+            assignee_user_ids,
+            milestone_id,
+            pull_request_id,
+            reaction,
+            target,
+            target_id,
+            created_at_ms,
+        });
+    }
+
+    fn find_issue_index(issues: &[IssueRecord], issue_id: &str) -> Result<usize, DomainError> {
+        issues
+            .iter()
+            .position(|issue| issue.id == issue_id)
+            .ok_or_else(|| DomainError::IssueNotFound(issue_id.to_string()))
+    }
+
+    fn validate_issue_label_ids(
+        settings: &IssueSettings,
+        label_ids: &[String],
+    ) -> Result<Vec<String>, DomainError> {
+        let mut normalized = label_ids
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized.dedup();
+        for label_id in &normalized {
+            if !settings.labels.iter().any(|label| label.id == *label_id) {
+                return Err(DomainError::IssueLabelNotFound(label_id.clone()));
+            }
+        }
+        Ok(normalized)
+    }
+
+    fn validate_issue_assignees(
+        auth: &RepoAuthState,
+        assignee_user_ids: &[String],
+    ) -> Result<Vec<String>, DomainError> {
+        let mut normalized = assignee_user_ids
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized.dedup();
+        for user_id in &normalized {
+            let user = Self::find_user(auth, user_id)?;
+            if user.status != RepoUserStatus::Active {
+                return Err(DomainError::InvalidIssue(format!(
+                    "assignee `{}` is not active",
+                    user_id
+                )));
+            }
+        }
+        Ok(normalized)
+    }
+
+    fn validate_issue_milestone_id(
+        settings: &IssueSettings,
+        milestone_id: Option<String>,
+    ) -> Result<Option<String>, DomainError> {
+        let milestone_id = milestone_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(milestone_id) = &milestone_id {
+            if !settings
+                .milestones
+                .iter()
+                .any(|milestone| milestone.id == *milestone_id)
+            {
+                return Err(DomainError::IssueMilestoneNotFound(milestone_id.clone()));
+            }
+        }
+        Ok(milestone_id)
+    }
+
+    fn validate_linked_pull_request_ids(
+        pull_requests: &[PullRequestRecord],
+        linked_pull_request_ids: &[String],
+        now_ms: u64,
+    ) -> Result<Vec<IssueLinkedPullRequest>, DomainError> {
+        let mut normalized = linked_pull_request_ids
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized.dedup();
+        for pull_request_id in &normalized {
+            if !pull_requests
+                .iter()
+                .any(|pull_request| pull_request.id == *pull_request_id)
+            {
+                return Err(DomainError::InvalidIssue(format!(
+                    "linked pull request `{}` was not found",
+                    pull_request_id
+                )));
+            }
+        }
+        Ok(normalized
+            .into_iter()
+            .map(|pull_request_id| IssueLinkedPullRequest {
+                pull_request_id,
+                relation: IssueLinkRelation::Related,
+                source: IssueLinkSource::Manual,
+                linked_at_ms: now_ms,
+            })
+            .collect())
+    }
+
+    fn issue_link_relation_rank(relation: &IssueLinkRelation) -> u8 {
+        match relation {
+            IssueLinkRelation::Related => 0,
+            IssueLinkRelation::Closing => 1,
+        }
+    }
+
+    fn issue_link_source_rank(source: &IssueLinkSource) -> u8 {
+        match source {
+            IssueLinkSource::Manual => 0,
+            IssueLinkSource::PullRequestDescription => 1,
+            IssueLinkSource::PullRequestComment => 2,
+            IssueLinkSource::PullRequestReview => 3,
+            IssueLinkSource::IssueDescription => 4,
+            IssueLinkSource::IssueComment => 5,
+        }
+    }
+
+    fn should_replace_issue_link(
+        current_relation: &IssueLinkRelation,
+        current_source: &IssueLinkSource,
+        next_relation: &IssueLinkRelation,
+        next_source: &IssueLinkSource,
+    ) -> bool {
+        let current_relation_rank = Self::issue_link_relation_rank(current_relation);
+        let next_relation_rank = Self::issue_link_relation_rank(next_relation);
+        if next_relation_rank != current_relation_rank {
+            return next_relation_rank > current_relation_rank;
+        }
+        Self::issue_link_source_rank(next_source) < Self::issue_link_source_rank(current_source)
+    }
+
+    fn is_reference_word(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    fn matches_reference_keyword(haystack: &str, start: usize, keyword: &str) -> bool {
+        if !haystack[start..].starts_with(keyword) {
+            return false;
+        }
+        if start > 0 && Self::is_reference_word(haystack.as_bytes()[start - 1]) {
+            return false;
+        }
+        let end = start + keyword.len();
+        if end < haystack.len() && Self::is_reference_word(haystack.as_bytes()[end]) {
+            return false;
+        }
+        true
+    }
+
+    fn skip_reference_spacing(haystack: &str, mut cursor: usize) -> usize {
+        while cursor < haystack.len() {
+            let next = &haystack[cursor..];
+            if next.starts_with("issue ") {
+                cursor += "issue ".len();
+                continue;
+            }
+            if next.starts_with("issues ") {
+                cursor += "issues ".len();
+                continue;
+            }
+            let byte = haystack.as_bytes()[cursor];
+            if byte.is_ascii_whitespace() || matches!(byte, b':' | b'(' | b'[') {
+                cursor += 1;
+                continue;
+            }
+            break;
+        }
+        cursor
+    }
+
+    fn parse_reference_number(haystack: &str, cursor: usize) -> Option<(u64, usize)> {
+        if cursor >= haystack.len() || haystack.as_bytes()[cursor] != b'#' {
+            return None;
+        }
+        let digits_start = cursor + 1;
+        let mut digits_end = digits_start;
+        while digits_end < haystack.len() && haystack.as_bytes()[digits_end].is_ascii_digit() {
+            digits_end += 1;
+        }
+        if digits_end == digits_start {
+            return None;
+        }
+        haystack[digits_start..digits_end]
+            .parse::<u64>()
+            .ok()
+            .map(|number| (number, digits_end))
+    }
+
+    fn consume_reference_separator(haystack: &str, mut cursor: usize) -> Option<usize> {
+        while cursor < haystack.len() && haystack.as_bytes()[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let next = &haystack[cursor..];
+        if next.starts_with(',') {
+            return Some(cursor + 1);
+        }
+        if next.starts_with("and ") {
+            return Some(cursor + "and ".len());
+        }
+        if next.starts_with("or ") {
+            return Some(cursor + "or ".len());
+        }
+        None
+    }
+
+    fn parse_issue_references(text: &str) -> Vec<(u64, IssueLinkRelation)> {
+        const CLOSING_KEYWORDS: [&str; 6] =
+            ["fixes", "fix", "closes", "close", "resolves", "resolve"];
+        const RELATED_KEYWORDS: [&str; 5] =
+            ["related to", "relates to", "refs", "ref", "references"];
+
+        let lowercase = text.to_ascii_lowercase();
+        let mut references = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < lowercase.len() {
+            let mut matched = None;
+            for keyword in CLOSING_KEYWORDS {
+                if Self::matches_reference_keyword(&lowercase, cursor, keyword) {
+                    matched = Some((IssueLinkRelation::Closing, keyword.len()));
+                    break;
+                }
+            }
+            if matched.is_none() {
+                for keyword in RELATED_KEYWORDS {
+                    if Self::matches_reference_keyword(&lowercase, cursor, keyword) {
+                        matched = Some((IssueLinkRelation::Related, keyword.len()));
+                        break;
+                    }
+                }
+            }
+            let Some((relation, keyword_len)) = matched else {
+                cursor += 1;
+                continue;
+            };
+
+            let mut next_cursor = Self::skip_reference_spacing(&lowercase, cursor + keyword_len);
+            while let Some((number, after_number)) =
+                Self::parse_reference_number(&lowercase, next_cursor)
+            {
+                references.push((number, relation.clone()));
+                let Some(separator_cursor) =
+                    Self::consume_reference_separator(&lowercase, after_number)
+                else {
+                    next_cursor = after_number;
+                    break;
+                };
+                next_cursor = Self::skip_reference_spacing(&lowercase, separator_cursor);
+            }
+            cursor = next_cursor.max(cursor + keyword_len);
+        }
+        references
+    }
+
+    fn parse_pull_request_reference_selectors(text: &str) -> Vec<String> {
+        const KEYWORDS: [&str; 2] = ["pull request", "pr"];
+
+        let lowercase = text.to_ascii_lowercase();
+        let mut selectors = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < lowercase.len() {
+            let mut keyword_len = None;
+            for keyword in KEYWORDS {
+                if Self::matches_reference_keyword(&lowercase, cursor, keyword) {
+                    keyword_len = Some(keyword.len());
+                    break;
+                }
+            }
+            let Some(keyword_len) = keyword_len else {
+                cursor += 1;
+                continue;
+            };
+
+            let mut token_start = cursor + keyword_len;
+            while token_start < lowercase.len()
+                && (lowercase.as_bytes()[token_start].is_ascii_whitespace()
+                    || lowercase.as_bytes()[token_start] == b'#'
+                    || lowercase.as_bytes()[token_start] == b':')
+            {
+                token_start += 1;
+            }
+            let mut token_end = token_start;
+            while token_end < lowercase.len() {
+                let byte = lowercase.as_bytes()[token_end];
+                if byte.is_ascii_alphanumeric() || byte == b'-' {
+                    token_end += 1;
+                    continue;
+                }
+                break;
+            }
+            if token_end > token_start {
+                selectors.push(text[token_start..token_end].trim().to_string());
+                cursor = token_end;
+            } else {
+                cursor += keyword_len;
+            }
+        }
+        selectors
+    }
+
+    fn resolve_pull_request_selector(
+        pull_requests: &[PullRequestRecord],
+        selector: &str,
+    ) -> Option<String> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return None;
+        }
+        if let Some(exact) = pull_requests
+            .iter()
+            .find(|pull_request| pull_request.id == selector)
+        {
+            return Some(exact.id.clone());
+        }
+        let mut matches = pull_requests
+            .iter()
+            .filter(|pull_request| pull_request.id.starts_with(selector));
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first.id.clone())
+    }
+
+    fn accumulate_issue_pull_request_link(
+        by_issue: &mut std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, LinkedPullRequestReference>,
+        >,
+        by_pull_request: &mut std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, LinkedIssueReference>,
+        >,
+        issue: &IssueRecord,
+        pull_request_id: &str,
+        relation: IssueLinkRelation,
+        source: IssueLinkSource,
+    ) {
+        let issue_entry = by_issue.entry(issue.id.clone()).or_default();
+        match issue_entry.get_mut(pull_request_id) {
+            Some(existing)
+                if Self::should_replace_issue_link(
+                    &existing.relation,
+                    &existing.source,
+                    &relation,
+                    &source,
+                ) =>
+            {
+                existing.relation = relation.clone();
+                existing.source = source.clone();
+            }
+            None => {
+                issue_entry.insert(
+                    pull_request_id.to_string(),
+                    LinkedPullRequestReference {
+                        pull_request_id: pull_request_id.to_string(),
+                        relation: relation.clone(),
+                        source: source.clone(),
+                    },
+                );
+            }
+            _ => {}
+        }
+
+        let pull_request_entry = by_pull_request
+            .entry(pull_request_id.to_string())
+            .or_default();
+        match pull_request_entry.get_mut(&issue.id) {
+            Some(existing)
+                if Self::should_replace_issue_link(
+                    &existing.relation,
+                    &existing.source,
+                    &relation,
+                    &source,
+                ) =>
+            {
+                existing.relation = relation;
+                existing.source = source;
+            }
+            None => {
+                pull_request_entry.insert(
+                    issue.id.clone(),
+                    LinkedIssueReference {
+                        issue_id: issue.id.clone(),
+                        issue_number: issue.number,
+                        relation,
+                        source,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn issue_pull_request_cross_links(
+        issues: &[IssueRecord],
+        pull_requests: &[PullRequestRecord],
+    ) -> (
+        std::collections::BTreeMap<String, Vec<LinkedPullRequestReference>>,
+        std::collections::BTreeMap<String, Vec<LinkedIssueReference>>,
+    ) {
+        let mut by_issue = std::collections::BTreeMap::<
+            String,
+            std::collections::BTreeMap<String, LinkedPullRequestReference>,
+        >::new();
+        let mut by_pull_request = std::collections::BTreeMap::<
+            String,
+            std::collections::BTreeMap<String, LinkedIssueReference>,
+        >::new();
+        let issue_by_number = issues
+            .iter()
+            .map(|issue| (issue.number, issue))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        for issue in issues {
+            for linked in &issue.linked_pull_requests {
+                if pull_requests
+                    .iter()
+                    .any(|pull_request| pull_request.id == linked.pull_request_id)
+                {
+                    Self::accumulate_issue_pull_request_link(
+                        &mut by_issue,
+                        &mut by_pull_request,
+                        issue,
+                        &linked.pull_request_id,
+                        linked.relation.clone(),
+                        linked.source.clone(),
+                    );
+                }
+            }
+
+            for selector in Self::parse_pull_request_reference_selectors(&issue.description) {
+                if let Some(pull_request_id) =
+                    Self::resolve_pull_request_selector(pull_requests, &selector)
+                {
+                    Self::accumulate_issue_pull_request_link(
+                        &mut by_issue,
+                        &mut by_pull_request,
+                        issue,
+                        &pull_request_id,
+                        IssueLinkRelation::Related,
+                        IssueLinkSource::IssueDescription,
+                    );
+                }
+            }
+            for comment in &issue.comments {
+                for selector in Self::parse_pull_request_reference_selectors(&comment.body) {
+                    if let Some(pull_request_id) =
+                        Self::resolve_pull_request_selector(pull_requests, &selector)
+                    {
+                        Self::accumulate_issue_pull_request_link(
+                            &mut by_issue,
+                            &mut by_pull_request,
+                            issue,
+                            &pull_request_id,
+                            IssueLinkRelation::Related,
+                            IssueLinkSource::IssueComment,
+                        );
+                    }
+                }
+            }
+        }
+
+        for pull_request in pull_requests {
+            for (issue_number, relation) in Self::parse_issue_references(&pull_request.description)
+            {
+                if let Some(issue) = issue_by_number.get(&issue_number) {
+                    Self::accumulate_issue_pull_request_link(
+                        &mut by_issue,
+                        &mut by_pull_request,
+                        issue,
+                        &pull_request.id,
+                        relation,
+                        IssueLinkSource::PullRequestDescription,
+                    );
+                }
+            }
+            for comment in Self::pull_request_comments(pull_request) {
+                for (issue_number, relation) in Self::parse_issue_references(&comment.body) {
+                    if let Some(issue) = issue_by_number.get(&issue_number) {
+                        Self::accumulate_issue_pull_request_link(
+                            &mut by_issue,
+                            &mut by_pull_request,
+                            issue,
+                            &pull_request.id,
+                            relation,
+                            IssueLinkSource::PullRequestComment,
+                        );
+                    }
+                }
+            }
+            for review in Self::pull_request_reviews(pull_request) {
+                for (issue_number, relation) in Self::parse_issue_references(&review.body) {
+                    if let Some(issue) = issue_by_number.get(&issue_number) {
+                        Self::accumulate_issue_pull_request_link(
+                            &mut by_issue,
+                            &mut by_pull_request,
+                            issue,
+                            &pull_request.id,
+                            relation,
+                            IssueLinkSource::PullRequestReview,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut issue_links = std::collections::BTreeMap::new();
+        for (issue_id, links) in by_issue {
+            let mut values = links.into_values().collect::<Vec<_>>();
+            values.sort_by(|left, right| {
+                Self::issue_link_relation_rank(&right.relation)
+                    .cmp(&Self::issue_link_relation_rank(&left.relation))
+                    .then_with(|| {
+                        Self::issue_link_source_rank(&left.source)
+                            .cmp(&Self::issue_link_source_rank(&right.source))
+                    })
+                    .then_with(|| left.pull_request_id.cmp(&right.pull_request_id))
+            });
+            issue_links.insert(issue_id, values);
+        }
+
+        let mut pull_request_links = std::collections::BTreeMap::new();
+        for (pull_request_id, links) in by_pull_request {
+            let mut values = links.into_values().collect::<Vec<_>>();
+            values.sort_by(|left, right| {
+                Self::issue_link_relation_rank(&right.relation)
+                    .cmp(&Self::issue_link_relation_rank(&left.relation))
+                    .then_with(|| {
+                        Self::issue_link_source_rank(&left.source)
+                            .cmp(&Self::issue_link_source_rank(&right.source))
+                    })
+                    .then_with(|| left.issue_number.cmp(&right.issue_number))
+            });
+            pull_request_links.insert(pull_request_id, values);
+        }
+
+        (issue_links, pull_request_links)
+    }
+
+    pub fn linked_pull_requests_for_issue(
+        issue: &IssueRecord,
+        issues: &[IssueRecord],
+        pull_requests: &[PullRequestRecord],
+    ) -> Vec<LinkedPullRequestReference> {
+        let (mut issue_links, _) = Self::issue_pull_request_cross_links(issues, pull_requests);
+        issue_links.remove(&issue.id).unwrap_or_default()
+    }
+
+    pub fn linked_issues_for_pull_request(
+        pull_request: &PullRequestRecord,
+        issues: &[IssueRecord],
+        pull_requests: &[PullRequestRecord],
+    ) -> Vec<LinkedIssueReference> {
+        let (_, mut pull_request_links) =
+            Self::issue_pull_request_cross_links(issues, pull_requests);
+        pull_request_links
+            .remove(&pull_request.id)
+            .unwrap_or_default()
+    }
+
+    fn issue_reaction_summary_for_records(
+        reactions: &[IssueReactionRecord],
+        viewer_actor: Option<&IssueActor>,
+    ) -> Vec<IssueReactionSummary> {
+        let viewer_key = viewer_actor.map(Self::interaction_issue_actor_key);
+        let mut groups = std::collections::BTreeMap::<IssueReactionContent, (usize, bool)>::new();
+        for reaction in reactions {
+            let entry = groups.entry(reaction.content.clone()).or_insert((0, false));
+            entry.0 += 1;
+            if viewer_key
+                .as_ref()
+                .is_some_and(|key| *key == Self::interaction_issue_actor_key(&reaction.actor))
+            {
+                entry.1 = true;
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(content, (count, reacted))| IssueReactionSummary {
+                content,
+                count,
+                reacted,
+            })
+            .collect()
+    }
+
+    pub fn pull_request_comments(
+        pull_request: &PullRequestRecord,
+    ) -> Vec<PullRequestCommentRecord> {
         pull_request
             .activities
             .iter()
@@ -979,13 +1859,12 @@ impl WorkspaceService {
                 Some(PullRequestCommentRecord {
                     id: activity.id.clone(),
                     actor_role: activity.actor_role.clone(),
-                    display_name: activity
-                        .display_name
-                        .clone()
-                        .unwrap_or_else(|| match activity.actor_role {
+                    display_name: activity.display_name.clone().unwrap_or_else(|| {
+                        match activity.actor_role {
                             UiRole::Owner => "Owner".into(),
                             UiRole::User => "Viewer".into(),
-                        }),
+                        }
+                    }),
                     body: activity.body.clone().unwrap_or_default(),
                     created_at_ms: activity.created_at_ms,
                 })
@@ -1004,15 +1883,17 @@ impl WorkspaceService {
                 Some(PullRequestReviewRecord {
                     id: activity.id.clone(),
                     actor_role: activity.actor_role.clone(),
-                    display_name: activity
-                        .display_name
-                        .clone()
-                        .unwrap_or_else(|| match activity.actor_role {
+                    display_name: activity.display_name.clone().unwrap_or_else(|| {
+                        match activity.actor_role {
                             UiRole::Owner => "Owner".into(),
                             UiRole::User => "Viewer".into(),
-                        }),
+                        }
+                    }),
                     body: activity.body.clone().unwrap_or_default(),
-                    state: activity.review_state.clone().unwrap_or(PullRequestReviewState::Commented),
+                    state: activity
+                        .review_state
+                        .clone()
+                        .unwrap_or(PullRequestReviewState::Commented),
                     created_at_ms: activity.created_at_ms,
                 })
             })
@@ -1038,8 +1919,7 @@ impl WorkspaceService {
         for review in Self::pull_request_reviews(pull_request) {
             if dismiss_stale_approvals {
                 let matching_review = pull_request.activities.iter().find(|activity| {
-                    activity.kind == PullRequestActivityKind::Reviewed
-                        && activity.id == review.id
+                    activity.kind == PullRequestActivityKind::Reviewed && activity.id == review.id
                 });
                 if let Some(source_commit) = current_source_commit {
                     if matching_review
@@ -1085,6 +1965,20 @@ impl WorkspaceService {
             comments,
             latest_reviews: latest_by_reviewer,
         }
+    }
+
+    pub fn issue_reaction_summary(
+        issue: &IssueRecord,
+        viewer_actor: Option<&IssueActor>,
+    ) -> Vec<IssueReactionSummary> {
+        Self::issue_reaction_summary_for_records(&issue.reactions, viewer_actor)
+    }
+
+    pub fn issue_comment_reaction_summary(
+        comment: &IssueCommentRecord,
+        viewer_actor: Option<&IssueActor>,
+    ) -> Vec<IssueReactionSummary> {
+        Self::issue_reaction_summary_for_records(&comment.reactions, viewer_actor)
     }
 
     fn branch_head_commit(branches: &[BranchInfo], name: &str) -> Option<String> {
@@ -1322,6 +2216,7 @@ impl WorkspaceService {
             .map(|record| record.web_ui)
             .unwrap_or_default();
         state.repository = Self::normalize_repository_settings(state.repository)?;
+        state.issue_settings = Self::normalize_issue_settings(state.issue_settings)?;
         state.auth = Self::normalize_auth_state(state.auth)?;
         Ok(state)
     }
@@ -1332,6 +2227,7 @@ impl WorkspaceService {
         mut web_ui: WorkspaceWebUiState,
     ) -> Result<(), DomainError> {
         web_ui.repository = Self::normalize_repository_settings(web_ui.repository)?;
+        web_ui.issue_settings = Self::normalize_issue_settings(web_ui.issue_settings)?;
         web_ui.auth = Self::normalize_auth_state(web_ui.auth)?;
         self.registry_store
             .save(
@@ -1525,7 +2421,12 @@ impl WorkspaceService {
                 "only pending requests can be approved".into(),
             ));
         }
-        if web_ui.auth.users.iter().any(|user| user.email == request.email) {
+        if web_ui
+            .auth
+            .users
+            .iter()
+            .any(|user| user.email == request.email)
+        {
             return Err(DomainError::InvalidAuth(
                 "a user with that email already exists".into(),
             ));
@@ -1548,7 +2449,12 @@ impl WorkspaceService {
         web_ui.auth.access_requests[request_index].linked_user_id = Some(user.id.clone());
         web_ui.auth.access_requests[request_index].reviewed_at_ms = Some(now_ms);
         web_ui.auth.users.push(user.clone());
-        let onboarding = Self::issue_onboarding_for_user(&mut web_ui.auth, &user.id, now_ms)?;
+        let issued = IssuedOnboarding {
+            user_id: user.id.clone(),
+            email: user.email.clone(),
+            secret: None,
+            expires_at_ms: 0,
+        };
         Self::record_auth_activity(
             &mut web_ui.auth,
             actor,
@@ -1560,7 +2466,7 @@ impl WorkspaceService {
             now_ms,
         );
         self.save_workspace_with_web_ui(&workspace, web_ui)?;
-        Ok((workspace, RepoUserView::from(&user), onboarding))
+        Ok((workspace, RepoUserView::from(&user), issued))
     }
 
     pub fn issue_setup_token(
@@ -1604,7 +2510,9 @@ impl WorkspaceService {
             .auth
             .access_requests
             .iter()
-            .position(|request| request.email == email && request.status == AccessRequestStatus::Pending)
+            .position(|request| {
+                request.email == email && request.status == AccessRequestStatus::Pending
+            })
             .map(|request_index| {
                 let request = &mut web_ui.auth.access_requests[request_index];
                 request.status = AccessRequestStatus::Approved;
@@ -1693,7 +2601,9 @@ impl WorkspaceService {
         let view = {
             let user = Self::find_user_mut(&mut web_ui.auth, user_id)?;
             if user.status == RepoUserStatus::Revoked {
-                return Err(DomainError::InvalidAuth("cannot promote a revoked user".into()));
+                return Err(DomainError::InvalidAuth(
+                    "cannot promote a revoked user".into(),
+                ));
             }
             user.role = RepoUserRole::Owner;
             user.updated_at_ms = now_ms;
@@ -1729,7 +2639,9 @@ impl WorkspaceService {
         let view = {
             let user = Self::find_user_mut(&mut web_ui.auth, user_id)?;
             if user.status == RepoUserStatus::Revoked {
-                return Err(DomainError::InvalidAuth("cannot demote a revoked user".into()));
+                return Err(DomainError::InvalidAuth(
+                    "cannot demote a revoked user".into(),
+                ));
             }
             user.role = RepoUserRole::User;
             user.updated_at_ms = now_ms;
@@ -1816,7 +2728,9 @@ impl WorkspaceService {
         {
             let user = Self::find_user_mut(&mut web_ui.auth, user_id)?;
             if user.status == RepoUserStatus::Revoked {
-                return Err(DomainError::InvalidAuth("cannot reset setup for a revoked user".into()));
+                return Err(DomainError::InvalidAuth(
+                    "cannot reset setup for a revoked user".into(),
+                ));
             }
             user.status = RepoUserStatus::ApprovedPendingSetup;
             user.updated_at_ms = now_ms;
@@ -1949,7 +2863,8 @@ impl WorkspaceService {
         password: &str,
     ) -> Result<(WorkspaceSpec, AuthenticatedPrincipal), DomainError> {
         let (workspace, auth) = self.read_auth_state(path, fallback_branch)?;
-        let username = Self::normalize_username(username).map_err(|_| DomainError::AuthenticationFailed)?;
+        let username =
+            Self::normalize_username(username).map_err(|_| DomainError::AuthenticationFailed)?;
         let user = Self::find_active_user_by_username(&auth, &username)
             .ok_or(DomainError::AuthenticationFailed)?;
         let verifier = user
@@ -1979,7 +2894,8 @@ impl WorkspaceService {
         secret: &str,
     ) -> Result<(WorkspaceSpec, AuthenticatedPrincipal), DomainError> {
         let (workspace, auth) = self.read_auth_state(path, fallback_branch)?;
-        let username = Self::normalize_username(username).map_err(|_| DomainError::AuthenticationFailed)?;
+        let username =
+            Self::normalize_username(username).map_err(|_| DomainError::AuthenticationFailed)?;
         let user = Self::find_active_user_by_username(&auth, &username)
             .ok_or(DomainError::AuthenticationFailed)?;
         if let Some(verifier) = user.password_verifier.as_deref() {
@@ -2294,6 +3210,7 @@ impl WorkspaceService {
         path: PathBuf,
         fallback_branch: &str,
         pull_request_id: &str,
+        actor: IssueActorInput,
     ) -> Result<(WorkspaceSpec, PullRequestRecord), DomainError> {
         let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
         let _lock = self.lock_resolved_workspace(&initial_workspace)?;
@@ -2330,10 +3247,8 @@ impl WorkspaceService {
                 name: record.name,
             })
             .collect::<Vec<_>>();
-        let current_source_commit = Self::branch_head_commit(
-            &branches,
-            &web_ui.pull_requests[index].source_branch,
-        );
+        let current_source_commit =
+            Self::branch_head_commit(&branches, &web_ui.pull_requests[index].source_branch);
         if protection.required_approvals > 0 {
             let summary = Self::pull_request_review_summary_for_source(
                 &web_ui.pull_requests[index],
@@ -2349,8 +3264,7 @@ impl WorkspaceService {
             if summary.approvals < protection.required_approvals as usize {
                 return Err(DomainError::BranchRuleViolation(format!(
                     "`{}` requires {} approval(s) before merge",
-                    web_ui.pull_requests[index].target_branch,
-                    protection.required_approvals
+                    web_ui.pull_requests[index].target_branch, protection.required_approvals
                 )));
             }
         }
@@ -2365,6 +3279,7 @@ impl WorkspaceService {
             .await
             .map_err(DomainError::Repository)?;
 
+        let merge_actor = Self::normalize_issue_actor(actor)?;
         let timestamp = Self::now_ms();
         web_ui.pull_requests[index].status = PullRequestStatus::Merged;
         web_ui.pull_requests[index].updated_at_ms = timestamp;
@@ -2372,8 +3287,8 @@ impl WorkspaceService {
         Self::push_activity(
             &mut web_ui.pull_requests[index],
             PullRequestActivityKind::Merged,
-            UiRole::Owner,
-            None,
+            merge_actor.role.clone(),
+            Some(merge_actor.display_name.clone()),
             None,
             None,
             None,
@@ -2382,9 +3297,46 @@ impl WorkspaceService {
             None,
             timestamp,
         );
-        let pull_request = web_ui.pull_requests[index].clone();
+        let merged_pull_request = web_ui.pull_requests[index].clone();
+        let closing_issue_ids = Self::linked_issues_for_pull_request(
+            &merged_pull_request,
+            &web_ui.issues,
+            &web_ui.pull_requests,
+        )
+        .into_iter()
+        .filter(|link| link.relation == IssueLinkRelation::Closing)
+        .map(|link| link.issue_id)
+        .collect::<Vec<_>>();
+        for issue_id in closing_issue_ids {
+            let Ok(issue_index) = Self::find_issue_index(&web_ui.issues, &issue_id) else {
+                continue;
+            };
+            let issue = &mut web_ui.issues[issue_index];
+            if issue.status == IssueStatus::Closed {
+                continue;
+            }
+            issue.status = IssueStatus::Closed;
+            issue.closed_at_ms = Some(timestamp);
+            issue.updated_at_ms = timestamp;
+            Self::push_issue_timeline_event(
+                issue,
+                IssueTimelineEventKind::Closed,
+                merge_actor.clone(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(merged_pull_request.id.clone()),
+                None,
+                Some(IssueTimelineTarget::Issue),
+                None,
+                timestamp,
+            );
+        }
         self.save_workspace_with_web_ui(&workspace, web_ui)?;
-        Ok((workspace, pull_request))
+        Ok((workspace, merged_pull_request))
     }
 
     pub async fn update_pull_request(
@@ -2637,6 +3589,788 @@ impl WorkspaceService {
         let pull_request = web_ui.pull_requests.remove(index);
         self.save_workspace_with_web_ui(&workspace, web_ui)?;
         Ok((workspace, pull_request))
+    }
+
+    pub async fn create_issue(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        draft: CreateIssue,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        web_ui.issue_settings = Self::normalize_issue_settings(web_ui.issue_settings)?;
+        let author = Self::normalize_issue_actor(actor)?;
+        let title = Self::normalize_issue_required(&draft.title, "issue title")?;
+        let description = Self::normalize_optional(&draft.description);
+        let timestamp = Self::now_ms();
+        let label_ids = Self::validate_issue_label_ids(&web_ui.issue_settings, &draft.label_ids)?;
+        let assignee_user_ids =
+            Self::validate_issue_assignees(&web_ui.auth, &draft.assignee_user_ids)?;
+        let milestone_id =
+            Self::validate_issue_milestone_id(&web_ui.issue_settings, draft.milestone_id)?;
+        let linked_pull_requests = Self::validate_linked_pull_request_ids(
+            &web_ui.pull_requests,
+            &draft.linked_pull_request_ids,
+            timestamp,
+        )?;
+        let number = web_ui.issue_settings.next_issue_number;
+        web_ui.issue_settings.next_issue_number =
+            web_ui.issue_settings.next_issue_number.saturating_add(1);
+
+        let mut issue = IssueRecord {
+            id: Uuid::new_v4().to_string(),
+            number,
+            title: title.clone(),
+            description: description.clone(),
+            status: IssueStatus::Open,
+            author: author.clone(),
+            created_at_ms: timestamp,
+            updated_at_ms: timestamp,
+            closed_at_ms: None,
+            label_ids: label_ids.clone(),
+            assignee_user_ids: assignee_user_ids.clone(),
+            milestone_id: milestone_id.clone(),
+            linked_pull_requests: linked_pull_requests.clone(),
+            reactions: Vec::new(),
+            comments: Vec::new(),
+            timeline: Vec::new(),
+        };
+        Self::push_issue_timeline_event(
+            &mut issue,
+            IssueTimelineEventKind::Opened,
+            author.clone(),
+            None,
+            Some(title),
+            Some(description),
+            label_ids,
+            assignee_user_ids,
+            milestone_id,
+            None,
+            None,
+            Some(IssueTimelineTarget::Issue),
+            None,
+            timestamp,
+        );
+        for linked in linked_pull_requests {
+            Self::push_issue_timeline_event(
+                &mut issue,
+                IssueTimelineEventKind::PullRequestLinked,
+                author.clone(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(linked.pull_request_id),
+                None,
+                Some(IssueTimelineTarget::Issue),
+                None,
+                timestamp,
+            );
+        }
+        web_ui.issues.insert(0, issue.clone());
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
+    }
+
+    pub async fn update_issue(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        issue_id: &str,
+        update: UpdateIssue,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let actor = Self::normalize_issue_actor(actor)?;
+        let issue_index = Self::find_issue_index(&web_ui.issues, issue_id)?;
+        if !Self::can_manage_issue(&actor, &web_ui.issues[issue_index]) {
+            return Err(DomainError::InvalidIssue(
+                "only issue authors or owners can edit this issue".into(),
+            ));
+        }
+
+        let timestamp = Self::now_ms();
+        let issue = &mut web_ui.issues[issue_index];
+        let mut edited = false;
+
+        if let Some(title) = update.title {
+            let title = Self::normalize_issue_required(&title, "issue title")?;
+            if title != issue.title {
+                issue.title = title;
+                edited = true;
+            }
+        }
+        if let Some(description) = update.description {
+            let description = Self::normalize_optional(&description);
+            if description != issue.description {
+                issue.description = description;
+                edited = true;
+            }
+        }
+        if edited {
+            issue.updated_at_ms = timestamp;
+            Self::push_issue_timeline_event(
+                issue,
+                IssueTimelineEventKind::Edited,
+                actor.clone(),
+                None,
+                Some(issue.title.clone()),
+                Some(issue.description.clone()),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                Some(IssueTimelineTarget::Issue),
+                None,
+                timestamp,
+            );
+        }
+        if let Some(status) = update.status {
+            match (&issue.status, status) {
+                (IssueStatus::Open, IssueStatus::Closed) => {
+                    issue.status = IssueStatus::Closed;
+                    issue.closed_at_ms = Some(timestamp);
+                    issue.updated_at_ms = timestamp;
+                    Self::push_issue_timeline_event(
+                        issue,
+                        IssueTimelineEventKind::Closed,
+                        actor,
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        None,
+                        None,
+                        Some(IssueTimelineTarget::Issue),
+                        None,
+                        timestamp,
+                    );
+                }
+                (IssueStatus::Closed, IssueStatus::Open) => {
+                    issue.status = IssueStatus::Open;
+                    issue.closed_at_ms = None;
+                    issue.updated_at_ms = timestamp;
+                    Self::push_issue_timeline_event(
+                        issue,
+                        IssueTimelineEventKind::Reopened,
+                        actor,
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        None,
+                        None,
+                        Some(IssueTimelineTarget::Issue),
+                        None,
+                        timestamp,
+                    );
+                }
+                (IssueStatus::Open, IssueStatus::Open)
+                | (IssueStatus::Closed, IssueStatus::Closed) => {}
+            }
+        }
+
+        let issue = web_ui.issues[issue_index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
+    }
+
+    pub async fn delete_issue(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        issue_id: &str,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let issue_index = Self::find_issue_index(&web_ui.issues, issue_id)?;
+        let issue = web_ui.issues.remove(issue_index);
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
+    }
+
+    pub async fn comment_issue(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        issue_id: &str,
+        comment: CreateIssueComment,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let issue_index = Self::find_issue_index(&web_ui.issues, issue_id)?;
+        let actor = Self::normalize_issue_actor(IssueActorInput {
+            display_name: comment.display_name,
+            ..actor
+        })?;
+        let body = Self::normalize_issue_required(&comment.body, "comment body")?;
+        let timestamp = Self::now_ms();
+        let issue = &mut web_ui.issues[issue_index];
+        let comment_id = Uuid::new_v4().to_string();
+        issue.comments.push(IssueCommentRecord {
+            id: comment_id.clone(),
+            actor: actor.clone(),
+            body: body.clone(),
+            created_at_ms: timestamp,
+            updated_at_ms: timestamp,
+            reactions: Vec::new(),
+        });
+        issue.updated_at_ms = timestamp;
+        Self::push_issue_timeline_event(
+            issue,
+            IssueTimelineEventKind::Commented,
+            actor,
+            Some(body),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(IssueTimelineTarget::Comment),
+            Some(comment_id),
+            timestamp,
+        );
+        let issue = web_ui.issues[issue_index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
+    }
+
+    pub fn upsert_issue_label(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        label: UpsertIssueLabel,
+    ) -> Result<(WorkspaceSpec, IssueLabel), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        web_ui.issue_settings = Self::normalize_issue_settings(web_ui.issue_settings)?;
+        let timestamp = Self::now_ms();
+        let mut normalized =
+            Self::normalize_issue_label(label.clone(), label.id.as_deref(), timestamp)?;
+        if web_ui.issue_settings.labels.iter().any(|existing| {
+            existing.id != normalized.id && existing.name.eq_ignore_ascii_case(&normalized.name)
+        }) {
+            return Err(DomainError::InvalidIssue(format!(
+                "issue label `{}` already exists",
+                normalized.name
+            )));
+        }
+        if let Some(existing) = web_ui
+            .issue_settings
+            .labels
+            .iter_mut()
+            .find(|existing| existing.id == normalized.id)
+        {
+            normalized.created_at_ms = existing.created_at_ms;
+            *existing = normalized.clone();
+        } else {
+            web_ui.issue_settings.labels.push(normalized.clone());
+        }
+        web_ui.issue_settings = Self::normalize_issue_settings(web_ui.issue_settings)?;
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, normalized))
+    }
+
+    pub fn delete_issue_label(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        label_id: &str,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueLabel), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let actor = Self::normalize_issue_actor(actor)?;
+        let label_index = web_ui
+            .issue_settings
+            .labels
+            .iter()
+            .position(|label| label.id == label_id)
+            .ok_or_else(|| DomainError::IssueLabelNotFound(label_id.to_string()))?;
+        let deleted = web_ui.issue_settings.labels.remove(label_index);
+        let timestamp = Self::now_ms();
+        for issue in web_ui
+            .issues
+            .iter_mut()
+            .filter(|issue| issue.label_ids.iter().any(|existing| existing == label_id))
+        {
+            issue.label_ids.retain(|existing| existing != label_id);
+            issue.updated_at_ms = timestamp;
+            Self::push_issue_timeline_event(
+                issue,
+                IssueTimelineEventKind::LabelsChanged,
+                actor.clone(),
+                None,
+                None,
+                None,
+                issue.label_ids.clone(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                Some(IssueTimelineTarget::Issue),
+                None,
+                timestamp,
+            );
+        }
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, deleted))
+    }
+
+    pub fn upsert_issue_milestone(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        milestone: UpsertIssueMilestone,
+    ) -> Result<(WorkspaceSpec, IssueMilestone), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        web_ui.issue_settings = Self::normalize_issue_settings(web_ui.issue_settings)?;
+        let timestamp = Self::now_ms();
+        let mut normalized =
+            Self::normalize_issue_milestone(milestone.clone(), milestone.id.as_deref(), timestamp)?;
+        if web_ui.issue_settings.milestones.iter().any(|existing| {
+            existing.id != normalized.id && existing.title.eq_ignore_ascii_case(&normalized.title)
+        }) {
+            return Err(DomainError::InvalidIssue(format!(
+                "issue milestone `{}` already exists",
+                normalized.title
+            )));
+        }
+        if let Some(existing) = web_ui
+            .issue_settings
+            .milestones
+            .iter_mut()
+            .find(|existing| existing.id == normalized.id)
+        {
+            normalized.created_at_ms = existing.created_at_ms;
+            *existing = normalized.clone();
+        } else {
+            web_ui.issue_settings.milestones.push(normalized.clone());
+        }
+        web_ui.issue_settings = Self::normalize_issue_settings(web_ui.issue_settings)?;
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, normalized))
+    }
+
+    pub fn delete_issue_milestone(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        milestone_id: &str,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueMilestone), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let actor = Self::normalize_issue_actor(actor)?;
+        let milestone_index = web_ui
+            .issue_settings
+            .milestones
+            .iter()
+            .position(|milestone| milestone.id == milestone_id)
+            .ok_or_else(|| DomainError::IssueMilestoneNotFound(milestone_id.to_string()))?;
+        let deleted = web_ui.issue_settings.milestones.remove(milestone_index);
+        let timestamp = Self::now_ms();
+        for issue in web_ui
+            .issues
+            .iter_mut()
+            .filter(|issue| issue.milestone_id.as_deref() == Some(milestone_id))
+        {
+            issue.milestone_id = None;
+            issue.updated_at_ms = timestamp;
+            Self::push_issue_timeline_event(
+                issue,
+                IssueTimelineEventKind::MilestoneChanged,
+                actor.clone(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                Some(IssueTimelineTarget::Issue),
+                None,
+                timestamp,
+            );
+        }
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, deleted))
+    }
+
+    pub async fn set_issue_labels(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        issue_id: &str,
+        label_ids: Vec<String>,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let actor = Self::normalize_issue_actor(actor)?;
+        let issue_index = Self::find_issue_index(&web_ui.issues, issue_id)?;
+        let label_ids = Self::validate_issue_label_ids(&web_ui.issue_settings, &label_ids)?;
+        if web_ui.issues[issue_index].label_ids != label_ids {
+            let timestamp = Self::now_ms();
+            let issue = &mut web_ui.issues[issue_index];
+            issue.label_ids = label_ids.clone();
+            issue.updated_at_ms = timestamp;
+            Self::push_issue_timeline_event(
+                issue,
+                IssueTimelineEventKind::LabelsChanged,
+                actor,
+                None,
+                None,
+                None,
+                label_ids,
+                Vec::new(),
+                None,
+                None,
+                None,
+                Some(IssueTimelineTarget::Issue),
+                None,
+                timestamp,
+            );
+        }
+        let issue = web_ui.issues[issue_index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
+    }
+
+    pub async fn set_issue_assignees(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        issue_id: &str,
+        assignee_user_ids: Vec<String>,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let actor = Self::normalize_issue_actor(actor)?;
+        let issue_index = Self::find_issue_index(&web_ui.issues, issue_id)?;
+        let assignee_user_ids = Self::validate_issue_assignees(&web_ui.auth, &assignee_user_ids)?;
+        if web_ui.issues[issue_index].assignee_user_ids != assignee_user_ids {
+            let timestamp = Self::now_ms();
+            let issue = &mut web_ui.issues[issue_index];
+            issue.assignee_user_ids = assignee_user_ids.clone();
+            issue.updated_at_ms = timestamp;
+            Self::push_issue_timeline_event(
+                issue,
+                IssueTimelineEventKind::AssigneesChanged,
+                actor,
+                None,
+                None,
+                None,
+                Vec::new(),
+                assignee_user_ids,
+                None,
+                None,
+                None,
+                Some(IssueTimelineTarget::Issue),
+                None,
+                timestamp,
+            );
+        }
+        let issue = web_ui.issues[issue_index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
+    }
+
+    pub async fn set_issue_milestone(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        issue_id: &str,
+        milestone_id: Option<String>,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let actor = Self::normalize_issue_actor(actor)?;
+        let issue_index = Self::find_issue_index(&web_ui.issues, issue_id)?;
+        let milestone_id = Self::validate_issue_milestone_id(&web_ui.issue_settings, milestone_id)?;
+        if web_ui.issues[issue_index].milestone_id != milestone_id {
+            let timestamp = Self::now_ms();
+            let issue = &mut web_ui.issues[issue_index];
+            issue.milestone_id = milestone_id.clone();
+            issue.updated_at_ms = timestamp;
+            Self::push_issue_timeline_event(
+                issue,
+                IssueTimelineEventKind::MilestoneChanged,
+                actor,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                milestone_id,
+                None,
+                None,
+                Some(IssueTimelineTarget::Issue),
+                None,
+                timestamp,
+            );
+        }
+        let issue = web_ui.issues[issue_index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
+    }
+
+    pub async fn link_issue_pull_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        issue_id: &str,
+        pull_request_id: &str,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        if !web_ui
+            .pull_requests
+            .iter()
+            .any(|pull_request| pull_request.id == pull_request_id)
+        {
+            return Err(DomainError::InvalidIssue(format!(
+                "linked pull request `{}` was not found",
+                pull_request_id
+            )));
+        }
+        let actor = Self::normalize_issue_actor(actor)?;
+        let issue_index = Self::find_issue_index(&web_ui.issues, issue_id)?;
+        if !web_ui.issues[issue_index]
+            .linked_pull_requests
+            .iter()
+            .any(|linked| linked.pull_request_id == pull_request_id)
+        {
+            let timestamp = Self::now_ms();
+            let issue = &mut web_ui.issues[issue_index];
+            issue.linked_pull_requests.push(IssueLinkedPullRequest {
+                pull_request_id: pull_request_id.to_string(),
+                relation: IssueLinkRelation::Related,
+                source: IssueLinkSource::Manual,
+                linked_at_ms: timestamp,
+            });
+            issue.updated_at_ms = timestamp;
+            Self::push_issue_timeline_event(
+                issue,
+                IssueTimelineEventKind::PullRequestLinked,
+                actor,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(pull_request_id.to_string()),
+                None,
+                Some(IssueTimelineTarget::Issue),
+                None,
+                timestamp,
+            );
+        }
+        let issue = web_ui.issues[issue_index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
+    }
+
+    pub async fn unlink_issue_pull_request(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        issue_id: &str,
+        pull_request_id: &str,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let actor = Self::normalize_issue_actor(actor)?;
+        let issue_index = Self::find_issue_index(&web_ui.issues, issue_id)?;
+        if web_ui.issues[issue_index]
+            .linked_pull_requests
+            .iter()
+            .any(|linked| linked.pull_request_id == pull_request_id)
+        {
+            let timestamp = Self::now_ms();
+            let issue = &mut web_ui.issues[issue_index];
+            issue
+                .linked_pull_requests
+                .retain(|linked| linked.pull_request_id != pull_request_id);
+            issue.updated_at_ms = timestamp;
+            Self::push_issue_timeline_event(
+                issue,
+                IssueTimelineEventKind::PullRequestUnlinked,
+                actor,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(pull_request_id.to_string()),
+                None,
+                Some(IssueTimelineTarget::Issue),
+                None,
+                timestamp,
+            );
+        }
+        let issue = web_ui.issues[issue_index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
+    }
+
+    pub async fn toggle_issue_reaction(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        issue_id: &str,
+        reaction: IssueReactionContent,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let actor = Self::normalize_issue_actor(actor)?;
+        let actor_key = Self::interaction_issue_actor_key(&actor);
+        let issue_index = Self::find_issue_index(&web_ui.issues, issue_id)?;
+        let timestamp = Self::now_ms();
+        let issue = &mut web_ui.issues[issue_index];
+        if let Some(existing_index) = issue.reactions.iter().position(|existing| {
+            existing.content == reaction
+                && Self::interaction_issue_actor_key(&existing.actor) == actor_key
+        }) {
+            issue.reactions.remove(existing_index);
+        } else {
+            issue.reactions.push(IssueReactionRecord {
+                id: Uuid::new_v4().to_string(),
+                content: reaction.clone(),
+                actor: actor.clone(),
+                created_at_ms: timestamp,
+            });
+        }
+        issue.updated_at_ms = timestamp;
+        Self::push_issue_timeline_event(
+            issue,
+            IssueTimelineEventKind::ReactionToggled,
+            actor,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            Some(reaction),
+            Some(IssueTimelineTarget::Issue),
+            None,
+            timestamp,
+        );
+        let issue = web_ui.issues[issue_index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
+    }
+
+    pub async fn toggle_issue_comment_reaction(
+        &self,
+        path: PathBuf,
+        fallback_branch: &str,
+        issue_id: &str,
+        comment_id: &str,
+        reaction: IssueReactionContent,
+        actor: IssueActorInput,
+    ) -> Result<(WorkspaceSpec, IssueRecord), DomainError> {
+        let initial_workspace = self.existing_workspace(path.clone(), fallback_branch)?;
+        let _lock = self.lock_resolved_workspace(&initial_workspace)?;
+        let workspace = self.existing_workspace(path, fallback_branch)?;
+        let mut web_ui = self.load_web_ui_state(&workspace)?;
+        let actor = Self::normalize_issue_actor(actor)?;
+        let actor_key = Self::interaction_issue_actor_key(&actor);
+        let issue_index = Self::find_issue_index(&web_ui.issues, issue_id)?;
+        let timestamp = Self::now_ms();
+        let issue = &mut web_ui.issues[issue_index];
+        let comment = issue
+            .comments
+            .iter_mut()
+            .find(|comment| comment.id == comment_id)
+            .ok_or_else(|| {
+                DomainError::InvalidIssue(format!("comment `{comment_id}` was not found"))
+            })?;
+        if let Some(existing_index) = comment.reactions.iter().position(|existing| {
+            existing.content == reaction
+                && Self::interaction_issue_actor_key(&existing.actor) == actor_key
+        }) {
+            comment.reactions.remove(existing_index);
+        } else {
+            comment.reactions.push(IssueReactionRecord {
+                id: Uuid::new_v4().to_string(),
+                content: reaction.clone(),
+                actor: actor.clone(),
+                created_at_ms: timestamp,
+            });
+        }
+        issue.updated_at_ms = timestamp;
+        Self::push_issue_timeline_event(
+            issue,
+            IssueTimelineEventKind::ReactionToggled,
+            actor,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            Some(reaction),
+            Some(IssueTimelineTarget::Comment),
+            Some(comment_id.to_string()),
+            timestamp,
+        );
+        let issue = web_ui.issues[issue_index].clone();
+        self.save_workspace_with_web_ui(&workspace, web_ui)?;
+        Ok((workspace, issue))
     }
 
     pub async fn apply(
@@ -2914,7 +4648,11 @@ pub async fn resolve_branch_commit_at_time(
         if history.commits.is_empty() {
             return None;
         }
-        if let Some(commit) = history.commits.iter().find(|commit| commit.authored_at <= cutoff) {
+        if let Some(commit) = history
+            .commits
+            .iter()
+            .find(|commit| commit.authored_at <= cutoff)
+        {
             return Some(commit.id.clone());
         }
         if !history.has_more {
@@ -3617,6 +5355,347 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_lifecycle_tracks_metadata_comments_and_reactions() {
+        let (_temp, registry, service) = service_with_workspace("main", "feature");
+        let (_, label) = service
+            .upsert_issue_label(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                UpsertIssueLabel {
+                    id: None,
+                    name: "bug".into(),
+                    color: "cf222e".into(),
+                    description: "Bug work".into(),
+                },
+            )
+            .unwrap();
+        let (_, milestone) = service
+            .upsert_issue_milestone(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                UpsertIssueMilestone {
+                    id: None,
+                    title: "v1".into(),
+                    description: "First release".into(),
+                },
+            )
+            .unwrap();
+        let (_, pull_request) = service
+            .create_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreatePullRequest {
+                    title: "Fix PR".into(),
+                    description: String::new(),
+                    source_branch: "feature".into(),
+                    target_branch: "main".into(),
+                },
+                UiRole::Owner,
+            )
+            .await
+            .unwrap();
+
+        let actor = IssueActorInput {
+            role: UiRole::Owner,
+            display_name: Some("Taylor".into()),
+            user_id: Some("owner-1".into()),
+            username: Some("taylor".into()),
+        };
+        let (_, created) = service
+            .create_issue(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreateIssue {
+                    title: "Broken flow".into(),
+                    description: "Something is off".into(),
+                    label_ids: vec![label.id.clone()],
+                    assignee_user_ids: Vec::new(),
+                    milestone_id: Some(milestone.id.clone()),
+                    linked_pull_request_ids: vec![pull_request.id.clone()],
+                },
+                actor.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.number, 1);
+        assert_eq!(created.timeline[0].kind, IssueTimelineEventKind::Opened);
+
+        let (_, commented) = service
+            .comment_issue(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &created.id,
+                CreateIssueComment {
+                    display_name: Some("Taylor".into()),
+                    body: "Investigating now.".into(),
+                },
+                actor.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(commented.comments.len(), 1);
+
+        let (_, reacted) = service
+            .toggle_issue_reaction(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &created.id,
+                IssueReactionContent::ThumbsUp,
+                actor.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            WorkspaceService::issue_reaction_summary(&reacted, Some(&created.author))[0].count,
+            1
+        );
+
+        let (_, closed) = service
+            .update_issue(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &created.id,
+                UpdateIssue {
+                    title: Some("Broken login flow".into()),
+                    description: None,
+                    status: Some(IssueStatus::Closed),
+                },
+                actor,
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.status, IssueStatus::Closed);
+
+        let stored = registry.records.lock().unwrap();
+        let stored_issue = stored
+            .values()
+            .next()
+            .unwrap()
+            .web_ui
+            .issues
+            .first()
+            .unwrap()
+            .clone();
+        assert_eq!(stored_issue.title, "Broken login flow");
+        assert!(stored_issue
+            .timeline
+            .iter()
+            .any(|event| event.kind == IssueTimelineEventKind::Commented));
+        assert!(stored_issue
+            .timeline
+            .iter()
+            .any(|event| event.kind == IssueTimelineEventKind::PullRequestLinked));
+    }
+
+    #[tokio::test]
+    async fn smart_links_are_derived_in_both_directions_without_duplicates() {
+        let (_temp, _registry, service) = service_with_workspace("main", "feature");
+        let actor = IssueActorInput {
+            role: UiRole::Owner,
+            display_name: Some("Taylor".into()),
+            user_id: Some("owner-1".into()),
+            username: Some("taylor".into()),
+        };
+        let (_, issue_one) = service
+            .create_issue(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreateIssue {
+                    title: "Broken login".into(),
+                    description: String::new(),
+                    label_ids: Vec::new(),
+                    assignee_user_ids: Vec::new(),
+                    milestone_id: None,
+                    linked_pull_request_ids: Vec::new(),
+                },
+                actor.clone(),
+            )
+            .await
+            .unwrap();
+        let (_, issue_two) = service
+            .create_issue(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreateIssue {
+                    title: "Docs follow-up".into(),
+                    description: String::new(),
+                    label_ids: Vec::new(),
+                    assignee_user_ids: Vec::new(),
+                    milestone_id: None,
+                    linked_pull_request_ids: Vec::new(),
+                },
+                actor.clone(),
+            )
+            .await
+            .unwrap();
+        let (_, pull_request_one) = service
+            .create_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreatePullRequest {
+                    title: "Login fix".into(),
+                    description: format!(
+                        "Fixes #{}\nRelated to #{}",
+                        issue_one.number, issue_two.number
+                    ),
+                    source_branch: "feature".into(),
+                    target_branch: "main".into(),
+                },
+                UiRole::Owner,
+            )
+            .await
+            .unwrap();
+        let (_, pull_request_two) = service
+            .create_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreatePullRequest {
+                    title: "Docs cleanup".into(),
+                    description: String::new(),
+                    source_branch: "feature".into(),
+                    target_branch: "main".into(),
+                },
+                UiRole::Owner,
+            )
+            .await
+            .unwrap();
+
+        let (_, issue_two) = service
+            .comment_issue(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &issue_two.id,
+                CreateIssueComment {
+                    display_name: Some("Taylor".into()),
+                    body: format!(
+                        "Related to PR {} and also PR {}",
+                        pull_request_two.id.chars().take(8).collect::<String>(),
+                        pull_request_two.id.chars().take(8).collect::<String>()
+                    ),
+                },
+                actor.clone(),
+            )
+            .await
+            .unwrap();
+        let (_, web_ui) = service
+            .load_web_ui(PathBuf::from("."), DEFAULT_BRANCH)
+            .unwrap();
+
+        let linked_issue_one = WorkspaceService::linked_pull_requests_for_issue(
+            &issue_one,
+            &web_ui.issues,
+            &web_ui.pull_requests,
+        );
+        assert_eq!(linked_issue_one.len(), 1);
+        assert_eq!(linked_issue_one[0].pull_request_id, pull_request_one.id);
+        assert_eq!(linked_issue_one[0].relation, IssueLinkRelation::Closing);
+        assert_eq!(
+            linked_issue_one[0].source,
+            IssueLinkSource::PullRequestDescription
+        );
+
+        let linked_issue_two = WorkspaceService::linked_pull_requests_for_issue(
+            &issue_two,
+            &web_ui.issues,
+            &web_ui.pull_requests,
+        );
+        assert_eq!(linked_issue_two.len(), 2);
+        assert!(linked_issue_two.iter().any(|link| {
+            link.pull_request_id == pull_request_one.id
+                && link.relation == IssueLinkRelation::Related
+                && link.source == IssueLinkSource::PullRequestDescription
+        }));
+        assert!(linked_issue_two.iter().any(|link| {
+            link.pull_request_id == pull_request_two.id
+                && link.relation == IssueLinkRelation::Related
+                && link.source == IssueLinkSource::IssueComment
+        }));
+
+        let linked_pull_request_one = WorkspaceService::linked_issues_for_pull_request(
+            &pull_request_one,
+            &web_ui.issues,
+            &web_ui.pull_requests,
+        );
+        assert_eq!(linked_pull_request_one.len(), 2);
+        assert!(linked_pull_request_one.iter().any(|link| {
+            link.issue_id == issue_one.id && link.relation == IssueLinkRelation::Closing
+        }));
+        assert!(linked_pull_request_one.iter().any(|link| {
+            link.issue_id == issue_two.id && link.relation == IssueLinkRelation::Related
+        }));
+
+        let linked_pull_request_two = WorkspaceService::linked_issues_for_pull_request(
+            &pull_request_two,
+            &web_ui.issues,
+            &web_ui.pull_requests,
+        );
+        assert_eq!(linked_pull_request_two.len(), 1);
+        assert_eq!(linked_pull_request_two[0].issue_id, issue_two.id);
+        assert_eq!(
+            linked_pull_request_two[0].source,
+            IssueLinkSource::IssueComment
+        );
+    }
+
+    #[tokio::test]
+    async fn merging_pull_request_closes_issues_referenced_with_closing_keywords() {
+        let (_temp, _registry, service) = service_with_workspace("main", "feature");
+        let actor = IssueActorInput {
+            role: UiRole::Owner,
+            display_name: Some("Taylor".into()),
+            user_id: Some("owner-1".into()),
+            username: Some("taylor".into()),
+        };
+        let (_, issue) = service
+            .create_issue(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreateIssue {
+                    title: "Broken login".into(),
+                    description: String::new(),
+                    label_ids: Vec::new(),
+                    assignee_user_ids: Vec::new(),
+                    milestone_id: None,
+                    linked_pull_request_ids: Vec::new(),
+                },
+                actor.clone(),
+            )
+            .await
+            .unwrap();
+        let (_, pull_request) = service
+            .create_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                CreatePullRequest {
+                    title: "Login fix".into(),
+                    description: format!("Fixes #{}", issue.number),
+                    source_branch: "feature".into(),
+                    target_branch: "main".into(),
+                },
+                UiRole::Owner,
+            )
+            .await
+            .unwrap();
+
+        let (_, merged) = service
+            .merge_pull_request(PathBuf::from("."), DEFAULT_BRANCH, &pull_request.id, actor)
+            .await
+            .unwrap();
+        assert_eq!(merged.status, PullRequestStatus::Merged);
+
+        let (_, web_ui) = service
+            .load_web_ui(PathBuf::from("."), DEFAULT_BRANCH)
+            .unwrap();
+        let stored_issue = web_ui
+            .issues
+            .iter()
+            .find(|candidate| candidate.id == issue.id)
+            .unwrap();
+        assert_eq!(stored_issue.status, IssueStatus::Closed);
+        assert!(stored_issue.closed_at_ms.is_some());
+    }
+
+    #[tokio::test]
     async fn repository_settings_round_trip_and_branch_rules_persist() {
         let (_temp, registry, service) = service_with_workspace("main", "main");
 
@@ -3657,7 +5736,10 @@ mod tests {
             record.web_ui.repository.homepage_url,
             "https://example.com/docs"
         );
-        assert_eq!(record.web_ui.repository.branch_rules[0].required_approvals, 2);
+        assert_eq!(
+            record.web_ui.repository.branch_rules[0].required_approvals,
+            2
+        );
     }
 
     #[tokio::test]
@@ -3759,7 +5841,17 @@ mod tests {
             .unwrap();
 
         let error = service
-            .merge_pull_request(PathBuf::from("."), DEFAULT_BRANCH, &created.id)
+            .merge_pull_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                &created.id,
+                IssueActorInput {
+                    role: UiRole::Owner,
+                    display_name: Some("Taylor".into()),
+                    user_id: Some("owner-1".into()),
+                    username: Some("taylor".into()),
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, DomainError::BranchRuleViolation(_)));
@@ -3876,7 +5968,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(user.status, RepoUserStatus::ApprovedPendingSetup);
-        assert!(onboarding.secret.starts_with("qit_setup."));
+        assert!(onboarding
+            .secret
+            .as_deref()
+            .is_some_and(|secret| secret.starts_with("qit_setup.")));
 
         let (_, progress) = service
             .read_access_request_progress(PathBuf::from("."), DEFAULT_BRANCH, &request.secret)
@@ -3887,7 +5982,10 @@ mod tests {
             .complete_onboarding(
                 PathBuf::from("."),
                 DEFAULT_BRANCH,
-                &onboarding.secret,
+                onboarding
+                    .secret
+                    .as_deref()
+                    .expect("manual setup issues a token"),
                 "alice",
                 "very-secret-pass",
             )
@@ -3907,9 +6005,14 @@ mod tests {
             )
             .unwrap();
         let (_, request) = service
-            .submit_access_request(PathBuf::from("."), DEFAULT_BRANCH, "Owner", "owner@example.com")
+            .submit_access_request(
+                PathBuf::from("."),
+                DEFAULT_BRANCH,
+                "Owner",
+                "owner@example.com",
+            )
             .unwrap();
-        let (_, owner, onboarding) = service
+        let (_, owner, _issued) = service
             .approve_access_request(
                 PathBuf::from("."),
                 DEFAULT_BRANCH,
@@ -3922,7 +6025,7 @@ mod tests {
             .complete_onboarding(
                 PathBuf::from("."),
                 DEFAULT_BRANCH,
-                &onboarding.secret,
+                &request.secret,
                 "owner-user",
                 "very-secret-pass",
             )

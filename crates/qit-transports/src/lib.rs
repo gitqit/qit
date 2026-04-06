@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use local_ip_address::list_afinet_netifas;
 use ngrok::config::ForwarderBuilder;
 use ngrok::prelude::{EndpointInfo, TunnelCloser};
+use std::net::IpAddr;
 use std::process::{Command, Output};
 use url::Url;
 
@@ -9,6 +11,7 @@ use url::Url;
 pub enum PublicTransport {
     Ngrok,
     Tailscale,
+    Lan,
     Local,
 }
 
@@ -65,6 +68,12 @@ pub async fn expose(transport: PublicTransport, local_url: &Url) -> anyhow::Resu
             note: "Available on this machine's loopback interface only.".into(),
             session: None,
         }),
+        PublicTransport::Lan => Ok(PublicEndpoint {
+            label: "LAN",
+            public_url: lan_public_url(local_url)?,
+            note: "Available to other devices on the same local network.".into(),
+            session: None,
+        }),
         PublicTransport::Ngrok => {
             let mut forwarder = ngrok::Session::builder()
                 .authtoken_from_env()
@@ -72,7 +81,7 @@ pub async fn expose(transport: PublicTransport, local_url: &Url) -> anyhow::Resu
                 .await
                 .map_err(|err| {
                     anyhow!(
-                        "{err}\n\nSet NGROK_AUTHTOKEN or use --transport tailscale / --transport local."
+                        "{err}\n\nSet NGROK_AUTHTOKEN or use --transport tailscale / --transport lan / --transport local."
                     )
                 })?
                 .http_endpoint()
@@ -106,6 +115,40 @@ pub async fn expose(transport: PublicTransport, local_url: &Url) -> anyhow::Resu
             })
         }
     }
+}
+
+fn lan_public_url(local_url: &Url) -> anyhow::Result<Url> {
+    let host = detect_lan_host()?;
+    lan_public_url_with_host(local_url, &host)
+}
+
+fn detect_lan_host() -> anyhow::Result<String> {
+    let addresses = list_afinet_netifas().context("list network interfaces")?;
+    pick_lan_host(addresses.into_iter().map(|(_, addr)| addr))
+        .map(|addr| addr.to_string())
+        .context("could not determine a LAN address for this machine")
+}
+
+fn pick_lan_host(addrs: impl IntoIterator<Item = IpAddr>) -> Option<IpAddr> {
+    let mut fallback_ipv4 = None;
+    for addr in addrs {
+        match addr {
+            IpAddr::V4(ipv4) if ipv4.is_loopback() || ipv4.is_link_local() => continue,
+            IpAddr::V4(ipv4) if ipv4.is_private() => return Some(IpAddr::V4(ipv4)),
+            IpAddr::V4(ipv4) => {
+                fallback_ipv4.get_or_insert(ipv4);
+            }
+            IpAddr::V6(_) => {}
+        }
+    }
+    fallback_ipv4.map(IpAddr::V4)
+}
+
+fn lan_public_url_with_host(local_url: &Url, host: &str) -> anyhow::Result<Url> {
+    let mut public_url = Url::parse(&format!("http://{host}/")).context("build LAN public URL")?;
+    public_url.set_port(local_url.port()).ok();
+    public_url.set_path(local_url.path());
+    Ok(public_url)
 }
 
 async fn wait_for_ngrok_url(
@@ -189,8 +232,12 @@ fn parse_tailscale_dns_name(value: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_public_url, parse_tailscale_dns_name};
+    use super::{
+        lan_public_url_with_host, normalize_public_url, parse_tailscale_dns_name, pick_lan_host,
+    };
     use serde_json::json;
+    use std::net::{IpAddr, Ipv4Addr};
+    use url::Url;
 
     #[test]
     fn normalize_public_url_adds_https_and_trims_slashes() {
@@ -215,5 +262,32 @@ mod tests {
             parse_tailscale_dns_name(&payload).as_deref(),
             Some("host.tailnet.ts.net")
         );
+    }
+
+    #[test]
+    fn pick_lan_host_prefers_private_ipv4() {
+        let host = pick_lan_host([
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 10)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 25)),
+        ]);
+        assert_eq!(host, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 25))));
+    }
+
+    #[test]
+    fn pick_lan_host_falls_back_to_non_loopback_ipv4() {
+        let host = pick_lan_host([
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5)),
+        ]);
+        assert_eq!(host, Some(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5))));
+    }
+
+    #[test]
+    fn lan_public_url_keeps_port_and_path() {
+        let local_url = Url::parse("http://127.0.0.1:8080/repo").unwrap();
+        let public_url = lan_public_url_with_host(&local_url, "192.168.1.25").unwrap();
+        assert_eq!(public_url.as_str(), "http://192.168.1.25:8080/repo");
     }
 }

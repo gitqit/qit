@@ -10,6 +10,13 @@ import type {
   CompareResponse,
   IssuedOnboarding,
   IssuedPat,
+  IssueDetailResponse,
+  IssueLabel,
+  IssueMetadataResponse,
+  IssueMilestone,
+  IssueReactionContent,
+  IssueRecord,
+  IssuesResponse,
   PatRecordView,
   PullRequestDetailResponse,
   PullRequestRecord,
@@ -177,6 +184,105 @@ export const api = {
     requestJson<CompareResponse>(
       `/api/compare?base=${encodeURIComponent(base)}&head=${encodeURIComponent(head)}`,
     ).then((response) => response.comparison),
+  issues: async () => (await requestJson<IssuesResponse>('/api/issues')).issues,
+  issueMetadata: () => requestJson<IssueMetadataResponse>('/api/issues/meta'),
+  issue: (id: string) => requestJson<IssueDetailResponse>(`/api/issues/${encodeURIComponent(id)}`),
+  createIssue: (payload: {
+    title: string
+    description: string
+    display_name?: string | null
+    label_ids?: string[]
+    assignee_user_ids?: string[]
+    milestone_id?: string | null
+    linked_pull_request_ids?: string[]
+  }) =>
+    requestJson<IssueRecord>('/api/issues', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  updateIssue: (
+    id: string,
+    payload: {
+      title?: string
+      description?: string
+      status?: 'open' | 'closed'
+    },
+  ) =>
+    requestJson<IssueRecord>(`/api/issues/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+  deleteIssue: (id: string) =>
+    requestJson<IssueRecord>(`/api/issues/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  commentIssue: (id: string, payload: { display_name?: string | null; body: string }) =>
+    requestJson<IssueRecord>(`/api/issues/${encodeURIComponent(id)}/comments`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  reactIssue: (id: string, payload: { content: IssueReactionContent; display_name?: string | null }) =>
+    requestJson<IssueRecord>(`/api/issues/${encodeURIComponent(id)}/reactions`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  reactIssueComment: (
+    id: string,
+    commentId: string,
+    payload: { content: IssueReactionContent; display_name?: string | null },
+  ) =>
+    requestJson<IssueRecord>(
+      `/api/issues/${encodeURIComponent(id)}/comments/${encodeURIComponent(commentId)}/reactions`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+    ),
+  setIssueLabels: (id: string, labelIds: string[]) =>
+    requestJson<IssueRecord>(`/api/issues/${encodeURIComponent(id)}/labels`, {
+      method: 'PUT',
+      body: JSON.stringify({ label_ids: labelIds }),
+    }),
+  setIssueAssignees: (id: string, assigneeUserIds: string[]) =>
+    requestJson<IssueRecord>(`/api/issues/${encodeURIComponent(id)}/assignees`, {
+      method: 'PUT',
+      body: JSON.stringify({ assignee_user_ids: assigneeUserIds }),
+    }),
+  setIssueMilestone: (id: string, milestoneId: string | null) =>
+    requestJson<IssueRecord>(`/api/issues/${encodeURIComponent(id)}/milestone`, {
+      method: 'PUT',
+      body: JSON.stringify({ milestone_id: milestoneId }),
+    }),
+  linkIssuePullRequest: (id: string, pullRequestId: string) =>
+    requestJson<IssueRecord>(`/api/issues/${encodeURIComponent(id)}/links/pull-requests`, {
+      method: 'POST',
+      body: JSON.stringify({ pull_request_id: pullRequestId }),
+    }),
+  unlinkIssuePullRequest: (id: string, pullRequestId: string) =>
+    requestJson<IssueRecord>(
+      `/api/issues/${encodeURIComponent(id)}/links/pull-requests/${encodeURIComponent(pullRequestId)}`,
+      {
+        method: 'DELETE',
+      },
+    ),
+  upsertIssueLabel: (payload: { id?: string; name: string; color?: string; description?: string }) =>
+    requestJson<IssueLabel>('/api/issues/labels', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  deleteIssueLabel: (id: string) =>
+    requestJson<IssueLabel>(`/api/issues/labels/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  upsertIssueMilestone: (payload: { id?: string; title: string; description?: string }) =>
+    requestJson<IssueMilestone>('/api/issues/milestones', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  deleteIssueMilestone: (id: string) =>
+    requestJson<IssueMilestone>(`/api/issues/milestones/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
   pullRequests: async () =>
     (await requestJson<PullRequestsResponse>('/api/pull-requests')).pull_requests,
   pullRequest: (id: string) =>

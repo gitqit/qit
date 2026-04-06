@@ -7,7 +7,9 @@ use axum::routing::any;
 use axum::{extract::DefaultBodyLimit, Router};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use qit_domain::{AuthMethod, DomainError, RegistryStore, SessionCredentials, WorkspaceService, WorkspaceSpec};
+use qit_domain::{
+    AuthMethod, DomainError, RegistryStore, SessionCredentials, WorkspaceService, WorkspaceSpec,
+};
 use qit_http_backend::{
     GitHttpBackend, GitHttpBackendError, GitHttpBackendRequest, GitHttpBackendResponse,
 };

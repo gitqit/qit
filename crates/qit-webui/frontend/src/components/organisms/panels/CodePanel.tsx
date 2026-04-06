@@ -1,10 +1,9 @@
 import { Suspense, lazy, useMemo, useState, type ReactNode } from 'react'
 import { ArrowUp, Download, ExternalLink, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { Badge, EmptyState, IconButton, Spinner } from '../../atoms/Controls'
 import { RepoEntryIcon } from '../../../lib/fileIcons'
 import { RepoFileTree } from '../RepoFileTree'
+import { MarkdownSurface } from '../MarkdownSurface'
 import type { BlobContent, CommitHistoryNode, RefDiffFile, TreeEntry } from '../../../lib/types'
 import { api } from '../../../lib/api'
 import { AuthorBadge, RepoPathBreadcrumbs } from './shared'
@@ -141,41 +140,6 @@ function RepoTreeCard({
   )
 }
 
-function MarkdownDocument({ source }: { source: string }) {
-  return (
-    <div className="markdown-body">
-      <ReactMarkdown
-        components={{
-          a: ({ children, ...props }) => (
-            <a {...props} className="text-accent-strong hover:underline" rel="noreferrer" target="_blank">
-              {children}
-            </a>
-          ),
-          code: ({ children, className, ...props }) => {
-            const isBlock = Boolean(className)
-            return (
-              <code
-                {...props}
-                className={isBlock ? className : 'rounded-md border border-border bg-canvas px-1.5 py-0.5 text-[0.95em]'}
-              >
-                {children}
-              </code>
-            )
-          },
-          table: ({ children }) => (
-            <div className="overflow-x-auto">
-              <table>{children}</table>
-            </div>
-          ),
-        }}
-        remarkPlugins={[remarkGfm]}
-      >
-        {source}
-      </ReactMarkdown>
-    </div>
-  )
-}
-
 function BlobPreview({
   blob,
   emptyTitle,
@@ -198,7 +162,7 @@ function BlobPreview({
   }
 
   if (isMarkdownPath(blob.path)) {
-    return <MarkdownDocument source={blob.text} />
+    return <MarkdownSurface source={blob.text} />
   }
 
   return (

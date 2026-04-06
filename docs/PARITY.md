@@ -8,7 +8,7 @@ This document captures the current LocalCollab behavior that `qit` preserves or 
 
 - `qit <path>` publishes a normal folder without requiring a `.git` directory in that folder.
 - Startup resolves the folder path, creates or reopens a hidden bare sidecar repository, snapshots the host folder into its checked-out branch, starts Git Smart HTTP, and prints a clone URL plus a local credentials file path.
-- `--transport ngrok`, `--transport tailscale`, and `--transport local` remain first-class options.
+- `--transport ngrok`, `--transport tailscale`, `--transport lan`, and `--transport local` are first-class options.
 - `--local-only` remains a compatibility alias for local transport.
 - `--port` keeps the local Git HTTP listener configurable.
 - `--branch` sets the exported branch when a workspace is first served and defaults to `main`.

@@ -2,21 +2,96 @@
 title: Sharing and Auth
 description: Understand how Qit session URLs, temporary credentials, and sidecar-first review work when you share a folder.
 slug: /sharing-and-auth
+section: Concepts
 sidebar_label: Sharing and auth
-sidebar_position: 3
+sidebar_position: 62
 ---
 
 # Sharing and Auth
 
-Qit keeps the collaboration model intentionally small: standard Git clients, session-scoped credentials, and a sidecar-first apply flow.
+Qit keeps the collaboration model intentionally small: standard Git clients, explicit authentication, and a sidecar-first apply flow.
 
-## Session credentials
+## Shared-session credentials
 
-Every shared session starts with fresh credentials. Qit prints the username and password in the terminal so you can hand them off with the clone command.
+When you start Qit with `--auth-mode shared-session`, the process generates a temporary username and password for that serve process. Qit prints those credentials in the terminal so you can hand them off with the clone command.
+
+Use this mode when you need the fastest possible start. Use [request-based auth](/docs/guides/managing-authentication) when you need durable users, approvals, setup tokens, and PATs.
 
 ## Localhost versus exposed sessions
 
 The local Web UI is intended to be easy to open on `localhost`, but exposed transports still require Web UI authentication. If you share Qit through LAN, ngrok, or Tailscale, expect the browser experience to stay behind the session login gate.
+
+## Transports
+
+Qit has four built-in transport flags today: `local`, `lan`, `ngrok`, and `tailscale`.
+
+| Mode | CLI flag | Best for | What Qit gives you |
+| --- | --- | --- | --- |
+| Local | `--transport local` | One machine, demos, same-device workflows | A loopback-only URL such as `http://127.0.0.1:8080/my-app` |
+| LAN | `--transport lan` | Sharing inside your home or office network | A LAN-reachable `http://` URL for this machine, such as `http://192.168.1.25:8080/my-app` |
+| ngrok | `--transport ngrok` | Fast public sharing | A public `https://` tunnel URL |
+| Tailscale | `--transport tailscale` | Tailnet sharing or Funnel-based public access | A Tailscale-hosted `https://` URL tied to your node name |
+
+### `local`
+
+Use `local` when the operator and the browser are on the same machine, or when you want the smallest possible setup:
+
+```bash
+qit --transport local ./my-app
+```
+
+This is the easiest place to learn Qit because the startup output includes a loopback Web UI URL and Git remote, and the browser gets the localhost owner bypass on `localhost`, `127.0.0.1`, or `::1`.
+
+### `lan`
+
+LAN access means other devices on your network can reach the Qit session through this machine's local-network IP address.
+
+```bash
+qit --transport lan ./my-app
+```
+
+Qit binds the shared entrypoint on your machine's LAN interface and prints a LAN-reachable clone/Web UI URL. Once the request comes in through a LAN host instead of `localhost`, Qit treats the Web UI as a remote session and requires login.
+
+Use this when:
+
+- you trust the local network
+- you want nearby devices to clone or open the Web UI without a public tunnel
+- you do not need ngrok or Tailscale-specific routing
+
+### `ngrok`
+
+Use `ngrok` when you want the fastest public share link:
+
+```bash
+qit --transport ngrok ./my-app
+```
+
+Qit opens an ngrok tunnel to the local server and prints a public URL. This is the most direct way to hand someone outside your network a working clone target, but it depends on your ngrok setup and authtoken.
+
+Use this when:
+
+- collaborators are outside your network
+- you want a public URL quickly
+- you are fine with ngrok managing the tunnel endpoint
+
+### `tailscale`
+
+Use `tailscale` when you already live in a Tailnet or want Funnel-backed exposure:
+
+```bash
+qit --transport tailscale ./my-app
+```
+
+Qit uses Tailscale to publish the session and prints the resulting URL. This is usually the best fit when your collaborators already use Tailscale and you want a more stable network identity than a throwaway public tunnel.
+
+For setup details, prerequisites, and Funnel notes, see [Using Qit with Tailscale](/docs/guides/tailscale).
+
+### Choosing the right mode
+
+- Choose `local` when you are working alone on one machine or running a same-device demo.
+- Choose `lan` when people are on the same network and you want Qit to advertise a directly reachable local-network URL.
+- Choose `ngrok` when you need a public link immediately.
+- Choose `tailscale` when you want Tailnet-aware access or Funnel-based sharing.
 
 ## Standard Git transport
 
