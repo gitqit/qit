@@ -781,7 +781,7 @@ impl WebUiServer {
     <meta name="twitter:image" content="{og_image}" />
     <title>{title}</title>
     <link rel="icon" type="image/png" href="{favicon}" />
-    <link rel="stylesheet" href="{base}/assets/app.css" />
+    <link rel="stylesheet" href="{base}/assets/index.css" />
   </head>
   <body>
     <div id="root"></div>
@@ -1044,7 +1044,7 @@ fn split_repo_name(repo: &str) -> Vec<String> {
         .enumerate()
         .take(target + 1)
         .filter_map(|(index, ch)| matches!(ch, '-' | '_' | '.' | ' ').then_some(index + 1))
-        .last()
+        .next_back()
         .unwrap_or(target);
 
     let first = chars[..split_at].iter().collect::<String>();
@@ -1081,7 +1081,7 @@ async fn index(State(state): State<Arc<WebUiServer>>) -> Html<String> {
 fn static_asset(asset_path: &str) -> Option<(&'static str, &'static [u8])> {
     match asset_path {
         "app.js" => Some(("text/javascript; charset=utf-8", APP_JS)),
-        "app.css" => Some(("text/css; charset=utf-8", APP_CSS)),
+        "app.css" | "index.css" => Some(("text/css; charset=utf-8", APP_CSS)),
         "chunk-rolldown-runtime.js" => {
             Some(("text/javascript; charset=utf-8", CHUNK_ROLLDOWN_RUNTIME_JS))
         }

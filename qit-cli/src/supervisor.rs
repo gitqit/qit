@@ -43,6 +43,8 @@ pub struct RouteLease {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct SupervisorDiscovery {
+    #[serde(default)]
+    transport: String,
     label: String,
     local_base_url: String,
     public_base_url: String,
@@ -131,7 +133,7 @@ pub async fn ensure_supervisor(
     port: u16,
     transport: PublicTransport,
 ) -> Result<SharedEntrypoint> {
-    if let Some(existing) = load_healthy_discovery(data_root).await? {
+    if let Some(existing) = load_healthy_discovery(data_root, transport).await? {
         return Ok(existing);
     }
 
@@ -156,7 +158,7 @@ pub async fn ensure_supervisor(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
-        if let Some(existing) = load_healthy_discovery(data_root).await? {
+        if let Some(existing) = load_healthy_discovery(data_root, transport).await? {
             return Ok(existing);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -288,6 +290,7 @@ pub async fn run_internal_supervisor(
         .context("build supervisor control URL")?;
 
     let discovery = SupervisorDiscovery {
+        transport: transport_name(transport).to_string(),
         label: endpoint.label.to_string(),
         local_base_url: edge_local_url.as_str().trim_end_matches('/').to_string(),
         public_base_url: endpoint
@@ -377,12 +380,10 @@ pub async fn run_internal_supervisor(
         }
     });
 
-    let control_result = control_task
+    control_task
         .await
         .context("join qit supervisor control task")??;
-    let edge_result = edge_task.await.context("join qit supervisor edge task")??;
-    let _ = control_result;
-    let _ = edge_result;
+    edge_task.await.context("join qit supervisor edge task")??;
     let _ = janitor.await;
     let _ = ctrlc.await;
     remove_discovery_file_if_owned(&data_root, discovery.pid);
@@ -665,7 +666,10 @@ fn remove_discovery_file_if_owned(data_root: &Path, pid: u32) {
     }
 }
 
-async fn load_healthy_discovery(data_root: &Path) -> Result<Option<SharedEntrypoint>> {
+async fn load_healthy_discovery(
+    data_root: &Path,
+    requested_transport: PublicTransport,
+) -> Result<Option<SharedEntrypoint>> {
     let path = discovery_path(data_root);
     let payload = match tokio::fs::read(&path).await {
         Ok(payload) => payload,
@@ -674,6 +678,9 @@ async fn load_healthy_discovery(data_root: &Path) -> Result<Option<SharedEntrypo
     };
     let discovery: SupervisorDiscovery =
         serde_json::from_slice(&payload).with_context(|| format!("decode {}", path.display()))?;
+    if discovery.transport != transport_name(requested_transport) {
+        return Ok(None);
+    }
     let entrypoint = parse_discovery(discovery)?;
     let response = reqwest::Client::new()
         .get(control_url(&entrypoint.control_url, "/health")?)
@@ -706,6 +713,15 @@ fn control_url(base: &Url, suffix: &str) -> Result<Url> {
 
 fn discovery_path(data_root: &Path) -> PathBuf {
     data_root.join(DISCOVERY_FILE)
+}
+
+fn transport_name(transport: PublicTransport) -> &'static str {
+    match transport {
+        PublicTransport::Ngrok => "ngrok",
+        PublicTransport::Tailscale => "tailscale",
+        PublicTransport::Lan => "lan",
+        PublicTransport::Local => "local",
+    }
 }
 
 fn assignments_path(data_root: &Path) -> PathBuf {

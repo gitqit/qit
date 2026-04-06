@@ -1260,7 +1260,7 @@ fn print_pr_activity(pull_request: &PullRequestRecord) {
         let actor = activity
             .display_name
             .clone()
-            .unwrap_or_else(|| default_display_name());
+            .unwrap_or_else(default_display_name);
         say(&format!("  - {} {}", actor, format_activity(activity)));
     }
 }
@@ -3046,6 +3046,7 @@ async fn run_shared_serve(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_worker_app(
     repo_store: Arc<GitRepoStore>,
     registry_store: Arc<FilesystemRegistry>,

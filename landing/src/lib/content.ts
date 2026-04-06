@@ -1,4 +1,4 @@
-export const repoUrl = 'https://github.com/flynnemon/qit'
+export const repoUrl = 'https://github.com/gitqit/qit'
 export const releasesUrl = `${repoUrl}/releases`
 export const docsUrl = '/docs/install'
 

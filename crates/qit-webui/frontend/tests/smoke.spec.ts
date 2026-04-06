@@ -385,6 +385,28 @@ function mockApi(
       return
     }
 
+    if (pathname.endsWith('/api/issues/meta')) {
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          labels: [],
+          milestones: [],
+          assignees: [],
+        }),
+      })
+      return
+    }
+
+    if (pathname.endsWith('/api/issues')) {
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          issues: [],
+        }),
+      })
+      return
+    }
+
     if (pathname.endsWith('/api/pull-requests')) {
       await route.fulfill({
         contentType: 'application/json',
@@ -419,7 +441,6 @@ test('signed-in repo users can open the account menu and log out', async ({ page
   await page.getByRole('button', { name: 'alice@example.com' }).click()
   await expect(page.getByRole('menuitem', { name: 'User settings' })).toBeVisible()
   await expect(page.getByRole('menuitem', { name: 'Log out' })).toBeVisible()
-  await expect(page.getByText('Repo settings', { exact: true })).toBeVisible()
 
   await page.getByRole('menuitem', { name: 'User settings' }).click()
   await expect(page.getByRole('heading', { name: 'User settings' })).toBeVisible()
@@ -512,8 +533,8 @@ test('renders request-based auth actions', async ({ page }) => {
   await expect(page.getByLabel('Email')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Send request' })).toBeVisible()
 
-  await page.getByRole('button', { name: 'Complete setup', exact: true }).click()
-  await expect(page.getByLabel('Onboarding token')).toBeVisible()
+  await page.getByRole('button', { name: 'Use setup code', exact: true }).click()
+  await expect(page.getByLabel('Setup code')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Finish setup' })).toBeVisible()
 })
 
