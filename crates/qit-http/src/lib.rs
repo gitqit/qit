@@ -126,7 +126,7 @@ impl GitHttpServer {
         let (_, settings) = self
             .workspace_service
             .read_repository_settings(workspace.worktree.clone(), &workspace.exported_branch)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            .map_err(|error| io::Error::other(error.to_string()))?;
         let hooks_dir = workspace.sidecar.join("hooks");
         fs::create_dir_all(&hooks_dir)?;
         let rules_path = workspace.sidecar.join("qit-branch-rules");
