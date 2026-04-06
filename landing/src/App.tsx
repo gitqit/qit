@@ -35,7 +35,7 @@ function MetadataManager() {
     const title = doc ? `${doc.title} | Qit Docs` : location.pathname === '/' ? 'Qit | Quick Git for normal folders' : 'Qit'
     const description = doc
       ? doc.description
-      : 'Download Qit, point it at any folder, and share it over authenticated Git Smart HTTP without reshaping your working tree.'
+      : 'Install Qit, point it at any folder, and share it over authenticated Git Smart HTTP without reshaping your working tree.'
 
     document.title = title
 
