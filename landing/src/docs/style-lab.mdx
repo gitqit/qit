@@ -1,0 +1,133 @@
+---
+title: Docs Style Lab
+description: Development-only playground page for tuning every markdown and MDX presentation style used by the landing docs.
+slug: /style-lab
+section: Internal
+sidebar_label: Style lab
+sidebar_position: 999
+sidebar_hidden: true
+---
+
+# Docs Style Lab
+
+Use this page as a visual playground while tuning docs presentation. It intentionally exercises headings, links, inline code, lists, tables, quotes, and fenced code blocks in one place.
+
+## Paragraphs and inline formatting
+
+This paragraph includes a normal [inline link](/docs/install), a second link to [Sharing and auth](/docs/sharing-and-auth), bold text with **strong emphasis**, italic text with *subtle emphasis*, and mixed formatting like **important `qit serve` details** inside prose.
+
+Inline code examples:
+
+- Use `qit ./my-app` to start a session.
+- Pass `--hidden-pass` when you do not want to print the password.
+- Collaborators can run `git clone`, `git fetch`, and `git push` as usual.
+
+### Secondary heading
+
+Headings should create clear rhythm without overpowering the article body. This paragraph exists mostly to show spacing after a subheading and how longer text wraps beside the sticky sidebar.
+
+#### Tertiary heading
+
+Smaller headings are useful for grouping related notes inside a larger section.
+
+## Lists
+
+Unordered list:
+
+- Fast setup for a new session
+- Familiar Git workflows for collaborators
+- Review changes before applying them back to the host folder
+  - Inspect changes in the Web UI first
+  - Apply only when the review looks good
+    - Keep the host folder unchanged until you are ready
+    - Preserve familiar local tooling while collaborating
+
+Ordered list:
+
+1. Install Qit.
+2. Start a session for a folder.
+3. Share the clone URL and temporary credentials.
+4. Review incoming work before applying it.
+   1. Check the commit history.
+   2. Compare changed files.
+   3. Confirm the session branch and target branch.
+      1. Verify the source branch.
+      2. Verify the destination branch.
+
+Task list:
+
+- [x] Serve a normal folder
+- [x] Open the Web UI
+- [ ] Polish final docs styling
+
+## Blockquote
+
+> Qit snapshots a normal folder into a sidecar repository first, so collaboration can happen without turning the host directory into a regular Git working copy.
+>
+> That makes it easier to review incoming changes before they are applied back to the host files.
+
+## Table
+
+| Surface | Users | Setup time (min) | Example |
+| --- | ---: | ---: | --- |
+| CLI | 1,280 | 2 | `qit ./my-app` |
+| Web UI | 920 | 4 | `/temp-git?tab=commits` |
+| Docs | 540 | 1 | `/docs/sharing-and-auth` |
+| Style lab | 12 | 0 | `/docs/style-lab` |
+
+## Code blocks
+
+### Bash
+
+```bash
+qit ./my-app --hidden-pass
+```
+
+### TypeScript
+
+```ts
+type SessionSummary = {
+  repoUrl: string
+  cloneCommand: string
+  username: string
+}
+
+export function formatSummary(session: SessionSummary) {
+  return `${session.username}: ${session.cloneCommand} (${session.repoUrl})`
+}
+```
+
+### JSON
+
+```json
+{
+  "repoUrl": "http://127.0.0.1:8080/my-app/",
+  "cloneCommand": "git clone http://session-owner:temporary-pass@127.0.0.1:8080/my-app/",
+  "transport": "local"
+}
+```
+
+### Diff
+
+```diff
+diff --git a/README.md b/README.md
++ Prefer Git command parity for the CLI surface.
+- Print large startup banners by default.
+```
+
+### Plain text
+
+```text
+Serving
+  path: ./my-app
+  branch: main
+  transport: local
+```
+
+## Horizontal rule
+
+---
+
+## Mixed content
+
+When docs need to combine several inline treatments in one sentence, the styling should still feel coherent. For example, read the [install guide](/docs/install), try `qit ./project`, and compare the result with the [FAQ](/docs/faq) before sharing the session externally.

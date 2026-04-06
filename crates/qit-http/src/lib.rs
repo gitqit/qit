@@ -7,10 +7,13 @@ use axum::routing::any;
 use axum::{extract::DefaultBodyLimit, Router};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use qit_domain::{RegistryStore, SessionCredentials, WorkspaceService, WorkspaceSpec};
+use qit_domain::{
+    AuthMethod, DomainError, RegistryStore, SessionCredentials, WorkspaceService, WorkspaceSpec,
+};
 use qit_http_backend::{
     GitHttpBackend, GitHttpBackendError, GitHttpBackendRequest, GitHttpBackendResponse,
 };
+use std::fs;
 use std::io;
 use std::sync::Arc;
 use tokio_stream::StreamExt;
@@ -18,6 +21,51 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{info, warn};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+fn update_hook_script() -> &'static str {
+    r#"#!/bin/sh
+refname="$1"
+oldrev="$2"
+newrev="$3"
+
+case "$refname" in
+  refs/heads/*) ;;
+  *) exit 0 ;;
+esac
+
+rules_file="${GIT_DIR:-.}/qit-branch-rules"
+[ -f "$rules_file" ] || exit 0
+
+branch="${refname#refs/heads/}"
+zeros="0000000000000000000000000000000000000000"
+matched_force=0
+matched_delete=0
+
+while IFS="$(printf '\t')" read -r pattern block_force_push block_delete; do
+  [ -n "$pattern" ] || continue
+  case "$branch" in
+    $pattern)
+      [ "$block_force_push" = "1" ] && matched_force=1
+      [ "$block_delete" = "1" ] && matched_delete=1
+      ;;
+  esac
+done < "$rules_file"
+
+if [ "$newrev" = "$zeros" ] && [ "$matched_delete" = "1" ]; then
+  echo "qit: deleting protected branch '$branch' is not allowed" >&2
+  exit 1
+fi
+
+if [ "$matched_force" = "1" ] && [ "$oldrev" != "$zeros" ] && [ "$newrev" != "$zeros" ]; then
+  if ! git merge-base --is-ancestor "$oldrev" "$newrev" >/dev/null 2>&1; then
+    echo "qit: force-pushing protected branch '$branch' is not allowed" >&2
+    exit 1
+  fi
+fi
+
+exit 0
+"#
+}
 
 pub struct GitHttpServerConfig {
     pub workspace: WorkspaceSpec,
@@ -74,15 +122,55 @@ impl GitHttpServer {
         Ok(self.workspace.clone())
     }
 
-    pub fn router(self) -> Router {
+    fn sync_push_rules(&self, workspace: &WorkspaceSpec) -> Result<(), io::Error> {
+        let (_, settings) = self
+            .workspace_service
+            .read_repository_settings(workspace.worktree.clone(), &workspace.exported_branch)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        let hooks_dir = workspace.sidecar.join("hooks");
+        fs::create_dir_all(&hooks_dir)?;
+        let rules_path = workspace.sidecar.join("qit-branch-rules");
+        let hook_path = hooks_dir.join("update");
+        let mut rules = String::new();
+        for rule in settings.branch_rules {
+            if rule.block_delete || rule.block_force_push {
+                rules.push_str(&format!(
+                    "{}\t{}\t{}\n",
+                    rule.pattern,
+                    if rule.block_force_push { "1" } else { "0" },
+                    if rule.block_delete { "1" } else { "0" }
+                ));
+            }
+        }
+        fs::write(&rules_path, rules)?;
+        fs::write(&hook_path, update_hook_script())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&hook_path)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&hook_path, permissions)?;
+        }
+        Ok(())
+    }
+
+    pub fn git_router(self) -> Router {
+        let git_path = format!("{}/{{*git_path}}", self.repo_mount_path);
         let max_body_bytes = self.max_body_bytes;
         let state = Arc::new(self);
         Router::new()
-            .fallback(any(move |req: Request| {
-                let state = state.clone();
-                async move { state.handle(req).await }
-            }))
+            .route(
+                &git_path,
+                any(move |req: Request| {
+                    let state = state.clone();
+                    async move { state.handle(req).await }
+                }),
+            )
             .layer(DefaultBodyLimit::max(max_body_bytes))
+    }
+
+    pub fn router(self) -> Router {
+        self.git_router()
     }
 
     fn spawn_auto_apply(
@@ -166,10 +254,6 @@ impl GitHttpServer {
     }
 
     async fn handle(self: Arc<Self>, req: Request) -> Result<Response<Body>, StatusCode> {
-        if !authorize(req.headers(), &self.credentials) {
-            return Ok(unauthorized_response());
-        }
-
         let method = req.method().clone();
         let uri = req.uri().clone();
         let workspace = self.latest_workspace().map_err(|error| {
@@ -182,13 +266,43 @@ impl GitHttpServer {
             );
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+        if !self
+            .authorize_request(&workspace, req.headers())
+            .map_err(|error| {
+                warn!(
+                    method = %method,
+                    path = %uri.path(),
+                    worktree = %workspace.worktree.display(),
+                    %error,
+                    "git authorization failed while loading auth state"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+        {
+            return Ok(unauthorized_response());
+        }
         let path_info = match strip_repo_mount(uri.path(), &self.repo_mount_path) {
             Some(path_info) => path_info,
             None => return Err(StatusCode::NOT_FOUND),
         };
+        if !is_git_path_info(&path_info) {
+            return Err(StatusCode::NOT_FOUND);
+        }
         let query = uri.query().map(ToString::to_string);
         let is_receive_pack =
             method == axum::http::Method::POST && path_info.ends_with("git-receive-pack");
+        if is_receive_pack {
+            self.sync_push_rules(&workspace).map_err(|error| {
+                warn!(
+                    method = %method,
+                    path = %uri.path(),
+                    worktree = %workspace.worktree.display(),
+                    %error,
+                    "failed to sync branch protection hooks before push"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
         let request_scheme = request_scheme(&self.request_scheme);
         let content_length = req
             .headers()
@@ -252,28 +366,78 @@ impl GitHttpServer {
 
         Ok(build_response(response))
     }
+
+    fn authorize_request(
+        &self,
+        workspace: &WorkspaceSpec,
+        headers: &HeaderMap,
+    ) -> Result<bool, DomainError> {
+        let (_, auth) = self
+            .workspace_service
+            .read_auth_state(workspace.worktree.clone(), &workspace.exported_branch)?;
+        let Some((username, secret)) = basic_credentials(headers) else {
+            return Ok(false);
+        };
+        if auth.has_method(&AuthMethod::BasicAuth)
+            && secure_eq(&username, &self.credentials.username)
+            && secure_eq(&secret, &self.credentials.password)
+        {
+            return Ok(true);
+        }
+        self.workspace_service
+            .authenticate_git_user(
+                workspace.worktree.clone(),
+                &workspace.exported_branch,
+                &username,
+                &secret,
+            )
+            .map(|_| true)
+            .or_else(|error| {
+                if matches!(error, DomainError::AuthenticationFailed) {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            })
+    }
 }
 
 pub fn authorize(headers: &HeaderMap, credentials: &SessionCredentials) -> bool {
-    let Some(header) = headers.get(axum::http::header::AUTHORIZATION) else {
+    let Some((username, password)) = basic_credentials(headers) else {
         return false;
+    };
+    secure_eq(&username, &credentials.username) && secure_eq(&password, &credentials.password)
+}
+
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let Some(header) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return None;
     };
     let Ok(header) = header.to_str() else {
-        return false;
+        return None;
     };
     let Some(encoded) = header.strip_prefix("Basic ") else {
-        return false;
+        return None;
     };
     let Ok(decoded) = BASE64.decode(encoded) else {
-        return false;
+        return None;
     };
     let Ok(decoded) = String::from_utf8(decoded) else {
-        return false;
+        return None;
     };
-    let Some((username, password)) = decoded.split_once(':') else {
+    let (username, password) = decoded.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
+}
+
+fn secure_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
         return false;
-    };
-    username == credentials.username && password == credentials.password
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0_u8, |acc, (lhs, rhs)| acc | (lhs ^ rhs))
+        == 0
 }
 
 pub fn request_scheme(configured_scheme: &str) -> String {
@@ -351,6 +515,20 @@ pub fn strip_repo_mount(path: &str, repo_mount_path: &str) -> Option<String> {
         .map(|suffix| format!("/{}", suffix))
 }
 
+pub fn is_git_request_path(path: &str, repo_mount_path: &str) -> bool {
+    strip_repo_mount(path, repo_mount_path)
+        .map(|path_info| is_git_path_info(&path_info))
+        .unwrap_or(false)
+}
+
+pub fn is_git_path_info(path_info: &str) -> bool {
+    matches!(
+        path_info,
+        "/HEAD" | "/info/refs" | "/git-upload-pack" | "/git-receive-pack"
+    ) || path_info.starts_with("/objects/")
+        || path_info.starts_with("/refs/")
+}
+
 fn unauthorized_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
@@ -413,5 +591,11 @@ mod tests {
             None
         );
         assert_eq!(strip_repo_mount("/other/info/refs", "/My-Project"), None);
+        assert!(is_git_request_path("/My-Project/info/refs", "/My-Project"));
+        assert!(!is_git_request_path("/My-Project", "/My-Project"));
+        assert!(!is_git_request_path(
+            "/My-Project/api/session",
+            "/My-Project"
+        ));
     }
 }

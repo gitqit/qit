@@ -1,0 +1,36 @@
+class Qit < Formula
+  desc "Quick Git for normal folders"
+  homepage "https://github.com/__REPOSITORY__"
+  version "__VERSION__"
+  license "MIT OR Apache-2.0"
+
+  depends_on "git"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/__REPOSITORY__/releases/download/v#{version}/qit-v#{version}-macos-ARM64.tar.gz"
+      sha256 "__MACOS_ARM64_SHA__"
+    else
+      url "https://github.com/__REPOSITORY__/releases/download/v#{version}/qit-v#{version}-macos-X64.tar.gz"
+      sha256 "__MACOS_X64_SHA__"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/__REPOSITORY__/releases/download/v#{version}/qit-v#{version}-linux-ARM64.tar.gz"
+      sha256 "__LINUX_ARM64_SHA__"
+    else
+      url "https://github.com/__REPOSITORY__/releases/download/v#{version}/qit-v#{version}-linux-X64.tar.gz"
+      sha256 "__LINUX_X64_SHA__"
+    end
+  end
+
+  def install
+    bin.install "qit"
+  end
+
+  test do
+    assert_match "Host a folder as an authenticated Git remote.", shell_output("#{bin}/qit --help")
+  end
+end

@@ -5,4 +5,7 @@
 .DS_Store
 .cursor/
 
+examples/
 example-out.txt
+example-qit-repo/
+qit-serve-output.txt

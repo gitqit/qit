@@ -139,3 +139,100 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: gh release edit "$GITHUB_REF_NAME" --draft=false
+
+  update-homebrew-tap:
+    name: Update Homebrew tap
+    needs: [verify-tag, publish-release]
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tap settings
+        shell: bash
+        run: |
+          if [[ -z "$HOMEBREW_TAP_REPOSITORY" ]]; then
+            echo "Set the HOMEBREW_TAP_REPOSITORY repository variable (for example, flynnemon/homebrew-qit)." >&2
+            exit 1
+          fi
+
+          if [[ -z "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]]; then
+            echo "Set the HOMEBREW_TAP_TOKEN repository secret with contents:write access to the tap repository." >&2
+            exit 1
+          fi
+      - name: Download release checksum assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" --pattern "*.sha256" --dir dist
+      - name: Render Homebrew formula
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          linux_x64_sha="$(awk 'NR==1 { print $1 }' "dist/qit-v${VERSION}-linux-X64.tar.gz.sha256")"
+          linux_arm64_sha="$(awk 'NR==1 { print $1 }' "dist/qit-v${VERSION}-linux-ARM64.tar.gz.sha256")"
+          macos_x64_sha="$(awk 'NR==1 { print $1 }' "dist/qit-v${VERSION}-macos-X64.tar.gz.sha256")"
+          macos_arm64_sha="$(awk 'NR==1 { print $1 }' "dist/qit-v${VERSION}-macos-ARM64.tar.gz.sha256")"
+
+          export VERSION REPOSITORY
+          export LINUX_X64_SHA="$linux_x64_sha"
+          export LINUX_ARM64_SHA="$linux_arm64_sha"
+          export MACOS_X64_SHA="$macos_x64_sha"
+          export MACOS_ARM64_SHA="$macos_arm64_sha"
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          template_path = Path("packaging/homebrew/qit.rb.template")
+          rendered_path = Path("dist/qit.rb")
+          content = template_path.read_text()
+
+          for key in (
+              "VERSION",
+              "REPOSITORY",
+              "LINUX_X64_SHA",
+              "LINUX_ARM64_SHA",
+              "MACOS_X64_SHA",
+              "MACOS_ARM64_SHA",
+          ):
+              content = content.replace(f"__{key}__", os.environ[key])
+
+          if "__" in content:
+              raise SystemExit("Homebrew formula template still contains unreplaced placeholders.")
+
+          rendered_path.write_text(content)
+          PY
+      - name: Validate Homebrew formula syntax
+        run: ruby -c dist/qit.rb
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HOMEBREW_TAP_REPOSITORY }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Update tap formula
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        shell: bash
+        run: |
+          mkdir -p homebrew-tap/Formula
+          cp dist/qit.rb homebrew-tap/Formula/qit.rb
+
+          cd homebrew-tap
+
+          if git diff --quiet -- Formula/qit.rb; then
+            echo "Homebrew formula already matches v${VERSION}."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/qit.rb
+          git commit -m "Update qit formula to v${VERSION}"
+          git push

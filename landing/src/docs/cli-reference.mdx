@@ -1,0 +1,318 @@
+---
+title: CLI Reference
+description: Exact command, flag, environment variable, and behavior reference for the `qit` CLI.
+slug: /reference/cli
+section: Reference
+sidebar_label: CLI reference
+sidebar_position: 50
+---
+
+# CLI Reference
+
+This page is the exact reference for the `qit` command-line interface. It is intentionally terse. If you need a learning path, start with the [quick start](/docs/quick-start) or the [first collaboration tutorial](/docs/tutorials/first-collaboration).
+
+## Command forms
+
+Qit has two entry forms:
+
+```bash
+qit [serve-options] <path>
+qit <command> [command-options]
+```
+
+There is no explicit `serve` subcommand. Passing a path starts a serve session.
+
+## Global Options
+
+These options apply to the main `qit` command when serving a folder.
+
+| Option | Values | Meaning |
+| --- | --- | --- |
+| `--allow-existing-git` | none | Allow serving a folder that already contains a `.git` directory. |
+| `--transport` | `ngrok`, `tailscale`, `lan`, `local` | Choose how the repo is exposed. If omitted, Qit uses `ngrok` unless `--local-only` is passed. |
+| `--auto-apply` | none | Fast-forward the host folder after successful pushes when the host tree is clean and aligned with the served branch. |
+| `--hidden-pass` | none | Hide the shared-session password from stdout and write it to a local credentials file instead. |
+| `--auth-mode` | `shared-session`, `request-based` | Select one of the built-in auth mode bundles for the served repo. |
+| `--auth-method` | `request-access`, `setup-token`, `basic-auth` | Enable one or more auth methods explicitly. May be passed multiple times. |
+| `--port` | integer | Set the local supervisor port. Default: `8080`. |
+| `--branch` | branch name | Set the exported branch when the workspace is first served. |
+| `--max-body-bytes` | integer | Set the maximum Git HTTP request body size. Default: `536870912` bytes. |
+
+## Serve a folder
+
+### Serve behavior
+
+- `qit` snapshots the host folder into a sidecar repository before serving it.
+- If the workspace already exists, Qit reuses its stable workspace identity and sidecar path.
+- If you restart an existing workspace with a different `--branch`, Qit rejects the request. Use `qit switch <path> <branch>` instead.
+- `--auth-method` takes precedence over `--auth-mode`. If neither is passed, the workspace keeps its current auth state or falls back to the default request-based methods for a new workspace.
+- Shared-session Git credentials only appear in the serve summary when `basic-auth` is enabled.
+
+### Typical serve examples
+
+```bash
+# Fast local-only session with printed credentials
+qit --transport local --auth-mode shared-session ./my-app
+
+# Public session through ngrok with request-based auth
+qit --transport ngrok --auth-mode request-based ./my-app
+
+# Share directly on your local network
+qit --transport lan --auth-mode shared-session ./my-app
+
+# Local-only session while hiding the printed password
+qit --transport local --auth-mode shared-session --hidden-pass ./my-app
+
+# Serve an existing Git worktree root intentionally
+qit --allow-existing-git .
+```
+
+## Workspace commands
+
+### `qit apply`
+
+Fast-forward the host folder from the sidecar repository.
+
+```bash
+qit apply <path> [--branch <name>]
+```
+
+- Without `--branch`, Qit applies the exported branch.
+- With `--branch`, Qit applies that sidecar branch and updates the checked-out host branch to match it.
+- Apply is fast-forward only.
+
+### `qit branch`
+
+List or manage sidecar branches for an existing workspace.
+
+```bash
+qit branch <path>
+qit branch <path> --list [<pattern>...]
+qit branch <path> <name> [<start-point>]
+qit branch <path> -m <old> <new>
+qit branch <path> -M <old> <new>
+qit branch <path> -c <old> <new>
+qit branch <path> -C <old> <new>
+qit branch <path> -d <name>
+qit branch <path> -D <name>
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--list [PATTERN...]` | List branches, optionally filtered by one or more patterns. |
+| `-v`, `-vv` | Show commit summaries or full commit IDs when listing. |
+| `-m` / `-M` | Rename a branch, optionally forcing overwrite. |
+| `-c` / `-C` | Copy a branch, optionally forcing overwrite. |
+| `-d` / `-D` | Delete a merged branch or force-delete an unmerged branch. |
+
+### `qit checkout`
+
+Change the checked-out host branch without changing the served default branch.
+
+```bash
+qit checkout <path> <branch>
+qit checkout <path> -b <new-branch> [<start-point>]
+qit checkout <path> -B <new-branch> [<start-point>]
+qit checkout <path> -f <branch>
+```
+
+| Option | Meaning |
+| --- | --- |
+| `-b` | Create and check out a new branch. |
+| `-B` | Create or reset and check out a branch. |
+| `-f` | Force checkout even when the host tree is dirty relative to the applied ref. |
+| `--track`, `--no-track` | Accepted for Git CLI parity only. Qit does not persist upstream tracking metadata. |
+
+Unsupported forms are rejected explicitly:
+
+- merge-style checkout: `-m`
+- detached checkout: `--detach`
+- path checkout: extra trailing file paths
+
+### `qit switch`
+
+Change both the checked-out host branch and the exported branch.
+
+```bash
+qit switch <path> <branch>
+```
+
+Use this when you want new clones and the host folder to agree on the same branch.
+
+## Repository settings commands
+
+### `qit settings view`
+
+Show repository metadata, the exported branch, and current branch rules.
+
+```bash
+qit settings view <path>
+```
+
+### `qit settings set`
+
+Update repository metadata or change the served default branch.
+
+```bash
+qit settings set <path> [--description <text>] [--homepage <url>] [--default-branch <branch>]
+```
+
+- `--default-branch` uses the same branch-switching behavior as `qit switch`.
+
+### `qit settings rule`
+
+List, add, update, or delete branch rules.
+
+```bash
+qit settings rule <path>
+qit settings rule <path> --pattern <glob> [--require-pr] [--approvals <n>] [--dismiss-stale] [--block-force-push] [--block-delete]
+qit settings rule <path> --delete <glob>
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--pattern` | Branch pattern to create or update. |
+| `--delete` | Remove a rule by pattern. |
+| `--require-pr` | Require pull requests before merge. |
+| `--approvals N` | Require at least `n` approvals. |
+| `--dismiss-stale` | Ignore approvals after new commits arrive on the source branch. |
+| `--block-force-push` | Reject non-fast-forward pushes. |
+| `--block-delete` | Reject branch deletion. |
+
+## Authentication commands
+
+Authentication commands work on an existing served workspace.
+
+### `qit auth mode`
+
+Show or change the repo auth mode.
+
+```bash
+qit auth mode <path>
+qit auth mode <path> --shared-session
+qit auth mode <path> --request-based
+```
+
+- `--shared-session` enables only `basic-auth`.
+- `--request-based` enables `request-access` plus `setup-token`.
+
+### `qit auth requests`
+
+List, approve, or reject access requests.
+
+```bash
+qit auth requests <path>
+qit auth requests <path> --approve <request-id-or-prefix>
+qit auth requests <path> --reject <request-id-or-prefix>
+```
+
+- Approval creates a durable user in `approved_pending_setup` state and prints a one-time onboarding token exactly once.
+- Rejection marks the request as rejected and keeps it in history.
+
+### `qit auth users`
+
+List or manage durable users.
+
+```bash
+qit auth users <path>
+qit auth users <path> --promote <user-id-or-prefix>
+qit auth users <path> --demote <user-id-or-prefix>
+qit auth users <path> --revoke <user-id-or-prefix>
+qit auth users <path> --reset-setup <user-id-or-prefix>
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--promote` | Promote a user to owner. |
+| `--demote` | Demote an owner back to user. |
+| `--revoke` | Revoke the account and invalidate active PATs. |
+| `--reset-setup` | Clear the username/password, invalidate active PATs, and issue a new onboarding token. |
+
+Qit refuses to demote or revoke the last durable owner.
+
+### `qit auth pats`
+
+List or revoke personal access tokens.
+
+```bash
+qit auth pats <path>
+qit auth pats <path> --revoke <pat-id-or-prefix>
+```
+
+PAT creation is user self-service in the Web UI after onboarding. The CLI currently lists and revokes PATs but does not mint them.
+
+## Issue commands
+
+Issue selectors accept an issue number, a full issue ID, or a unique issue ID prefix, depending on the subcommand.
+
+| Command | Purpose |
+| --- | --- |
+| `qit issue list PATH [--state OPEN|CLOSED|ALL]` | List issues. |
+| `qit issue view PATH ISSUE` | Show the issue summary, comments, and activity. |
+| `qit issue create PATH --title TEXT [--body MARKDOWN] [--label NAME...] [--assignee USERNAME...] [--milestone TITLE] [--link-pr PR...]` | Create an issue. |
+| `qit issue edit PATH ISSUE [--title TEXT] [--body MARKDOWN] [--open|--close]` | Edit issue title, body, or state. |
+| `qit issue comment PATH ISSUE --body MARKDOWN [--author DISPLAY_NAME]` | Add a top-level comment. |
+| `qit issue close PATH ISSUE` | Close an issue. |
+| `qit issue reopen PATH ISSUE` | Reopen an issue. |
+| `qit issue delete PATH ISSUE` | Delete an issue. |
+| `qit issue label PATH ISSUE [--add NAME...] [--remove NAME...]` | Add or remove labels. |
+| `qit issue assign PATH ISSUE [--add USERNAME...] [--remove USERNAME...]` | Add or remove assignees. |
+| `qit issue milestone PATH ISSUE [--set TITLE|--clear]` | Set or clear the milestone. |
+| `qit issue link-pr PATH ISSUE PULL_REQUEST` | Link a pull request to an issue. |
+
+When labels or milestones are set by name, Qit creates them if needed.
+
+## Pull request commands
+
+Pull request selectors accept a full PR ID or a unique ID prefix.
+
+| Command | Purpose |
+| --- | --- |
+| `qit pr list PATH [--state OPEN|CLOSED|MERGED|ALL]` | List pull requests. |
+| `qit pr view PATH PULL_REQUEST` | Show the PR summary, discussion, reviews, and file summary. |
+| `qit pr diff PATH PULL_REQUEST` | Show a patch-style diff. |
+| `qit pr status PATH` | Show open PRs for the checked-out branch and served branch. |
+| `qit pr create PATH --title TEXT [--body MARKDOWN] [--head BRANCH] [--base BRANCH]` | Create a pull request. |
+| `qit pr edit PATH PULL_REQUEST [--title TEXT] [--body MARKDOWN] [--open|--close]` | Edit title, body, or state. |
+| `qit pr comment PATH PULL_REQUEST --body MARKDOWN [--author DISPLAY_NAME]` | Add a top-level comment. |
+| `qit pr review PATH PULL_REQUEST [--approve|--request-changes|--comment] [--body MARKDOWN] [--author DISPLAY_NAME]` | Submit a review. |
+| `qit pr merge PATH PULL_REQUEST` | Merge an open pull request. |
+| `qit pr close PATH PULL_REQUEST` | Close a pull request. |
+| `qit pr reopen PATH PULL_REQUEST` | Reopen a pull request. |
+| `qit pr delete PATH PULL_REQUEST` | Delete a pull request. |
+
+### Pull request defaults
+
+- `qit pr create` defaults `--head` to the checked-out branch.
+- `qit pr create` defaults `--base` to the exported branch.
+- `qit pr merge` enforces branch rules such as required approvals and dismissal of stale approvals.
+
+## Environment variables
+
+| Variable | Used by | Meaning |
+| --- | --- | --- |
+| `QIT_DATA_DIR` | CLI, supervisor, tests | Override the app-data root used for the registry, sidecars, and supervisor files. |
+| `QIT_DISPLAY_NAME` | CLI issue/PR comments and reviews | Preferred display name when `--author` is omitted. |
+| `GIT_AUTHOR_NAME` | CLI issue/PR comments and reviews | Fallback display name when `QIT_DISPLAY_NAME` is unset. |
+| `USER` / `USERNAME` | CLI issue/PR comments and reviews | Final shell-account fallbacks for the display name. |
+| `NGROK_AUTHTOKEN` | ngrok transport | Required when using `--transport ngrok`. |
+| `RUST_LOG` | CLI/runtime logging | Controls structured logging; Qit defaults it to `warn` when unset. |
+| `QIT_DEV_API` | Web UI frontend development | Development-only origin for the Vite frontend proxy. |
+| `QIT_DEV_MOUNT` | Web UI frontend development | Development-only repo mount path for the Vite frontend proxy. |
+
+## Data location and defaults
+
+- By default, Qit stores its registry and sidecars under the platform app-data directory for `com.quickgit.Qit`.
+- `QIT_DATA_DIR` overrides that root.
+- Workspace identity is derived from the canonical host path, so restarting Qit against the same folder reopens the same workspace metadata.
+
+## Configuration precedence
+
+- For serve-time auth selection, repeated `--auth-method` flags override `--auth-mode`.
+- For comment/review author names, `QIT_DISPLAY_NAME` overrides `GIT_AUTHOR_NAME`, which overrides `USER` / `USERNAME`, which finally falls back to `Qit CLI`.
+- Existing workspace metadata wins over a conflicting `--branch` on restart. Use `qit switch` to change the served branch.
+
+## Errors and exit behavior
+
+- Qit does not currently publish a fixed exit-code reference. Success returns zero; failures return non-zero.
+- Common failure strings come directly from the domain and repository layers. See [troubleshooting and recovery](/docs/troubleshooting/recovery) for the important ones.

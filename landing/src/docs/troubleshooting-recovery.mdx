@@ -1,0 +1,410 @@
+---
+title: Troubleshooting and Recovery
+description: Diagnose the most common Qit failures around serving, auth, branch changes, pushes, and apply.
+slug: /troubleshooting/recovery
+section: Troubleshooting
+sidebar_label: Troubleshooting
+sidebar_position: 80
+---
+
+# Troubleshooting and Recovery
+
+This page is organized by symptom. Each section gives likely causes, diagnostic steps, exact fixes, and when to escalate.
+
+## `path is required`
+
+### Symptoms
+
+- `qit` exits immediately with `path is required`.
+
+### Likely cause
+
+- You ran `qit` without a path and without a subcommand.
+
+### Diagnostic steps
+
+- Re-run the command and check whether you intended to serve a folder or run a subcommand.
+
+### Exact fix
+
+Serve a folder:
+
+```bash
+qit ./my-app
+```
+
+Or run an explicit subcommand:
+
+```bash
+qit apply ./my-app
+```
+
+### Escalation
+
+- None. This is a usage error.
+
+## `refusing to serve existing Git worktree ... rerun with --allow-existing-git`
+
+### Symptoms
+
+- Serve fails when the target folder already contains `.git`.
+
+### Likely causes
+
+- You pointed Qit at an existing Git worktree root.
+- Qit is protecting you from serving that worktree by accident.
+
+### Diagnostic steps
+
+- Check whether the target folder has a `.git` directory.
+
+### Exact fix
+
+If you intended to serve that Git worktree, opt in explicitly:
+
+```bash
+qit --allow-existing-git .
+```
+
+If you did not intend that, point Qit at the correct folder instead.
+
+### Escalation
+
+- If you are unsure whether the folder should be served as an existing worktree, stop and decide before proceeding.
+
+## `workspace already serves branch ... use switch`
+
+### Symptoms
+
+- Restarting Qit with `--branch <name>` fails for an existing workspace.
+
+### Likely cause
+
+- The workspace already has a saved exported branch, and Qit does not let a restart silently redefine it.
+
+### Diagnostic steps
+
+- Run:
+
+```bash
+qit settings view ./my-app
+```
+
+### Exact fix
+
+Use:
+
+```bash
+qit switch ./my-app <branch>
+```
+
+Do not keep retrying `qit --branch <name> ./my-app` against the same workspace.
+
+### Escalation
+
+- None. This is normal protection.
+
+## `workspace has local changes not snapshotted` or apply is blocked by dirty state
+
+### Symptoms
+
+- `qit apply` fails.
+- The host folder is not updating after pushes.
+
+### Likely causes
+
+- The host folder has local edits relative to the last applied state.
+- You changed files locally after the last serve or apply.
+
+### Diagnostic steps
+
+- Inspect the host folder with your normal tools.
+- Decide whether the local state should be preserved, committed elsewhere, or discarded manually.
+
+### Exact fix
+
+Choose one:
+
+1. Keep the local edits and move them somewhere safe before applying.
+2. Bring the host folder back to the last intended state, then run:
+
+```bash
+qit apply ./my-app
+```
+
+3. If the update should target another branch, apply that branch explicitly:
+
+```bash
+qit apply ./my-app --branch feature-x
+```
+
+### Escalation
+
+- If the local changes are valuable and you are not sure how to preserve them, stop before forcing any local cleanup.
+
+## `fast-forward apply not possible`
+
+### Symptoms
+
+- `qit apply` fails with a non-fast-forward error.
+
+### Likely causes
+
+- The host folder branch has diverged from the sidecar branch.
+- You are trying to apply history that is not a straight descendant of the currently applied state.
+
+### Diagnostic steps
+
+- Check the branch relationship:
+
+```bash
+qit branch ./my-app -v
+qit pr status ./my-app
+```
+
+### Exact fix
+
+- Decide which branch should own the host folder.
+- If the intended state lives on another branch, apply that branch explicitly:
+
+```bash
+qit apply ./my-app --branch feature-x
+```
+
+- If the workspace history itself is wrong, resolve the branch state first and then apply again.
+
+### Escalation
+
+- If you need a non-fast-forward rewrite of host state, do not improvise. Resolve the branch history intentionally first.
+
+## `authentication failed`
+
+### Symptoms
+
+- Git clone, fetch, or push is rejected.
+- Web UI login fails.
+- PAT-based access stops working.
+
+### Likely causes
+
+- Wrong username or secret.
+- Revoked or inactive user.
+- PAT has been revoked.
+- Shared-session password was from an older serve process.
+
+### Diagnostic steps
+
+- Confirm whether the workspace is in shared-session or request-based mode:
+
+```bash
+qit auth mode ./my-app
+```
+
+- In request-based mode, inspect users and PATs:
+
+```bash
+qit auth users ./my-app
+qit auth pats ./my-app
+```
+
+### Exact fix
+
+- Shared-session mode: use the username and password from the currently running `qit` process.
+- Request-based mode: use the durable username plus password or a current PAT.
+- If setup was never completed or the token was lost, issue a new setup token:
+
+```bash
+qit auth users ./my-app --reset-setup <user-id-or-prefix>
+```
+
+- If a PAT was revoked, mint a new one from the Web UI.
+
+### Escalation
+
+- If multiple users fail at once after an auth-mode change, verify that the workspace was not switched from shared-session to request-based unexpectedly.
+
+## `onboarding token is invalid or expired`
+
+### Symptoms
+
+- The Web UI rejects a setup token during onboarding.
+
+### Likely causes
+
+- The token already was redeemed.
+- The token expired.
+- The token was copied incorrectly.
+- The account is no longer in `approved_pending_setup` state.
+
+### Diagnostic steps
+
+- Check whether the user already appears as `active`:
+
+```bash
+qit auth users ./my-app
+```
+
+### Exact fix
+
+Issue a new token:
+
+```bash
+qit auth users ./my-app --reset-setup <user-id-or-prefix>
+```
+
+Share the newly printed token immediately.
+
+### Escalation
+
+- None, unless repeated resets still fail. In that case inspect whether the wrong workspace path is being managed.
+
+## `a pending request already exists for that email`
+
+### Symptoms
+
+- A collaborator cannot submit a new access request.
+
+### Likely cause
+
+- There is already a pending request for that email address.
+
+### Diagnostic steps
+
+- Inspect pending requests:
+
+```bash
+qit auth requests ./my-app
+```
+
+### Exact fix
+
+- Approve or reject the existing request instead of asking the user to submit again.
+
+### Escalation
+
+- None.
+
+## `cannot remove or demote the last durable owner`
+
+### Symptoms
+
+- Owner demotion or revocation fails.
+
+### Likely cause
+
+- Qit is preventing the workspace from losing its final durable owner.
+
+### Diagnostic steps
+
+- List users and roles:
+
+```bash
+qit auth users ./my-app
+```
+
+### Exact fix
+
+- Promote another active user first:
+
+```bash
+qit auth users ./my-app --promote <user-id-or-prefix>
+```
+
+- Then retry the demotion or revocation.
+
+### Escalation
+
+- None. This guard is intentional.
+
+## `branch is not fully merged`
+
+### Symptoms
+
+- `qit branch <path> -d <branch>` fails.
+
+### Likely cause
+
+- You tried to delete a branch that is not fully merged.
+
+### Diagnostic steps
+
+- Inspect open PRs and current branch state:
+
+```bash
+qit pr status ./my-app
+qit branch ./my-app -v
+```
+
+### Exact fix
+
+- Merge the work first, or use force delete if you intentionally want to remove the branch:
+
+```bash
+qit branch ./my-app -D <branch>
+```
+
+### Escalation
+
+- Do not force delete if you are unsure whether the branch contains unmerged work.
+
+## `merge-style checkout is not supported`, `detached checkout is not supported`, or `path checkout is not supported`
+
+### Symptoms
+
+- `qit checkout` rejects a Git-shaped form you expected to work.
+
+### Likely cause
+
+- Qit intentionally limits checkout behavior to forms that are safe for the sidecar-backed host-folder model.
+
+### Diagnostic steps
+
+- Re-check the intended goal: change the host branch, or change the served branch.
+
+### Exact fix
+
+- Use `qit checkout <path> <branch>` to change only the checked-out host branch.
+- Use `qit switch <path> <branch>` to change both the checked-out and served branch.
+
+### Escalation
+
+- None. Unsupported forms are a product constraint, not a transient failure.
+
+## Public Web UI login behaves differently from localhost
+
+### Symptoms
+
+- The local browser opens directly as operator on `localhost`, but the public or tunneled URL requires login.
+
+### Likely cause
+
+- Qit's implicit owner bypass is based on the request host being loopback, not on the client machine being trusted.
+
+### Diagnostic steps
+
+- Compare the URL you opened: `localhost` versus ngrok, Tailscale, or LAN host.
+
+### Exact fix
+
+- Use the local loopback URL for operator access.
+- Expect exposed hosts to require explicit authentication.
+
+### Escalation
+
+- None. This is part of Qit's trust model.
+
+## Recovery checklist
+
+When a workspace feels wrong, work through these in order:
+
+1. Confirm the workspace path you are managing.
+2. Confirm the current auth mode with `qit auth mode`.
+3. Confirm the served and checked-out branch with `qit settings view`.
+4. Inspect branch and PR state with `qit branch -v` and `qit pr status`.
+5. Decide whether the problem is in sidecar state, host-folder state, or authentication state.
+
+## Related pages
+
+- [CLI reference](/docs/reference/cli)
+- [Managing authentication](/docs/guides/managing-authentication)
+- [The sidecar model](/docs/concepts/sidecar-model)

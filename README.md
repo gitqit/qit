@@ -52,15 +52,15 @@ cargo run --manifest-path Cargo.toml -p qit -- --transport local ./my-app
 3. snapshot the folder into the host folder's checked-out branch
 4. start Git Smart HTTP
 5. generate a fresh session username and password
-6. print the repo URL, a local credentials file path, and a clone command
+6. print the repo URL, session username and password, and a clone command
 
-Clone from another machine or terminal:
+Clone from another terminal, or from another machine when you use `--transport lan`, `--transport ngrok`, or `--transport tailscale`:
 
 ```bash
-git clone http://qit-user:qit-pass@127.0.0.1:8080/my-app
+git clone http://127.0.0.1:8080/my-app
 ```
 
-`qit` prints the real session username/password and includes them in the suggested clone command by default. Pass `--hidden-pass` if you want stdout to hide the password and leave the clone command uncredentialed.
+`qit` shows the session username and password in stdout and embeds them in the suggested clone command by default. Pass `--hidden-pass` if you want stdout to hide the password and keep it only in a local credentials file.
 
 ## Commands
 
@@ -75,7 +75,14 @@ Choose a transport:
 ```bash
 cargo run -p qit -- --transport ngrok ./my-app
 cargo run -p qit -- --transport tailscale ./my-app
+cargo run -p qit -- --transport lan ./my-app
 cargo run -p qit -- --transport local ./my-app
+```
+
+Serve an existing Git worktree root explicitly:
+
+```bash
+cargo run -p qit -- --allow-existing-git .
 ```
 
 Enable auto-apply:
@@ -117,8 +124,10 @@ Unlike the current LocalCollab build, `qit` does not default to anonymous access
 - every server session generates a fresh username and password
 - authentication uses HTTP Basic Auth so standard Git clients can use normal clone and push commands
 - credentials live only for the lifetime of the serving process
-- credentials are written to a local file and also printed to stdout by default, including in the suggested clone command
-- pass `--hidden-pass` to hide the password from stdout and force Git to prompt instead
+- by default the startup summary prints the session username and password and includes them in the suggested clone command
+- `--hidden-pass` switches the CLI to a safer local-only mode that hides the password from stdout and writes it to a local credentials file with restricted permissions when supported
+- the Web UI enters as owner automatically only in local-only mode; exposed sessions must authenticate explicitly
+- exposed Web UI sessions do not echo Git credentials back to non-owner browser sessions after login; the operator remains the source of truth for handing those credentials out
 - pushes still land in the sidecar repository first
 - host-folder writes still require `apply` or `--auto-apply`
 
@@ -141,6 +150,7 @@ This is intentionally simple authentication, not a full multi-user permission sy
 - snapshots honor the published tree's local `.gitignore` rules even when the host folder is not a Git repository
 - snapshots do not inherit machine-global Git ignore rules from the operator's environment
 - snapshots include vendor/build directories when they are part of the published tree
+- serving an existing Git worktree root requires `--allow-existing-git`; `qit` snapshots the checked-out branch while skipping `.git` metadata
 - the sidecar repository still lives outside the host folder, so `qit` does not snapshot sidecar Git metadata into the published tree
 
 ## Operational Notes
@@ -169,3 +179,21 @@ Run the full rewrite test suite:
 ```bash
 cargo test --workspace
 ```
+
+## Development
+
+### Web UI
+
+To run the Web UI with hot reloading during development:
+
+1. Start the `qit` server (e.g., `cargo run -p qit -- ./my-app`)
+2. In a new terminal, navigate to the frontend directory:
+   ```bash
+   cd crates/qit-webui/frontend
+   ```
+3. Run the development server, pointing it to your local `qit` instance:
+   ```bash
+   QIT_DEV_API=http://127.0.0.1:8080 QIT_DEV_MOUNT=/my-app npm run dev
+   ```
+
+Replace `http://127.0.0.1:8080` with your actual local URL and `/my-app` with the mount path shown in the `qit` startup output.

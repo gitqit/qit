@@ -15,6 +15,60 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  web:
+    name: Web Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            crates/qit-webui/frontend/package-lock.json
+            landing/package-lock.json
+      - name: Install Web UI frontend dependencies
+        working-directory: crates/qit-webui/frontend
+        run: npm ci
+      - name: Lint Web UI frontend
+        working-directory: crates/qit-webui/frontend
+        run: npm run lint
+      - name: Test Web UI frontend
+        working-directory: crates/qit-webui/frontend
+        run: npm run test
+      - name: Build Web UI frontend
+        working-directory: crates/qit-webui/frontend
+        run: npm run build
+      - name: Install landing dependencies
+        working-directory: landing
+        run: npm ci
+      - name: Lint landing site
+        working-directory: landing
+        run: npm run lint
+      - name: Build landing site
+        working-directory: landing
+        run: npm run build
+
+  web-smoke:
+    name: Web Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/qit-webui/frontend/package-lock.json
+      - name: Install Web UI frontend dependencies
+        working-directory: crates/qit-webui/frontend
+        run: npm ci
+      - name: Install Playwright browser
+        working-directory: crates/qit-webui/frontend
+        run: npx playwright install --with-deps chromium
+      - name: Run frontend browser smoke tests
+        working-directory: crates/qit-webui/frontend
+        run: npm run smoke
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

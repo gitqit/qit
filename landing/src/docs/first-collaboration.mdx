@@ -1,0 +1,182 @@
+---
+title: First Collaboration Tutorial
+description: Learn the full Qit flow by serving a folder, opening an issue, pushing a branch, creating a pull request, merging it, and applying the result.
+slug: /tutorials/first-collaboration
+section: Tutorials
+sidebar_label: First collaboration
+sidebar_position: 30
+---
+
+# First Collaboration Tutorial
+
+This tutorial teaches the full Qit loop:
+
+1. serve a folder
+2. clone it as a collaborator
+3. open an issue
+4. push a feature branch
+5. create and merge a pull request
+6. apply the result back to the host folder
+
+This tutorial uses one machine and two terminals so you can learn the workflow without needing a second operator.
+
+## Prerequisites
+
+- `qit` is installed.
+- Git is installed.
+- You have a sample folder to share, such as `./demo-app`.
+
+## Step 1: Start a shared-session workspace
+
+In Terminal 1, start Qit in the simplest possible mode:
+
+```bash
+qit --transport local --auth-mode shared-session ./demo-app
+```
+
+Keep this process running.
+
+From the startup summary, note:
+
+- the local Web UI URL
+- the Git repo URL
+- the generated username
+- the generated password
+
+## Step 2: Clone it as a collaborator
+
+In Terminal 2, clone the served repo using the credentials from Terminal 1:
+
+```bash
+git clone http://session-owner:temporary-pass@127.0.0.1:8080/demo-app/
+cd demo-app
+```
+
+You now have a normal Git clone backed by Qit's sidecar repository.
+
+## Step 3: Open the Web UI
+
+In your browser, open the local Web UI URL from Terminal 1.
+
+Use this tutorial to watch the workspace state as you go:
+
+- code view
+- commits
+- issues
+- pull requests
+
+## Step 4: Create an issue
+
+Back in Terminal 1, create an issue against the served workspace:
+
+```bash
+qit issue create ./demo-app \
+  --title "Add a collaborator note" \
+  --body "Add a short note to the README so we can test the sidecar review flow."
+```
+
+Confirm that the issue appears in the Web UI.
+
+If you want to create the issue in the browser instead of the CLI, open the local Web UI URL, switch to the `Issues` tab, click `New issue`, fill in the title, description, and display name, then submit it there.
+
+![Open new issue modal in the Web UI](/tutorial-first-collaboration-issue-modal.png)
+
+The modal keeps the issue fields together in one place before you publish it. After you submit it, the issue page becomes the place to keep the conversation, metadata, and linked pull requests together while the work moves forward.
+
+## Step 5: Push a feature branch from the clone
+
+In Terminal 2, make a normal Git change:
+
+```bash
+git checkout -b docs-note
+printf '\nCollaboration note from a clone.\n' >> README.md
+git add README.md
+git commit -m "Add collaboration note"
+git push origin docs-note
+```
+
+Important: the push updates Qit's sidecar repository. It does **not** update the original `./demo-app` host folder yet.
+
+## Step 6: Verify that the host folder did not change
+
+In Terminal 1, inspect the served workspace:
+
+```bash
+qit branch ./demo-app
+qit pr status ./demo-app
+```
+
+You should see the new sidecar branch, but the host folder is still on its current checked-out state.
+
+## Step 7: Create a pull request
+
+Create a pull request from the pushed branch back to `main` and link the issue:
+
+```bash
+qit pr create ./demo-app \
+  --head docs-note \
+  --base main \
+  --title "Add the collaborator note" \
+  --body "Fixes #1"
+```
+
+Then inspect it:
+
+```bash
+qit pr view ./demo-app <pull-request-id-prefix>
+qit pr diff ./demo-app <pull-request-id-prefix>
+```
+
+You can also open the pull request in the Web UI and inspect the diff there.
+
+If you want to create the pull request in the browser instead of the CLI, open the `Pull requests` tab, click `Open pull request`, choose the source and target branches, write the title and body, and link the issue before you submit it.
+
+![Open pull request modal in the Web UI](/tutorial-first-collaboration-pr-modal.png)
+
+This modal is where Qit checks the source and target branch pairing before you publish the review request. Once the PR is open, the full pull-request screen keeps the linked issue, review activity, and diff together before anything is applied back to the host folder.
+
+## Step 8: Review and merge the pull request
+
+Submit a review:
+
+```bash
+qit pr review ./demo-app <pull-request-id-prefix> --approve --body "Looks good."
+```
+
+Merge it:
+
+```bash
+qit pr merge ./demo-app <pull-request-id-prefix>
+```
+
+In the Web UI, this same step happens from the pull request page: open the PR, review the diff, leave a comment or approval, and use the merge action when it is ready.
+
+At this point:
+
+- the sidecar branch history has advanced
+- the pull request is merged
+- the original `./demo-app` host folder still has not changed
+
+## Step 9: Apply the merged result to the host folder
+
+Apply the served branch back to the original folder:
+
+```bash
+qit apply ./demo-app
+```
+
+Now inspect `./demo-app/README.md` in the host folder. The collaborator change is finally present there.
+
+## What you just learned
+
+- Collaborators interact with a normal Git remote.
+- Issues and pull requests live on the served workspace, not inside the clone.
+- Pushes land in the sidecar repository first.
+- Merge does not automatically rewrite the host folder.
+- `qit apply` is the step that updates the host folder when you are ready.
+
+## Next steps
+
+- Read [the sidecar model](/docs/concepts/sidecar-model) to understand why the host folder stayed unchanged until apply.
+- Read [managing authentication](/docs/guides/managing-authentication) to switch from a shared password to durable accounts.
+- Use the [CLI reference](/docs/reference/cli) for exact command syntax beyond this tutorial.

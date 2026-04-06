@@ -1,0 +1,64 @@
+---
+title: Using Qit with Tailscale
+description: Expose your Qit session securely to your Tailnet or the public internet using Tailscale Funnel.
+slug: /guides/tailscale
+---
+
+# Using Qit with Tailscale
+
+Qit integrates with Tailscale to provide secure, zero-config sharing of your local folders. You can share within your private Tailnet or use **Tailscale Funnel** to expose your session to the public internet.
+
+## Prerequisites
+
+- [Tailscale](https://tailscale.com/download) installed and logged in on your machine.
+- For public sharing, [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) must be enabled for your tailnet.
+
+## Starting a Tailscale Session
+
+To serve a folder and expose it via Tailscale, use the `--transport tailscale` flag:
+
+```bash
+qit --transport tailscale ./my-app
+```
+
+### What happens behind the scenes?
+
+1. Qit identifies your machine's Tailscale DNS name (e.g., `my-machine.tailnet-name.ts.net`).
+2. It runs `tailscale funnel` in the background to route traffic to your local Qit supervisor.
+3. It prints a public `https://` URL that anyone (if Funnel is on) or just your Tailnet (if Funnel is off) can use.
+
+## Access Control
+
+When using Tailscale, Qit's [Trust Model](/docs/concepts/trust-model) ensures security:
+
+- **Localhost Bypass**: You can still access the Web UI on `localhost` without logging in.
+- **Tailnet/Public Access**: Any request coming through the Tailscale URL (even from your own machine) is treated as a remote request and **requires authentication**.
+
+## Troubleshooting
+
+### `tailscale` CLI not found
+Ensure the `tailscale` binary is in your system `PATH`. On macOS, this is usually `/Applications/Tailscale.app/Contents/Resources/bin/tailscale` if not linked.
+
+### Funnel is not enabled
+If you get an error about Funnel, ensure it is enabled in your [Tailscale Admin Console](https://login.tailscale.com/admin/settings/funnel). You may also need to run:
+```bash
+tailscale funnel --bg --yes http://127.0.0.1:8080
+```
+manually once to accept the terms if Qit cannot do it for you.
+
+### Authentication Failures
+Remember that the Tailscale URL always requires a login. Use the credentials printed at startup (in `shared-session` mode) or your durable account (in `request-based` mode).
+
+## Comparison with ngrok
+
+| Feature | Tailscale | ngrok |
+| :--- | :--- | :--- |
+| **Setup** | Requires Tailscale app | Requires `NGROK_AUTHTOKEN` |
+| **Security** | Can be restricted to Tailnet | Public by default |
+| **URL** | Stable (your node name) | Random (unless on paid plan) |
+| **Speed** | Peer-to-peer (often faster) | Relayed through ngrok |
+
+## Related Pages
+- [Sharing and Auth](/docs/sharing-and-auth)
+- [Managing Authentication](/docs/guides/managing-authentication)
+- [CLI Reference](/docs/reference/cli)

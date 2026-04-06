@@ -3,6 +3,7 @@ use qit_domain::{CredentialIssuer, SessionCredentials, WorkspaceService};
 use qit_git::{GitHttpBackendAdapter, GitRepoStore};
 use qit_http::{repo_mount_path, GitHttpServer, GitHttpServerConfig, DEFAULT_MAX_BODY_BYTES};
 use qit_storage::FilesystemRegistry;
+use qit_webui::{WebUiConfig, WebUiServer};
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
@@ -81,7 +82,7 @@ fn spawn_qit_serve(
     worktree: &Path,
     port: u16,
 ) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
-    spawn_qit_serve_with_options(worktree, port, false, None, false)
+    spawn_qit_serve_with_options(worktree, port, false, None, true, Some("shared-session"))
 }
 
 fn spawn_qit_serve_with_env(
@@ -90,7 +91,23 @@ fn spawn_qit_serve_with_env(
     auto_apply: bool,
     data_dir: Option<&Path>,
 ) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
-    spawn_qit_serve_with_options(worktree, port, auto_apply, data_dir, false)
+    spawn_qit_serve_with_options(
+        worktree,
+        port,
+        auto_apply,
+        data_dir,
+        true,
+        Some("shared-session"),
+    )
+}
+
+fn spawn_qit_serve_with_auth_mode(
+    worktree: &Path,
+    port: u16,
+    data_dir: Option<&Path>,
+    auth_mode: &str,
+) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
+    spawn_qit_serve_with_options(worktree, port, false, data_dir, true, Some(auth_mode))
 }
 
 fn spawn_qit_serve_with_options(
@@ -98,7 +115,8 @@ fn spawn_qit_serve_with_options(
     port: u16,
     auto_apply: bool,
     data_dir: Option<&Path>,
-    hidden_pass: bool,
+    show_pass: bool,
+    auth_mode: Option<&str>,
 ) -> Result<(Child, std::sync::mpsc::Receiver<String>)> {
     let bin = qit_binary_path()?;
     let mut command = Command::new(bin);
@@ -107,8 +125,11 @@ fn spawn_qit_serve_with_options(
         .arg("local")
         .arg("--port")
         .arg(port.to_string());
-    if hidden_pass {
+    if !show_pass {
         command.arg("--hidden-pass");
+    }
+    if let Some(auth_mode) = auth_mode {
+        command.arg("--auth-mode").arg(auth_mode);
     }
     if auto_apply {
         command.arg("--auto-apply");
@@ -168,6 +189,35 @@ fn run_qit_with_env(args: &[&str], data_dir: Option<&Path>) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn first_pr_selector(output: &str) -> Result<String> {
+    output
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("pull requests for ") {
+                return None;
+            }
+            trimmed.split_whitespace().next().map(ToString::to_string)
+        })
+        .ok_or_else(|| anyhow!("failed to parse pull request selector from output"))
+}
+
+fn first_issue_selector(output: &str) -> Result<String> {
+    output
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("issues for ") {
+                return None;
+            }
+            trimmed
+                .split_whitespace()
+                .next()
+                .map(|value| value.trim_start_matches('#').to_string())
+        })
+        .ok_or_else(|| anyhow!("failed to parse issue selector from output"))
+}
+
 fn wait_for_clone_url(rx: &std::sync::mpsc::Receiver<String>) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut clone_url = None;
@@ -193,6 +243,23 @@ fn wait_for_clone_url(rx: &std::sync::mpsc::Receiver<String>) -> Result<String> 
                 password = line
                     .split_once(':')
                     .map(|(_, value)| value.trim().to_string());
+            }
+            Ok(line) if line.contains("Ctrl+C to stop.") => {
+                if let Some(clone_url) = clone_url.clone() {
+                    if let (Some(username), Some(password)) = (username.clone(), password.clone()) {
+                        let url = Url::parse(&clone_url).context("parse qit clone URL")?;
+                        if !url.username().is_empty() || url.password().is_some() {
+                            return Ok(url.to_string());
+                        }
+                        let mut url = url;
+                        url.set_username(&username)
+                            .map_err(|_| anyhow!("failed to encode username in URL"))?;
+                        url.set_password(Some(&password))
+                            .map_err(|_| anyhow!("failed to encode password in URL"))?;
+                        return Ok(url.to_string());
+                    }
+                    return Ok(clone_url);
+                }
             }
             Ok(_) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -241,20 +308,34 @@ async fn start_server(
         issuer,
     ));
     let prepared = service
-        .prepare_serve(worktree.clone(), Some("main"), "integration snapshot")
+        .prepare_serve(
+            worktree.clone(),
+            Some("main"),
+            "integration snapshot",
+            false,
+        )
         .await
         .map_err(|err| anyhow!(err.to_string()))?;
     let credentials = prepared.credentials.clone();
+    let workspace = prepared.workspace.clone();
+    service
+        .update_auth_mode(
+            workspace.worktree.clone(),
+            &workspace.exported_branch,
+            qit_domain::AuthMode::SharedSession,
+            &qit_domain::AuthActor::Operator,
+        )
+        .map_err(|err| anyhow!(err.to_string()))?;
     let mount_path = repo_mount_path("host");
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
-    let router = GitHttpServer::new(
+    let git_router = GitHttpServer::new(
         Arc::new(GitHttpBackendAdapter),
         registry.clone(),
         service.clone(),
         GitHttpServerConfig {
-            workspace: prepared.workspace,
+            workspace: workspace.clone(),
             credentials: credentials.clone(),
             auto_apply,
             repo_mount_path: mount_path.clone(),
@@ -262,8 +343,28 @@ async fn start_server(
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         },
     )
+    .git_router();
+    let web_router = WebUiServer::new(
+        repo_store.clone(),
+        service.clone(),
+        WebUiConfig {
+            workspace,
+            repo_mount_path: mount_path.clone(),
+            credentials: credentials.clone(),
+            implicit_owner_mode: false,
+            secure_cookies: false,
+            public_repo_url: None,
+        },
+    )
     .router();
-    let task = tokio::spawn(async move { axum::serve(listener, router).await });
+    let app = web_router.merge(git_router);
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     Ok((port, task, credentials, worktree, mount_path))
 }
 
@@ -301,6 +402,20 @@ async fn git_http_requires_basic_auth() -> Result<()> {
     assert!(authorized.status().is_success());
 
     task.abort();
+    Ok(())
+}
+
+#[test]
+fn serve_rejects_existing_git_worktree_without_flag() -> Result<()> {
+    let root = TempDir::new()?;
+    let worktree = root.path().join("repo");
+    std::fs::create_dir_all(&worktree)?;
+    run_git(Some(&worktree), &["init"])?;
+
+    let output = run_qit_output(&["--transport", "local", worktree.to_str().unwrap()])?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--allow-existing-git"));
     Ok(())
 }
 
@@ -375,28 +490,179 @@ fn qit_cli_serves_and_manual_apply_updates_host() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn qit_cli_shared_supervisor_serves_multiple_repos_on_one_entrypoint() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("data");
+    let worktree_one = root.path().join("alpha").join("host");
+    let worktree_two = root.path().join("beta").join("host");
+    std::fs::create_dir_all(&worktree_one)?;
+    std::fs::create_dir_all(&worktree_two)?;
+    std::fs::write(worktree_one.join("README.md"), "alpha\n")?;
+    std::fs::write(worktree_two.join("README.md"), "beta\n")?;
+
+    let port = free_port()?;
+    let (mut first_child, first_rx) =
+        spawn_qit_serve_with_env(&worktree_one, port, false, Some(&data_dir))?;
+    let first_clone_url = wait_for_clone_url(&first_rx)?;
+    let (mut second_child, second_rx) =
+        spawn_qit_serve_with_env(&worktree_two, port, false, Some(&data_dir))?;
+    let second_clone_url = wait_for_clone_url(&second_rx)?;
+
+    let first_url = Url::parse(&first_clone_url)?;
+    let second_url = Url::parse(&second_clone_url)?;
+    assert_eq!(first_url.host_str(), second_url.host_str());
+    assert_eq!(
+        first_url.port_or_known_default(),
+        second_url.port_or_known_default()
+    );
+    assert_ne!(first_url.path(), second_url.path());
+    assert_eq!(first_url.path(), "/host/");
+    assert!(second_url.path().starts_with("/host-"));
+
+    let status_page = reqwest::get(format!("http://127.0.0.1:{port}/"))
+        .await?
+        .text()
+        .await?;
+    assert!(status_page.contains("/host"));
+    assert!(status_page.contains(second_url.path().trim_end_matches('/')));
+
+    let clone_one = root.path().join("clone-one");
+    let clone_two = root.path().join("clone-two");
+    run_git(
+        None,
+        &["clone", &first_clone_url, clone_one.to_str().unwrap()],
+    )?;
+    run_git(
+        None,
+        &["clone", &second_clone_url, clone_two.to_str().unwrap()],
+    )?;
+    assert_eq!(
+        std::fs::read_to_string(clone_one.join("README.md"))?.replace("\r\n", "\n"),
+        "alpha\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(clone_two.join("README.md"))?.replace("\r\n", "\n"),
+        "beta\n"
+    );
+
+    let _ = second_child.kill();
+    let _ = second_child.wait();
+    let _ = first_child.kill();
+    let _ = first_child.wait();
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_host_through_shared_supervisor_does_not_get_local_operator_mode() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("data");
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "hello\n")?;
+
+    let port = free_port()?;
+    let (mut child, rx) = spawn_qit_serve_with_env(&worktree, port, false, Some(&data_dir))?;
+    let clone_url = wait_for_clone_url(&rx)?;
+    let mount_path = Url::parse(&clone_url)?
+        .path()
+        .trim_end_matches('/')
+        .to_string();
+
+    let payload = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}{mount_path}/api/bootstrap"))
+        .header("Host", "demo.example.ts.net")
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(payload.contains("\"operator_override\":false"));
+    assert!(payload.contains("\"actor\":null"));
+    Ok(())
+}
+
 #[test]
-fn qit_cli_shows_password_and_clone_credentials_by_default() -> Result<()> {
+fn qit_cli_hides_password_and_clone_credentials_by_default() -> Result<()> {
     let root = TempDir::new()?;
     let worktree = root.path().join("host");
     std::fs::create_dir_all(&worktree)?;
     std::fs::write(worktree.join("README.md"), "initial\n")?;
 
     let port = free_port()?;
-    let (mut child, rx) = spawn_qit_serve_with_options(&worktree, port, false, None, false)?;
+    let (mut child, rx) =
+        spawn_qit_serve_with_options(&worktree, port, false, None, false, Some("shared-session"))?;
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut saw_password = false;
+    let mut saw_hidden_password = false;
     let mut saw_credentials_file = false;
-    let mut saw_credentialed_clone = false;
+    let mut saw_uncredentialed_clone = false;
+    let mut saw_old_banner = false;
+    let mut saw_internal_startup_noise = false;
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(line) if line.trim_start().starts_with("password: ") => {
-                saw_password = !line.contains("hidden from stdout");
+                saw_hidden_password = line.contains("hidden (--hidden-pass enabled)");
             }
             Ok(line) if line.trim_start().starts_with("file: ") => {
                 saw_credentials_file = true;
             }
-            Ok(line) if line.contains("git clone http://") && line.contains('@') => {
+            Ok(line) if line.contains("git clone ") && !line.contains('@') => {
+                saw_uncredentialed_clone = true;
+            }
+            Ok(line)
+                if line.contains("===========================================================") =>
+            {
+                saw_old_banner = true;
+            }
+            Ok(line)
+                if line.contains("qit: starting...")
+                    || line.contains("sidecar:")
+                    || line.contains("snapshot:")
+                    || line.contains("local Git HTTP:") =>
+            {
+                saw_internal_startup_noise = true;
+            }
+            Ok(line) if line.contains("Ctrl+C to stop.") => break,
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("qit server exited before printing banner")
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(saw_hidden_password);
+    assert!(saw_credentials_file);
+    assert!(saw_uncredentialed_clone);
+    assert!(!saw_old_banner);
+    assert!(!saw_internal_startup_noise);
+    Ok(())
+}
+
+#[test]
+fn qit_cli_shows_password_with_show_pass() -> Result<()> {
+    let root = TempDir::new()?;
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "initial\n")?;
+
+    let port = free_port()?;
+    let (mut child, rx) =
+        spawn_qit_serve_with_options(&worktree, port, false, None, true, Some("shared-session"))?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_password = false;
+    let mut saw_credentialed_clone = false;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) if line.trim_start().starts_with("password: ") => {
+                saw_password = !line.contains("hidden");
+            }
+            Ok(line) if line.contains("git clone ") && line.contains('@') => {
                 saw_credentialed_clone = true;
             }
             Ok(line) if line.contains("Ctrl+C to stop.") => break,
@@ -411,48 +677,7 @@ fn qit_cli_shows_password_and_clone_credentials_by_default() -> Result<()> {
     let _ = child.kill();
     let _ = child.wait();
     assert!(saw_password);
-    assert!(saw_credentials_file);
     assert!(saw_credentialed_clone);
-    Ok(())
-}
-
-#[test]
-fn qit_cli_hides_password_with_hidden_pass() -> Result<()> {
-    let root = TempDir::new()?;
-    let worktree = root.path().join("host");
-    std::fs::create_dir_all(&worktree)?;
-    std::fs::write(worktree.join("README.md"), "initial\n")?;
-
-    let port = free_port()?;
-    let (mut child, rx) = spawn_qit_serve_with_options(&worktree, port, false, None, true)?;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut saw_hidden_password = false;
-    let mut saw_uncredentialed_clone = false;
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(line)
-                if line
-                    .trim_start()
-                    .starts_with("password: hidden from stdout") =>
-            {
-                saw_hidden_password = true;
-            }
-            Ok(line) if line.contains("git clone http://") && !line.contains('@') => {
-                saw_uncredentialed_clone = true;
-            }
-            Ok(line) if line.contains("Ctrl+C to stop.") => break,
-            Ok(_) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("qit server exited before printing banner")
-            }
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    assert!(saw_hidden_password);
-    assert!(saw_uncredentialed_clone);
     Ok(())
 }
 
@@ -625,6 +850,474 @@ fn qit_cli_git_parity_options_cover_branch_and_checkout() -> Result<()> {
 }
 
 #[test]
+fn qit_cli_pr_commands_cover_core_workflow() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("qit-data");
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "initial\n")?;
+
+    let port = free_port()?;
+    let (mut child, rx) = spawn_qit_serve_with_env(&worktree, port, false, Some(&data_dir))?;
+    let clone_url = wait_for_clone_url(&rx)?;
+
+    let clone_dir = root.path().join("clone");
+    run_git(None, &["clone", &clone_url, clone_dir.to_str().unwrap()])?;
+    run_git(Some(&clone_dir), &["config", "user.name", "Qit Tester"])?;
+    run_git(
+        Some(&clone_dir),
+        &["config", "user.email", "qit@example.com"],
+    )?;
+
+    run_git(Some(&clone_dir), &["checkout", "-b", "feature"])?;
+    std::fs::write(clone_dir.join("README.md"), "feature branch\n")?;
+    run_git(Some(&clone_dir), &["commit", "-am", "feature readme"])?;
+    run_git(Some(&clone_dir), &["push", "origin", "HEAD:feature"])?;
+
+    run_qit_with_env(
+        &["checkout", worktree.to_str().unwrap(), "feature"],
+        Some(&data_dir),
+    )?;
+
+    let status = run_qit_with_env(
+        &["pr", "status", worktree.to_str().unwrap()],
+        Some(&data_dir),
+    )?;
+    assert!(status.contains("current branch: feature"));
+
+    let created = run_qit_with_env(
+        &[
+            "pr",
+            "create",
+            worktree.to_str().unwrap(),
+            "--title",
+            "Feature PR",
+            "--body",
+            "Adds the feature branch",
+            "--head",
+            "feature",
+            "--base",
+            "main",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(created.contains("created pull request"));
+
+    let listed = run_qit_with_env(
+        &["pr", "list", worktree.to_str().unwrap(), "--state", "open"],
+        Some(&data_dir),
+    )?;
+    assert!(listed.contains("Feature PR"));
+    let selector = first_pr_selector(&listed)?;
+
+    let diff = run_qit_with_env(
+        &["pr", "diff", worktree.to_str().unwrap(), &selector],
+        Some(&data_dir),
+    )?;
+    assert!(diff.contains("--- a/README.md"));
+    assert!(diff.contains("+++ b/README.md"));
+
+    run_qit_with_env(
+        &[
+            "pr",
+            "comment",
+            worktree.to_str().unwrap(),
+            &selector,
+            "--body",
+            "Please double check the copy.",
+            "--author",
+            "Alice",
+        ],
+        Some(&data_dir),
+    )?;
+    run_qit_with_env(
+        &[
+            "pr",
+            "review",
+            worktree.to_str().unwrap(),
+            &selector,
+            "--approve",
+            "--body",
+            "Looks good to me.",
+            "--author",
+            "Alice",
+        ],
+        Some(&data_dir),
+    )?;
+    run_qit_with_env(
+        &[
+            "pr",
+            "edit",
+            worktree.to_str().unwrap(),
+            &selector,
+            "--title",
+            "Updated Feature PR",
+            "--body",
+            "Updated body",
+            "--close",
+        ],
+        Some(&data_dir),
+    )?;
+
+    let viewed = run_qit_with_env(
+        &["pr", "view", worktree.to_str().unwrap(), &selector],
+        Some(&data_dir),
+    )?;
+    assert!(viewed.contains("Updated Feature PR"));
+    assert!(viewed.contains("Alice"));
+    assert!(viewed.contains("approved"));
+    assert!(viewed.contains("closed the pull request"));
+
+    run_qit_with_env(
+        &["pr", "reopen", worktree.to_str().unwrap(), &selector],
+        Some(&data_dir),
+    )?;
+    run_qit_with_env(
+        &["pr", "merge", worktree.to_str().unwrap(), &selector],
+        Some(&data_dir),
+    )?;
+
+    let merged = run_qit_with_env(
+        &[
+            "pr",
+            "list",
+            worktree.to_str().unwrap(),
+            "--state",
+            "merged",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(merged.contains("Updated Feature PR"));
+
+    run_git(Some(&clone_dir), &["checkout", "main"])?;
+    run_git(Some(&clone_dir), &["checkout", "-b", "cleanup"])?;
+    std::fs::write(clone_dir.join("cleanup.txt"), "cleanup\n")?;
+    run_git(Some(&clone_dir), &["add", "cleanup.txt"])?;
+    run_git(Some(&clone_dir), &["commit", "-m", "cleanup change"])?;
+    run_git(Some(&clone_dir), &["push", "origin", "HEAD:cleanup"])?;
+
+    run_qit_with_env(
+        &[
+            "pr",
+            "create",
+            worktree.to_str().unwrap(),
+            "--title",
+            "Cleanup PR",
+            "--body",
+            "Temporary cleanup",
+            "--head",
+            "cleanup",
+            "--base",
+            "main",
+        ],
+        Some(&data_dir),
+    )?;
+    let listed = run_qit_with_env(
+        &["pr", "list", worktree.to_str().unwrap(), "--state", "open"],
+        Some(&data_dir),
+    )?;
+    assert!(listed.contains("Cleanup PR"));
+    let cleanup_selector = listed
+        .lines()
+        .find(|line| line.contains("Cleanup PR"))
+        .and_then(|line| line.split_whitespace().next())
+        .map(ToString::to_string)
+        .context("parse cleanup selector")?;
+    run_qit_with_env(
+        &[
+            "pr",
+            "delete",
+            worktree.to_str().unwrap(),
+            &cleanup_selector,
+        ],
+        Some(&data_dir),
+    )?;
+    let listed = run_qit_with_env(
+        &["pr", "list", worktree.to_str().unwrap(), "--state", "all"],
+        Some(&data_dir),
+    )?;
+    assert!(!listed.contains("Cleanup PR"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+#[test]
+fn qit_cli_issue_commands_cover_core_workflow() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("qit-data");
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "initial\n")?;
+
+    let port = free_port()?;
+    let (mut child, rx) = spawn_qit_serve_with_env(&worktree, port, false, Some(&data_dir))?;
+    let clone_url = wait_for_clone_url(&rx)?;
+
+    let clone_dir = root.path().join("clone");
+    run_git(None, &["clone", &clone_url, clone_dir.to_str().unwrap()])?;
+    run_git(Some(&clone_dir), &["config", "user.name", "Qit Tester"])?;
+    run_git(
+        Some(&clone_dir),
+        &["config", "user.email", "qit@example.com"],
+    )?;
+
+    run_git(Some(&clone_dir), &["checkout", "-b", "feature"])?;
+    std::fs::write(clone_dir.join("README.md"), "issue feature branch\n")?;
+    run_git(Some(&clone_dir), &["commit", "-am", "feature readme"])?;
+    run_git(Some(&clone_dir), &["push", "origin", "HEAD:feature"])?;
+
+    let created_pr = run_qit_with_env(
+        &[
+            "pr",
+            "create",
+            worktree.to_str().unwrap(),
+            "--title",
+            "Issue Link PR",
+            "--body",
+            "Implements the fix",
+            "--head",
+            "feature",
+            "--base",
+            "main",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(created_pr.contains("created pull request"));
+    let listed_prs = run_qit_with_env(
+        &["pr", "list", worktree.to_str().unwrap(), "--state", "open"],
+        Some(&data_dir),
+    )?;
+    let pr_selector = first_pr_selector(&listed_prs)?;
+
+    let created_issue = run_qit_with_env(
+        &[
+            "issue",
+            "create",
+            worktree.to_str().unwrap(),
+            "--title",
+            "Broken login flow",
+            "--body",
+            "Investigate the regression",
+            "--label",
+            "bug",
+            "--milestone",
+            "v1",
+            "--link-pr",
+            &pr_selector,
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(created_issue.contains("created issue #"));
+
+    let listed = run_qit_with_env(
+        &[
+            "issue",
+            "list",
+            worktree.to_str().unwrap(),
+            "--state",
+            "open",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(listed.contains("Broken login flow"));
+    let issue_selector = first_issue_selector(&listed)?;
+
+    run_qit_with_env(
+        &[
+            "issue",
+            "comment",
+            worktree.to_str().unwrap(),
+            &issue_selector,
+            "--body",
+            "Working on this now.",
+            "--author",
+            "Alice",
+        ],
+        Some(&data_dir),
+    )?;
+    run_qit_with_env(
+        &[
+            "issue",
+            "edit",
+            worktree.to_str().unwrap(),
+            &issue_selector,
+            "--title",
+            "Broken auth login flow",
+            "--close",
+        ],
+        Some(&data_dir),
+    )?;
+
+    let viewed = run_qit_with_env(
+        &["issue", "view", worktree.to_str().unwrap(), &issue_selector],
+        Some(&data_dir),
+    )?;
+    assert!(viewed.contains("Broken auth login flow"));
+    assert!(viewed.contains("bug"));
+    assert!(viewed.contains("v1"));
+    assert!(viewed.contains("Alice"));
+    assert!(viewed.contains("linked pull request"));
+
+    run_qit_with_env(
+        &[
+            "issue",
+            "label",
+            worktree.to_str().unwrap(),
+            &issue_selector,
+            "--add",
+            "ui",
+        ],
+        Some(&data_dir),
+    )?;
+    run_qit_with_env(
+        &[
+            "issue",
+            "reopen",
+            worktree.to_str().unwrap(),
+            &issue_selector,
+        ],
+        Some(&data_dir),
+    )?;
+
+    let reopened = run_qit_with_env(
+        &["issue", "view", worktree.to_str().unwrap(), &issue_selector],
+        Some(&data_dir),
+    )?;
+    assert!(reopened.contains("ui"));
+    assert!(reopened.contains("[open]"));
+
+    run_qit_with_env(
+        &[
+            "issue",
+            "delete",
+            worktree.to_str().unwrap(),
+            &issue_selector,
+        ],
+        Some(&data_dir),
+    )?;
+    let listed = run_qit_with_env(
+        &[
+            "issue",
+            "list",
+            worktree.to_str().unwrap(),
+            "--state",
+            "all",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(!listed.contains("Broken auth login flow"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+#[test]
+fn qit_cli_smart_issue_links_show_in_views_and_close_on_merge() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("qit-data");
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "initial\n")?;
+
+    let port = free_port()?;
+    let (mut child, rx) = spawn_qit_serve_with_env(&worktree, port, false, Some(&data_dir))?;
+    let clone_url = wait_for_clone_url(&rx)?;
+
+    let clone_dir = root.path().join("clone");
+    run_git(None, &["clone", &clone_url, clone_dir.to_str().unwrap()])?;
+    run_git(Some(&clone_dir), &["config", "user.name", "Qit Tester"])?;
+    run_git(
+        Some(&clone_dir),
+        &["config", "user.email", "qit@example.com"],
+    )?;
+
+    let created_issue = run_qit_with_env(
+        &[
+            "issue",
+            "create",
+            worktree.to_str().unwrap(),
+            "--title",
+            "Broken login flow",
+            "--body",
+            "Needs investigation",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(created_issue.contains("created issue #"));
+    let listed_issues = run_qit_with_env(
+        &[
+            "issue",
+            "list",
+            worktree.to_str().unwrap(),
+            "--state",
+            "open",
+        ],
+        Some(&data_dir),
+    )?;
+    let issue_selector = first_issue_selector(&listed_issues)?;
+
+    run_git(Some(&clone_dir), &["checkout", "-b", "feature"])?;
+    std::fs::write(clone_dir.join("README.md"), "linked fix\n")?;
+    run_git(Some(&clone_dir), &["commit", "-am", "linked fix"])?;
+    run_git(Some(&clone_dir), &["push", "origin", "HEAD:feature"])?;
+
+    let created_pr = run_qit_with_env(
+        &[
+            "pr",
+            "create",
+            worktree.to_str().unwrap(),
+            "--title",
+            "Fix login flow",
+            "--body",
+            "Fixes #1",
+            "--head",
+            "feature",
+            "--base",
+            "main",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(created_pr.contains("created pull request"));
+    let listed_prs = run_qit_with_env(
+        &["pr", "list", worktree.to_str().unwrap(), "--state", "open"],
+        Some(&data_dir),
+    )?;
+    let pr_selector = first_pr_selector(&listed_prs)?;
+
+    let viewed_pr = run_qit_with_env(
+        &["pr", "view", worktree.to_str().unwrap(), &pr_selector],
+        Some(&data_dir),
+    )?;
+    assert!(viewed_pr.contains("linked_issues:"));
+    assert!(viewed_pr.contains("#1 [closing via PR body] Broken login flow"));
+
+    let viewed_issue = run_qit_with_env(
+        &["issue", "view", worktree.to_str().unwrap(), &issue_selector],
+        Some(&data_dir),
+    )?;
+    assert!(viewed_issue.contains("linked_prs:"));
+    assert!(viewed_issue.contains("[closing via PR body]"));
+    assert!(viewed_issue.contains("Fix login flow"));
+
+    run_qit_with_env(
+        &["pr", "merge", worktree.to_str().unwrap(), &pr_selector],
+        Some(&data_dir),
+    )?;
+    let closed_issue = run_qit_with_env(
+        &["issue", "view", worktree.to_str().unwrap(), &issue_selector],
+        Some(&data_dir),
+    )?;
+    assert!(closed_issue.contains("#1 Broken login flow [closed]"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+#[test]
 fn auto_apply_skips_when_checked_out_branch_differs_from_served_branch() -> Result<()> {
     let root = TempDir::new()?;
     let data_dir = root.path().join("qit-data");
@@ -669,6 +1362,217 @@ fn auto_apply_skips_when_checked_out_branch_differs_from_served_branch() -> Resu
         std::fs::read_to_string(worktree.join("README.md"))?.replace("\r\n", "\n"),
         "feature branch\n"
     );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+#[test]
+fn settings_commands_manage_metadata_and_branch_rules() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("qit-data");
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "initial\n")?;
+
+    let port = free_port()?;
+    let (mut child, _rx) = spawn_qit_serve_with_env(&worktree, port, false, Some(&data_dir))?;
+    std::thread::sleep(Duration::from_secs(2));
+
+    let updated = run_qit_with_env(
+        &[
+            "settings",
+            "set",
+            worktree.to_str().unwrap(),
+            "--description",
+            "Demo repo",
+            "--homepage",
+            "https://example.com/docs",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(updated.contains("Demo repo"));
+    assert!(updated.contains("https://example.com/docs"));
+
+    let rules = run_qit_with_env(
+        &[
+            "settings",
+            "rule",
+            worktree.to_str().unwrap(),
+            "--pattern",
+            "main",
+            "--require-pr",
+            "--approvals",
+            "1",
+            "--dismiss-stale",
+            "--block-force-push",
+            "--block-delete",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(rules.contains("main: require PR"));
+    assert!(rules.contains("1 approval(s)"));
+    assert!(rules.contains("block force-push"));
+    assert!(rules.contains("block delete"));
+
+    let listed = run_qit_with_env(
+        &["settings", "view", worktree.to_str().unwrap()],
+        Some(&data_dir),
+    )?;
+    assert!(listed.contains("description: Demo repo"));
+    assert!(listed.contains("homepage: https://example.com/docs"));
+    assert!(listed.contains("main: require PR"));
+
+    let deleted = run_qit_with_env(
+        &[
+            "settings",
+            "rule",
+            worktree.to_str().unwrap(),
+            "--delete",
+            "main",
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(deleted.contains("deleted branch rule `main`"));
+    assert!(deleted.contains("branch rules:"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_based_auth_cli_and_git_flow_works_end_to_end() -> Result<()> {
+    let root = TempDir::new()?;
+    let data_dir = root.path().join("qit-data");
+    let worktree = root.path().join("host");
+    std::fs::create_dir_all(&worktree)?;
+    std::fs::write(worktree.join("README.md"), "initial\n")?;
+
+    let port = free_port()?;
+    let (mut child, rx) =
+        spawn_qit_serve_with_auth_mode(&worktree, port, Some(&data_dir), "request-based")?;
+    let legacy_clone_url = wait_for_clone_url(&rx)?;
+    assert!(!legacy_clone_url.contains('@'));
+
+    let client = reqwest::Client::new();
+    let request_url = format!("http://127.0.0.1:{port}/host/api/access-requests");
+    let request_response = client
+        .post(&request_url)
+        .header("content-type", "application/json")
+        .body(r#"{"name":"Alice","email":"alice@example.com"}"#)
+        .send()
+        .await?;
+    assert!(request_response.status().is_success());
+    let request_payload: serde_json::Value = request_response.json().await?;
+    let request_secret = request_payload["secret"]
+        .as_str()
+        .context("access request secret")?;
+    assert!(request_secret.starts_with("qit_request."));
+
+    let listed = run_qit_with_env(
+        &["auth", "requests", worktree.to_str().unwrap()],
+        Some(&data_dir),
+    )?;
+    let selector = listed
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed == "none"
+                || trimmed.starts_with("access requests for ")
+            {
+                return None;
+            }
+            trimmed.split_whitespace().next().map(ToString::to_string)
+        })
+        .context("parse request selector")?;
+
+    let approved = run_qit_with_env(
+        &[
+            "auth",
+            "requests",
+            worktree.to_str().unwrap(),
+            "--approve",
+            &selector,
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(approved.contains("no setup code") || approved.contains("qit_setup."));
+
+    let onboarding_response = client
+        .post(format!(
+            "http://127.0.0.1:{port}/host/api/onboarding/complete"
+        ))
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"token":"{}","username":"alice","password":"very-secret-pass"}}"#,
+            request_secret
+        ))
+        .send()
+        .await?;
+    assert!(onboarding_response.status().is_success());
+
+    let legacy = client.get(format!(
+        "http://127.0.0.1:{port}/host/info/refs?service=git-upload-pack"
+    ));
+    let legacy_url = Url::parse(&legacy_clone_url)?;
+    let legacy_response = legacy
+        .basic_auth(legacy_url.username(), legacy_url.password())
+        .send()
+        .await?;
+    assert_eq!(legacy_response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let request_based_response = client
+        .get(format!(
+            "http://127.0.0.1:{port}/host/info/refs?service=git-upload-pack"
+        ))
+        .basic_auth("alice", Some("very-secret-pass"))
+        .send()
+        .await?;
+    assert!(request_based_response.status().is_success());
+
+    let promoted = run_qit_with_env(
+        &[
+            "auth",
+            "users",
+            worktree.to_str().unwrap(),
+            "--promote",
+            "alice",
+        ],
+        Some(&data_dir),
+    );
+    assert!(promoted.is_err());
+
+    let users = run_qit_with_env(
+        &["auth", "users", worktree.to_str().unwrap()],
+        Some(&data_dir),
+    )?;
+    let user_selector = users
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed.contains("alice@example.com").then(|| {
+                trimmed
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        })
+        .context("parse user selector")?;
+    let promoted = run_qit_with_env(
+        &[
+            "auth",
+            "users",
+            worktree.to_str().unwrap(),
+            "--promote",
+            &user_selector,
+        ],
+        Some(&data_dir),
+    )?;
+    assert!(promoted.contains("promoted"));
 
     let _ = child.kill();
     let _ = child.wait();

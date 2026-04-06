@@ -1,0 +1,1209 @@
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { api } from './lib/api'
+import { getQueryParam, mergeQueryParams } from './lib/queryState'
+import type {
+  BlobContent,
+  BootstrapResponse,
+  BranchInfo,
+  CommitDetail,
+  CommitHistory,
+  IssueMetadataResponse,
+  IssueRecord,
+  PullRequestRecord,
+  RefDiffFile,
+  SettingsResponse,
+  TreeEntry,
+} from './lib/types'
+import { DashboardPage, LoginPage } from './components/pages/DashboardPage'
+import { PreviewPage } from './components/pages/PreviewPage'
+
+const HISTORY_PAGE_SIZE = 40
+const ACCESS_REQUEST_STORAGE_KEY = 'qit.pendingAccessRequest'
+
+type PendingAccessReceipt = {
+  id: string
+  secret: string
+  email: string
+}
+
+function randomLowerAlnum(len: number): string {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
+  const bytes = new Uint8Array(len)
+  crypto.getRandomValues(bytes)
+  let out = ''
+  for (let i = 0; i < len; i++) {
+    out += alphabet[bytes[i]! % alphabet.length]!
+  }
+  return out
+}
+
+function generateOnboardingPassword(): string {
+  return randomLowerAlnum(24)
+}
+
+function baseUsernameFromEmail(email: string): string {
+  const at = email.indexOf('@')
+  const local = (at >= 0 ? email.slice(0, at) : email).toLowerCase()
+  const cleaned = local
+    .replace(/[^a-z0-9._-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+  let base = cleaned.slice(0, 32)
+  if (base.length < 3) {
+    base = `usr_${randomLowerAlnum(10)}`.slice(0, 32)
+  }
+  return base
+}
+
+function usernameCandidatesForAccessRequest(email: string): string[] {
+  const base = baseUsernameFromEmail(email.trim())
+  const candidates = [base]
+  for (let i = 0; i < 8; i++) {
+    candidates.push(`${base.slice(0, 24)}_${randomLowerAlnum(4)}`.slice(0, 32))
+  }
+  return candidates
+}
+
+function isReadmeEntry(entry: TreeEntry) {
+  return entry.kind === 'blob' && /^readme(?:\.[a-z0-9]+)?$/i.test(entry.name)
+}
+
+function parentPath(path: string) {
+  const slash = path.lastIndexOf('/')
+  return slash === -1 ? '' : path.slice(0, slash)
+}
+
+function readPendingAccessReceipt(): PendingAccessReceipt | null {
+  try {
+    const raw = window.localStorage.getItem(ACCESS_REQUEST_STORAGE_KEY)
+    if (!raw) {
+      return null
+    }
+    const parsed = JSON.parse(raw) as Partial<PendingAccessReceipt>
+    return typeof parsed.id === 'string' && typeof parsed.secret === 'string'
+      ? {
+          id: parsed.id,
+          secret: parsed.secret,
+          email: typeof parsed.email === 'string' ? parsed.email : '',
+        }
+      : null
+  } catch {
+    return null
+  }
+}
+
+function writePendingAccessReceipt(receipt: PendingAccessReceipt | null) {
+  if (!receipt) {
+    window.localStorage.removeItem(ACCESS_REQUEST_STORAGE_KEY)
+    return
+  }
+  window.localStorage.setItem(ACCESS_REQUEST_STORAGE_KEY, JSON.stringify(receipt))
+}
+
+async function loadReadme(reference: string, entries: TreeEntry[]) {
+  const readmeEntry = entries.find(isReadmeEntry)
+  return readmeEntry ? api.blob(reference, readmeEntry.path) : null
+}
+
+async function loadOptionalBlob(reference: string, path: string) {
+  try {
+    return await api.blob(reference, path)
+  } catch {
+    return null
+  }
+}
+
+function App() {
+  const previewMode = useMemo(() => getQueryParam(window.location.search, 'preview'), [])
+  const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null)
+  const [settings, setSettings] = useState<SettingsResponse | null>(null)
+  const [branches, setBranches] = useState<BranchInfo[]>([])
+  const [history, setHistory] = useState<CommitHistory | null>(null)
+  const [commitDetail, setCommitDetail] = useState<CommitDetail | null>(null)
+  const [loadingCommitDetail, setLoadingCommitDetail] = useState(false)
+  const [selectedCommitId, setSelectedCommitId] = useState<string | null>(() => getQueryParam(window.location.search, 'commit'))
+  const [selectedBranch, setSelectedBranch] = useState<string | null>(() => getQueryParam(window.location.search, 'branch'))
+  const [treeCache, setTreeCache] = useState<Record<string, TreeEntry[]>>({})
+  const [readme, setReadme] = useState<BlobContent | null>(null)
+  const [codePath, setCodePath] = useState('')
+  const [codeTree, setCodeTree] = useState<TreeEntry[]>([])
+  const [blob, setBlob] = useState<BlobContent | null>(null)
+  const [commitTreeCache, setCommitTreeCache] = useState<Record<string, TreeEntry[]>>({})
+  const [commitReadme, setCommitReadme] = useState<BlobContent | null>(null)
+  const [commitCodePath, setCommitCodePath] = useState('')
+  const [commitCodeTree, setCommitCodeTree] = useState<TreeEntry[]>([])
+  const [commitActivePath, setCommitActivePath] = useState<string | null>(null)
+  const [commitBlob, setCommitBlob] = useState<BlobContent | null>(null)
+  const [commitDiff, setCommitDiff] = useState<RefDiffFile | null>(null)
+  const [issues, setIssues] = useState<IssueRecord[]>([])
+  const [issueMetadata, setIssueMetadata] = useState<IssueMetadataResponse>({
+    labels: [],
+    milestones: [],
+    assignees: [],
+  })
+  const [selectedIssueId, setSelectedIssueId] = useState<string | null>(() => getQueryParam(window.location.search, 'issue'))
+  const [pullRequests, setPullRequests] = useState<PullRequestRecord[]>([])
+  const [selectedPullRequestId, setSelectedPullRequestId] = useState<string | null>(() => getQueryParam(window.location.search, 'pr'))
+  const [loading, setLoading] = useState(true)
+  const [loadingMoreCommits, setLoadingMoreCommits] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [authError, setAuthError] = useState<string | null>(null)
+  const [requestMessage, setRequestMessage] = useState<string | null>(null)
+  const [setupMessage, setSetupMessage] = useState<string | null>(null)
+  const [requestReceipt, setRequestReceipt] = useState<PendingAccessReceipt | null>(() => readPendingAccessReceipt())
+  const [toastMessage, setToastMessage] = useState<string | null>(null)
+  const [highlightedIssueId, setHighlightedIssueId] = useState<string | null>(null)
+  const [highlightedPullRequestId, setHighlightedPullRequestId] = useState<string | null>(null)
+
+  const actor = bootstrap?.actor ?? null
+
+  const syncUrlState = useCallback((updates: Record<string, string | null>) => {
+    window.history.replaceState(
+      null,
+      '',
+      mergeQueryParams(window.location.pathname, window.location.search, updates),
+    )
+  }, [])
+
+  const pushUrlState = useCallback((updates: Record<string, string | null>) => {
+    window.history.pushState(
+      null,
+      '',
+      mergeQueryParams(window.location.pathname, window.location.search, updates),
+    )
+  }, [])
+
+  const loadAppState = useCallback(async () => {
+    const nextBootstrap = await api.bootstrap()
+    setBootstrap(nextBootstrap)
+
+    if (!nextBootstrap.actor) {
+      setSettings(null)
+      setBranches([])
+      setHistory(null)
+      setCommitDetail(null)
+      setSelectedCommitId(null)
+      setTreeCache({})
+      setReadme(null)
+      setCodePath('')
+      setCodeTree([])
+      setBlob(null)
+      setLoadingCommitDetail(false)
+      setCommitTreeCache({})
+      setCommitReadme(null)
+      setCommitCodePath('')
+      setCommitCodeTree([])
+      setCommitActivePath(null)
+      setCommitBlob(null)
+      setCommitDiff(null)
+      setIssues([])
+      setIssueMetadata({ labels: [], milestones: [], assignees: [] })
+      setSelectedIssueId(null)
+      setPullRequests([])
+      setSelectedPullRequestId(null)
+      return
+    }
+
+    const [nextSettings, nextBranches, nextIssues, nextIssueMetadata, nextPullRequests] = await Promise.all([
+      api.settings(),
+      api.branches(),
+      api.issues(),
+      api.issueMetadata(),
+      api.pullRequests(),
+    ])
+
+    setSettings(nextSettings)
+    setBranches(nextBranches)
+    setIssues(nextIssues)
+    setIssueMetadata(nextIssueMetadata)
+    setPullRequests(nextPullRequests)
+
+    const nextSelectedIssueId =
+      selectedIssueId && nextIssues.some((issue) => issue.id === selectedIssueId) ? selectedIssueId : null
+    const nextSelectedPullRequestId =
+      selectedPullRequestId && nextPullRequests.some((pullRequest) => pullRequest.id === selectedPullRequestId)
+        ? selectedPullRequestId
+        : null
+
+    if (nextSelectedIssueId) {
+      setSelectedIssueId(nextSelectedIssueId)
+      setSelectedPullRequestId(null)
+      setSelectedCommitId(null)
+      setCommitDetail(null)
+      setLoadingCommitDetail(false)
+      setCommitTreeCache({})
+      setCommitReadme(null)
+      setCommitCodePath('')
+      setCommitCodeTree([])
+      setCommitActivePath(null)
+      setCommitBlob(null)
+      setCommitDiff(null)
+      return
+    }
+
+    if (nextSelectedPullRequestId) {
+      setSelectedPullRequestId(nextSelectedPullRequestId)
+      setSelectedIssueId(null)
+      setSelectedCommitId(null)
+      setCommitDetail(null)
+      setLoadingCommitDetail(false)
+      setCommitTreeCache({})
+      setCommitReadme(null)
+      setCommitCodePath('')
+      setCommitCodeTree([])
+      setCommitActivePath(null)
+      setCommitBlob(null)
+      setCommitDiff(null)
+      return
+    }
+
+    setSelectedIssueId(null)
+    setSelectedPullRequestId(null)
+  }, [selectedIssueId, selectedPullRequestId])
+
+  useEffect(() => {
+    const run = async () => {
+      setLoading(true)
+      setError(null)
+      try {
+        await loadAppState()
+      } catch (loadError) {
+        setError(loadError instanceof Error ? loadError.message : 'failed to load UI state')
+      } finally {
+        setLoading(false)
+      }
+    }
+    void run()
+  }, [loadAppState])
+
+  useEffect(() => {
+    if (!toastMessage) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setToastMessage(null)
+    }, 3500)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [toastMessage])
+
+  useEffect(() => {
+    if (actor) {
+      return
+    }
+    if (!bootstrap || !requestReceipt) {
+      return
+    }
+    if (!bootstrap.auth_methods.includes('request_access') || !bootstrap.auth_methods.includes('setup_token')) {
+      return
+    }
+
+    let cancelled = false
+    let timeoutId: number | null = null
+
+    const poll = async () => {
+      try {
+        const progress = await api.accessRequestStatus(requestReceipt.secret)
+        if (cancelled) {
+          return
+        }
+
+        if (progress.status === 'approved') {
+          setAuthError(null)
+          setRequestMessage('Request approved. Finishing sign-in…')
+          const receipt = requestReceipt
+          if (!receipt) {
+            return
+          }
+          const password = generateOnboardingPassword()
+          const candidates = usernameCandidatesForAccessRequest(receipt.email)
+          let completed = false
+          let lastError: unknown
+          for (const username of candidates) {
+            try {
+              await api.completeOnboarding(receipt.secret, username, password)
+              completed = true
+              break
+            } catch (error) {
+              lastError = error
+            }
+          }
+          if (!completed) {
+            setAuthError(
+              lastError instanceof Error
+                ? lastError.message
+                : 'Automatic sign-in failed after approval.',
+            )
+            setRequestMessage(
+              'Your request was approved, but automatic sign-in failed. Ask an owner for a one-time setup code and use the “Use setup code” tab.',
+            )
+            return
+          }
+          writePendingAccessReceipt(null)
+          setRequestReceipt(null)
+          setRequestMessage(null)
+          setSetupMessage(null)
+          setError(null)
+          try {
+            await loadAppState()
+          } catch (loadError) {
+            setError(loadError instanceof Error ? loadError.message : 'failed to load UI state')
+          }
+          return
+        }
+
+        if (progress.status === 'rejected' || progress.status === 'revoked') {
+          writePendingAccessReceipt(null)
+          setRequestReceipt(null)
+          setRequestMessage(null)
+          setSetupMessage(null)
+          setAuthError('Your access request was not approved.')
+          return
+        }
+
+        setRequestMessage('Access request sent. Waiting for the owner to approve…')
+        timeoutId = window.setTimeout(() => {
+          void poll()
+        }, 2500)
+      } catch {
+        if (cancelled) {
+          return
+        }
+        timeoutId = window.setTimeout(() => {
+          void poll()
+        }, 4000)
+      }
+    }
+
+    setRequestMessage('Access request sent. Waiting for the owner to approve…')
+    void poll()
+
+    return () => {
+      cancelled = true
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId)
+      }
+    }
+  }, [actor, bootstrap, loadAppState, requestReceipt])
+
+  useEffect(() => {
+    if (!highlightedIssueId) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setHighlightedIssueId(null)
+    }, 5000)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [highlightedIssueId])
+
+  useEffect(() => {
+    if (!highlightedPullRequestId) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setHighlightedPullRequestId(null)
+    }, 5000)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [highlightedPullRequestId])
+
+  useEffect(() => {
+    syncUrlState({
+      branch: selectedBranch,
+      commit: selectedCommitId,
+      issue: selectedIssueId,
+      pr: selectedPullRequestId,
+    })
+  }, [selectedBranch, selectedCommitId, selectedIssueId, selectedPullRequestId, syncUrlState])
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setSelectedBranch(getQueryParam(window.location.search, 'branch'))
+      setSelectedCommitId(getQueryParam(window.location.search, 'commit'))
+      setSelectedIssueId(getQueryParam(window.location.search, 'issue'))
+      setSelectedPullRequestId(getQueryParam(window.location.search, 'pr'))
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  const refresh = useCallback(async () => {
+    setError(null)
+    await loadAppState()
+  }, [loadAppState])
+
+  const selectedBranchExists = useMemo(
+    () => (selectedBranch ? branches.some((branch) => branch.name === selectedBranch) : false),
+    [branches, selectedBranch],
+  )
+
+  const currentRef = useMemo(
+    () => {
+      if (!bootstrap) {
+        return null
+      }
+
+      if (selectedBranch) {
+        if (loading) {
+          return null
+        }
+
+        return selectedBranchExists ? selectedBranch : bootstrap.checked_out_branch ?? bootstrap.exported_branch
+      }
+
+      return bootstrap.checked_out_branch ?? bootstrap.exported_branch
+    },
+    [bootstrap, loading, selectedBranch, selectedBranchExists],
+  )
+
+  useEffect(() => {
+    if (!bootstrap || loading || !selectedBranch) {
+      return
+    }
+
+    if (selectedBranch === bootstrap.checked_out_branch || !selectedBranchExists) {
+      setSelectedBranch(null)
+    }
+  }, [bootstrap, loading, selectedBranch, selectedBranchExists])
+
+  useEffect(() => {
+    if (!actor || !currentRef) {
+      setHistory(null)
+      return
+    }
+
+    let cancelled = false
+
+    const run = async () => {
+      setHistory(null)
+      try {
+        const nextHistory = await api.commits(currentRef, 0, HISTORY_PAGE_SIZE)
+        if (!cancelled) {
+          setHistory(nextHistory)
+        }
+      } catch (loadError) {
+        if (!cancelled) {
+          setHistory(null)
+          setError(loadError instanceof Error ? loadError.message : 'failed to load commit history')
+        }
+      }
+    }
+
+    void run()
+    return () => {
+      cancelled = true
+    }
+  }, [actor, currentRef])
+
+  useEffect(() => {
+    if (!actor || !currentRef) {
+      setTreeCache({})
+      setReadme(null)
+      setCodePath('')
+      setCodeTree([])
+      setBlob(null)
+      return
+    }
+
+    let cancelled = false
+
+    const run = async () => {
+      setTreeCache({})
+      setReadme(null)
+      setCodePath('')
+      setCodeTree([])
+      setBlob(null)
+
+      try {
+        const nextRootTree = await api.tree(currentRef)
+        const nextReadme = await loadReadme(currentRef, nextRootTree)
+
+        if (cancelled) {
+          return
+        }
+
+        setTreeCache({ '': nextRootTree })
+        setReadme(nextReadme)
+        setCodePath('')
+        setCodeTree(nextRootTree)
+        setBlob(null)
+      } catch (loadError) {
+        if (!cancelled) {
+          setTreeCache({})
+          setReadme(null)
+          setCodePath('')
+          setCodeTree([])
+          setBlob(null)
+          setError(loadError instanceof Error ? loadError.message : 'failed to load code browser')
+        }
+      }
+    }
+
+    void run()
+    return () => {
+      cancelled = true
+    }
+  }, [actor, currentRef])
+
+  const loadTreePath = useCallback(
+    async (path: string, force = false) => {
+      if (!currentRef) {
+        return []
+      }
+
+      if (!force) {
+        const cachedEntries = treeCache[path]
+        if (cachedEntries) {
+          return cachedEntries
+        }
+      }
+
+      const entries = await api.tree(currentRef, path || undefined)
+      setTreeCache((previous) => ({ ...previous, [path]: entries }))
+      return entries
+    },
+    [currentRef, treeCache],
+  )
+
+  const browseTree = useCallback(
+    async (path: string) => {
+      if (!currentRef) {
+        return
+      }
+
+      const nextTree = await loadTreePath(path)
+      const readmeEntry = nextTree.find(isReadmeEntry)
+      setCodePath(path)
+      setCodeTree(nextTree)
+      setReadme(readmeEntry ? await api.blob(currentRef, readmeEntry.path) : null)
+      setBlob(null)
+    },
+    [currentRef, loadTreePath],
+  )
+
+  const openBlob = useCallback(
+    async (path: string) => {
+      if (!currentRef) {
+        return
+      }
+
+      const nextPath = parentPath(path)
+      const [nextTree, nextBlob] = await Promise.all([
+        loadTreePath(nextPath),
+        api.blob(currentRef, path),
+      ])
+      setCodePath(nextPath)
+      setCodeTree(nextTree)
+      setBlob(nextBlob)
+    },
+    [currentRef, loadTreePath],
+  )
+
+  const loadCommitTreePath = useCallback(
+    async (path: string, force = false) => {
+      if (!selectedCommitId) {
+        return []
+      }
+
+      if (!force) {
+        const cachedEntries = commitTreeCache[path]
+        if (cachedEntries) {
+          return cachedEntries
+        }
+      }
+
+      const entries = await api.tree(selectedCommitId, path || undefined)
+      setCommitTreeCache((previous) => ({ ...previous, [path]: entries }))
+      return entries
+    },
+    [commitTreeCache, selectedCommitId],
+  )
+
+  const browseCommitTree = useCallback(
+    async (path: string) => {
+      if (!selectedCommitId) {
+        return
+      }
+
+      const nextTree = await loadCommitTreePath(path)
+      setCommitCodePath(path)
+      setCommitCodeTree(nextTree)
+      setCommitReadme(await loadReadme(selectedCommitId, nextTree))
+      setCommitActivePath(null)
+      setCommitBlob(null)
+      setCommitDiff(null)
+    },
+    [loadCommitTreePath, selectedCommitId],
+  )
+
+  const openCommitBlob = useCallback(
+    async (path: string, detailOverride?: CommitDetail | null) => {
+      const commitRef = selectedCommitId
+      if (!commitRef) {
+        return
+      }
+
+      const detailForPath = detailOverride ?? commitDetail
+      const nextPath = parentPath(path)
+      const change = detailForPath?.changes.find((entry) => entry.path === path) ?? null
+      const parentCommit = detailForPath?.parents[0] ?? null
+      const [nextTree, nextBlob, originalBlob] = await Promise.all([
+        loadCommitTreePath(nextPath, Boolean(detailOverride)),
+        loadOptionalBlob(commitRef, path),
+        change && parentCommit ? loadOptionalBlob(parentCommit, path) : Promise.resolve(null),
+      ])
+      setCommitCodePath(nextPath)
+      setCommitCodeTree(nextTree)
+      setCommitActivePath(path)
+      setCommitBlob(nextBlob)
+      setCommitDiff(
+        change
+          ? {
+              path,
+              previous_path: null,
+              status: change.status,
+              additions: change.additions,
+              deletions: change.deletions,
+              original: originalBlob,
+              modified: nextBlob,
+            }
+          : null,
+      )
+    },
+    [commitDetail, loadCommitTreePath, selectedCommitId],
+  )
+
+  useEffect(() => {
+    if (!selectedCommitId) {
+      setCommitDetail(null)
+      setLoadingCommitDetail(false)
+      setCommitTreeCache({})
+      setCommitReadme(null)
+      setCommitCodePath('')
+      setCommitCodeTree([])
+      setCommitActivePath(null)
+      setCommitBlob(null)
+      setCommitDiff(null)
+      return
+    }
+
+    let cancelled = false
+
+    const run = async () => {
+      setLoadingCommitDetail(true)
+      setCommitTreeCache({})
+      setCommitReadme(null)
+      setCommitCodePath('')
+      setCommitCodeTree([])
+      setCommitActivePath(null)
+      setCommitBlob(null)
+      setCommitDiff(null)
+      try {
+        const [nextDetail, nextRootTree] = await Promise.all([
+          api.commit(selectedCommitId),
+          api.tree(selectedCommitId),
+        ])
+        const nextReadme = await loadReadme(selectedCommitId, nextRootTree)
+
+        if (cancelled) {
+          return
+        }
+
+        setCommitDetail(nextDetail)
+        setCommitTreeCache({ '': nextRootTree })
+        setCommitReadme(nextReadme)
+        setCommitCodePath('')
+        setCommitCodeTree(nextRootTree)
+        setCommitActivePath(null)
+        setCommitBlob(null)
+        setCommitDiff(null)
+        const firstChangedFile = nextDetail.changes.find((change) => !change.status.toLowerCase().includes('rename from'))
+        if (firstChangedFile) {
+          const nextPath = parentPath(firstChangedFile.path)
+          const parentCommit = nextDetail.parents[0] ?? null
+          const [nextTree, nextBlob, originalBlob] = await Promise.all([
+            nextPath ? api.tree(selectedCommitId, nextPath) : Promise.resolve(nextRootTree),
+            loadOptionalBlob(selectedCommitId, firstChangedFile.path),
+            parentCommit ? loadOptionalBlob(parentCommit, firstChangedFile.path) : Promise.resolve(null),
+          ])
+
+          if (cancelled) {
+            return
+          }
+
+          setCommitTreeCache(nextPath ? { '': nextRootTree, [nextPath]: nextTree } : { '': nextRootTree })
+          setCommitCodePath(nextPath)
+          setCommitCodeTree(nextTree)
+          setCommitActivePath(firstChangedFile.path)
+          setCommitBlob(nextBlob)
+          setCommitDiff({
+            path: firstChangedFile.path,
+            previous_path: null,
+            status: firstChangedFile.status,
+            additions: firstChangedFile.additions,
+            deletions: firstChangedFile.deletions,
+            original: originalBlob,
+            modified: nextBlob,
+          })
+          return
+        }
+      } catch (loadError) {
+        if (cancelled) {
+          return
+        }
+
+        setCommitDetail(null)
+        setCommitTreeCache({})
+        setCommitReadme(null)
+        setCommitCodePath('')
+        setCommitCodeTree([])
+        setCommitActivePath(null)
+        setCommitBlob(null)
+        setCommitDiff(null)
+        setError(loadError instanceof Error ? loadError.message : 'failed to load commit snapshot')
+      } finally {
+        if (!cancelled) {
+          setLoadingCommitDetail(false)
+        }
+      }
+    }
+
+    void run()
+    return () => {
+      cancelled = true
+    }
+  }, [selectedCommitId])
+
+  if (previewMode === 'ui') {
+    return <PreviewPage />
+  }
+
+  if (loading && !bootstrap) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-canvas text-fg">
+        <p className="text-sm text-fg-muted">Loading Qit…</p>
+      </div>
+    )
+  }
+
+  if (!bootstrap) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-canvas text-danger">
+        <p>{error ?? 'Failed to load this Qit session.'}</p>
+      </div>
+    )
+  }
+
+  if (!actor) {
+    return (
+      <LoginPage
+        bootstrap={bootstrap}
+        error={authError}
+        requestMessage={requestMessage}
+        setupMessage={setupMessage}
+        onLogin={async (username, password) => {
+          setAuthError(null)
+          try {
+            await api.login(username, password)
+            await refresh()
+          } catch (loginError) {
+            setAuthError(loginError instanceof Error ? loginError.message : 'Unable to start the session.')
+          }
+        }}
+        onRequestAccess={async (name, email) => {
+          setAuthError(null)
+          setSetupMessage(null)
+          try {
+            const submitted = await api.requestAccess(name, email)
+            const receipt = { id: submitted.request.id, secret: submitted.secret, email: submitted.request.email }
+            writePendingAccessReceipt(receipt)
+            setRequestReceipt(receipt)
+            setRequestMessage('Access request sent. Waiting for the owner to approve…')
+          } catch (requestError) {
+            setAuthError(requestError instanceof Error ? requestError.message : 'Unable to send the access request.')
+          }
+        }}
+        onCompleteOnboarding={async (token, username, password) => {
+          setAuthError(null)
+          setSetupMessage(null)
+          try {
+            await api.completeOnboarding(token, username, password)
+            writePendingAccessReceipt(null)
+            setRequestReceipt(null)
+            setSetupMessage('Setup complete. Signing you in…')
+            await refresh()
+          } catch (setupError) {
+            setAuthError(setupError instanceof Error ? setupError.message : 'Unable to complete setup.')
+          }
+        }}
+      />
+    )
+  }
+
+  return (
+    <div>
+      {error ? (
+        <div className="border-b border-danger/40 bg-danger/12 px-6 py-3 text-sm text-danger">
+          {error}
+        </div>
+      ) : null}
+      {toastMessage ? (
+        <div className="fixed right-4 top-4 z-40 max-w-sm rounded-token border border-success bg-success px-4 py-3 text-sm text-canvas shadow-panel" role="status">
+          {toastMessage}
+        </div>
+      ) : null}
+      <DashboardPage
+        activeBlob={blob}
+        actor={actor}
+        bootstrap={bootstrap}
+        branches={branches}
+        commitDetail={commitDetail}
+        commitSnapshotBlob={commitBlob}
+        commitSnapshotDiff={commitDiff}
+        commitSnapshotActivePath={commitActivePath}
+        commitSnapshotPath={commitCodePath}
+        commitSnapshotReadme={commitReadme}
+        commitSnapshotTree={commitCodeTree}
+        commitSnapshotTreeCache={commitTreeCache}
+        codePath={codePath}
+        codeTree={codeTree}
+        history={history}
+        highlightedIssueId={highlightedIssueId}
+        highlightedPullRequestId={highlightedPullRequestId}
+        issueMetadata={issueMetadata}
+        issues={issues}
+        loadingCommitDetail={loadingCommitDetail}
+        loadingMoreCommits={loadingMoreCommits}
+        selectedBranch={selectedBranchExists ? selectedBranch : null}
+        selectedIssueId={selectedIssueId}
+        selectedPullRequestId={selectedPullRequestId}
+        treeCache={treeCache}
+        onCheckoutBranch={async (name) => {
+          await api.checkoutBranch(name, false)
+          await refresh()
+        }}
+        onCreateBranch={async (name, startPoint, force) => {
+          await api.createBranch(name, startPoint, force)
+          await refresh()
+        }}
+        onDeleteBranchRule={async (pattern) => {
+          await api.deleteBranchRule(pattern)
+          setToastMessage(`Branch rule "${pattern}" deleted.`)
+          await refresh()
+        }}
+        onUpdateAuthMethods={async (methods) => {
+          await api.updateAuthMethods(methods)
+          setToastMessage(`Auth methods updated to "${methods.join(', ').replaceAll('_', '-') || 'none'}".`)
+          await refresh()
+        }}
+        onApproveAccessRequest={async (id) => {
+          const issued = await api.approveAccessRequest(id)
+          setToastMessage(
+            issued.secret
+              ? `Approved ${issued.email}. Share the one-time setup code now.`
+              : `Approved ${issued.email}. They can finish signing in from their pending request browser tab.`,
+          )
+          await refresh()
+          return issued
+        }}
+        onRejectAccessRequest={async (id) => {
+          await api.rejectAccessRequest(id)
+          setToastMessage('Access request rejected.')
+          await refresh()
+        }}
+        onPromoteUser={async (id) => {
+          await api.promoteUser(id)
+          setToastMessage('User promoted to owner.')
+          await refresh()
+        }}
+        onDemoteUser={async (id) => {
+          await api.demoteUser(id)
+          setToastMessage('Owner demoted to user.')
+          await refresh()
+        }}
+        onRevokeUser={async (id) => {
+          await api.revokeUser(id)
+          setToastMessage('User revoked.')
+          await refresh()
+        }}
+        onIssueSetupToken={async (name, email) => {
+          const issued = await api.issueSetupToken(name, email)
+          setToastMessage(`Created a setup code for ${issued.email}. Share it now.`)
+          await refresh()
+          return issued
+        }}
+        onResetUserSetup={async (id) => {
+          const issued = await api.resetUserSetup(id)
+          setToastMessage(`Reset setup for ${issued.email}. Share the new setup code now.`)
+          await refresh()
+          return issued
+        }}
+        onCreatePat={async (label) => {
+          const issued = await api.createPat(label)
+          setToastMessage(`Created PAT "${issued.label}".`)
+          await refresh()
+          return issued
+        }}
+        onLogout={async () => {
+          await api.logout()
+          setAuthError(null)
+          setError(null)
+          await refresh()
+        }}
+        onRevokePat={async (id) => {
+          await api.revokePat(id)
+          setToastMessage('PAT revoked.')
+          await refresh()
+        }}
+        onCreateIssue={async (payload) => {
+          const createdIssue = await api.createIssue(payload)
+          setIssues((current) => {
+            const nextIssues = current.filter((issue) => issue.id !== createdIssue.id)
+            return [createdIssue, ...nextIssues]
+          })
+          setSelectedIssueId(createdIssue.id)
+          setHighlightedIssueId(createdIssue.id)
+          setToastMessage(`Issue #${createdIssue.number} created.`)
+          void refresh().catch((loadError) => {
+            setError(loadError instanceof Error ? loadError.message : 'failed to refresh UI state')
+          })
+          return createdIssue
+        }}
+        onCreatePullRequest={async (payload) => {
+          const createdPullRequest = await api.createPullRequest(payload)
+          setPullRequests((current) => {
+            const nextPullRequests = current.filter((pullRequest) => pullRequest.id !== createdPullRequest.id)
+            return [createdPullRequest, ...nextPullRequests]
+          })
+          setSelectedPullRequestId(createdPullRequest.id)
+          setHighlightedPullRequestId(createdPullRequest.id)
+          setToastMessage(`Pull request "${createdPullRequest.title}" created.`)
+          void refresh().catch((loadError) => {
+            setError(loadError instanceof Error ? loadError.message : 'failed to refresh UI state')
+          })
+          return createdPullRequest
+        }}
+        onDeleteBranch={async (name) => {
+          await api.deleteBranch(name)
+          await refresh()
+        }}
+        onDeleteIssue={async (id) => {
+          const deletedIssue = await api.deleteIssue(id)
+          if (selectedIssueId === id) {
+            setSelectedIssueId(null)
+          }
+          setToastMessage(`Issue #${deletedIssue.number} deleted.`)
+          await refresh()
+          return deletedIssue
+        }}
+        onDeleteIssueLabel={async (id) => {
+          await api.deleteIssueLabel(id)
+          setToastMessage('Issue label deleted.')
+          await refresh()
+        }}
+        onDeleteIssueMilestone={async (id) => {
+          await api.deleteIssueMilestone(id)
+          setToastMessage('Issue milestone deleted.')
+          await refresh()
+        }}
+        onDeletePullRequest={async (id) => {
+          const deletedPullRequest = await api.deletePullRequest(id)
+          if (selectedPullRequestId === id) {
+            setSelectedPullRequestId(null)
+          }
+          setToastMessage(`Pull request "${deletedPullRequest.title}" deleted.`)
+          await refresh()
+          return deletedPullRequest
+        }}
+        onMergePullRequest={async (id) => {
+          await api.mergePullRequest(id)
+          await refresh()
+        }}
+        onCommentIssue={async (id, payload) => {
+          const updatedIssue = await api.commentIssue(id, payload)
+          await refresh()
+          return updatedIssue
+        }}
+        onReactIssue={async (id, payload) => {
+          const updatedIssue = await api.reactIssue(id, payload)
+          await refresh()
+          return updatedIssue
+        }}
+        onReactIssueComment={async (id, commentId, payload) => {
+          const updatedIssue = await api.reactIssueComment(id, commentId, payload)
+          await refresh()
+          return updatedIssue
+        }}
+        onReviewPullRequest={async (id, payload) => {
+          const updatedPullRequest = await api.reviewPullRequest(id, payload)
+          await refresh()
+          return updatedPullRequest
+        }}
+        onLoadMoreCommits={async () => {
+          if (!currentRef || !history || !history.has_more) {
+            return
+          }
+
+          setLoadingMoreCommits(true)
+          try {
+            const nextHistory = await api.commits(
+              currentRef,
+              history.offset + history.commits.length,
+              history.limit,
+            )
+            setHistory((previous) =>
+              previous
+                ? {
+                    ...nextHistory,
+                    offset: previous.offset,
+                    commits: [...previous.commits, ...nextHistory.commits],
+                  }
+                : nextHistory,
+            )
+          } finally {
+            setLoadingMoreCommits(false)
+          }
+        }}
+        onBrowseTree={async (path) => {
+          await browseTree(path)
+        }}
+        onLoadTreePath={loadTreePath}
+        onOpenTreeEntry={async (entry) => {
+          if (entry.kind === 'tree') {
+            await browseTree(entry.path)
+            return
+          }
+
+          await openBlob(entry.path)
+        }}
+        onBrowseCommitTree={async (path) => {
+          await browseCommitTree(path)
+        }}
+        onLoadCommitTreePath={loadCommitTreePath}
+        onOpenCommitTreeEntry={async (entry) => {
+          if (entry.kind === 'tree') {
+            await browseCommitTree(entry.path)
+            return
+          }
+
+          await openCommitBlob(entry.path)
+        }}
+        onViewBranchCode={(name) => {
+          const nextBranch = name === bootstrap.checked_out_branch ? null : name
+          pushUrlState({ branch: nextBranch, commit: null, issue: null, pr: null, tab: 'code' })
+          setSelectedCommitId(null)
+          setCommitDetail(null)
+          setSelectedIssueId(null)
+          setSelectedPullRequestId(null)
+          setSelectedBranch(nextBranch)
+        }}
+        onSelectCommit={(commit) => {
+          pushUrlState({ commit, issue: null, pr: null })
+          setSelectedIssueId(null)
+          setSelectedPullRequestId(null)
+          setSelectedCommitId(commit)
+        }}
+        onClearSelectedCommit={() => {
+          pushUrlState({ commit: null })
+          setSelectedCommitId(null)
+        }}
+        onSelectIssue={(id) => {
+          pushUrlState({ commit: null, issue: id, pr: null })
+          setSelectedCommitId(null)
+          setCommitDetail(null)
+          setSelectedPullRequestId(null)
+          setSelectedIssueId(id)
+        }}
+        onClearSelectedIssue={() => {
+          pushUrlState({ issue: null })
+          setSelectedIssueId(null)
+        }}
+        onSelectPullRequest={(id) => {
+          pushUrlState({ commit: null, issue: null, pr: id })
+          setSelectedCommitId(null)
+          setCommitDetail(null)
+          setSelectedIssueId(null)
+          setSelectedPullRequestId(id)
+        }}
+        onClearSelectedPullRequest={() => {
+          pushUrlState({ pr: null })
+          setSelectedPullRequestId(null)
+        }}
+        onCommentPullRequest={async (id, payload) => {
+          const updatedPullRequest = await api.commentPullRequest(id, payload)
+          await refresh()
+          return updatedPullRequest
+        }}
+        onSwitchBranch={async (name) => {
+          await api.switchBranch(name)
+          setToastMessage(`Default branch switched to "${name}".`)
+          await refresh()
+        }}
+        onSetIssueLabels={async (id, labelIds) => {
+          const updatedIssue = await api.setIssueLabels(id, labelIds)
+          await refresh()
+          return updatedIssue
+        }}
+        onSetIssueAssignees={async (id, assigneeUserIds) => {
+          const updatedIssue = await api.setIssueAssignees(id, assigneeUserIds)
+          await refresh()
+          return updatedIssue
+        }}
+        onSetIssueMilestone={async (id, milestoneId) => {
+          const updatedIssue = await api.setIssueMilestone(id, milestoneId)
+          await refresh()
+          return updatedIssue
+        }}
+        onLinkIssuePullRequest={async (id, pullRequestId) => {
+          const updatedIssue = await api.linkIssuePullRequest(id, pullRequestId)
+          await refresh()
+          return updatedIssue
+        }}
+        onUnlinkIssuePullRequest={async (id, pullRequestId) => {
+          const updatedIssue = await api.unlinkIssuePullRequest(id, pullRequestId)
+          await refresh()
+          return updatedIssue
+        }}
+        onUpsertIssueLabel={async (payload) => {
+          await api.upsertIssueLabel(payload)
+          await refresh()
+        }}
+        onUpsertIssueMilestone={async (payload) => {
+          await api.upsertIssueMilestone(payload)
+          await refresh()
+        }}
+        onUpdateBranchRule={async (payload) => {
+          await api.upsertBranchRule(payload)
+          setToastMessage(`Branch rule "${payload.pattern}" saved.`)
+          await refresh()
+        }}
+        onUpdateSettings={async (payload) => {
+          await api.updateSettings(payload)
+          setToastMessage('Repository settings saved.')
+          await refresh()
+        }}
+        onUpdatePullRequest={async (id, payload) => {
+          const updatedPullRequest = await api.updatePullRequest(id, payload)
+          await refresh()
+          return updatedPullRequest
+        }}
+        onUpdateIssue={async (id, payload) => {
+          const updatedIssue = await api.updateIssue(id, payload)
+          await refresh()
+          return updatedIssue
+        }}
+        pullRequests={pullRequests}
+        readme={readme}
+        selectedCommitId={selectedCommitId}
+        settings={settings}
+      />
+    </div>
+  )
+}
+
+export default App
