@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "qit"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "qit-domain"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1798,7 +1798,7 @@ dependencies = [
 
 [[package]]
 name = "qit-git"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "dunce",
@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "qit-http"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "qit-http-backend"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "qit-storage"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "directories",
  "dunce",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "qit-tests"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1875,7 +1875,7 @@ dependencies = [
 
 [[package]]
 name = "qit-transports"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "qit-webui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "axum",

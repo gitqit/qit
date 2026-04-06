@@ -410,15 +410,11 @@ pub fn authorize(headers: &HeaderMap, credentials: &SessionCredentials) -> bool 
 }
 
 fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
-    let Some(header) = headers.get(axum::http::header::AUTHORIZATION) else {
-        return None;
-    };
+    let header = headers.get(axum::http::header::AUTHORIZATION)?;
     let Ok(header) = header.to_str() else {
         return None;
     };
-    let Some(encoded) = header.strip_prefix("Basic ") else {
-        return None;
-    };
+    let encoded = header.strip_prefix("Basic ")?;
     let Ok(decoded) = BASE64.decode(encoded) else {
         return None;
     };

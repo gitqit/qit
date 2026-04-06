@@ -827,6 +827,7 @@ impl WorkspaceService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_auth_activity(
         auth: &mut RepoAuthState,
         actor: &AuthActor,
@@ -1001,6 +1002,7 @@ impl WorkspaceService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_activity(
         pull_request: &mut PullRequestRecord,
         kind: PullRequestActivityKind,
@@ -1223,6 +1225,7 @@ impl WorkspaceService {
         Ok(normalized)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_issue_timeline_event(
         issue: &mut IssueRecord,
         kind: IssueTimelineEventKind,

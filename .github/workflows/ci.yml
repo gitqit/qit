@@ -86,6 +86,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/qit-webui/frontend/package-lock.json
+      - name: Install Web UI frontend dependencies
+        working-directory: crates/qit-webui/frontend
+        run: npm ci
+      - name: Build Web UI frontend bundle
+        working-directory: crates/qit-webui/frontend
+        run: npm run build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -114,6 +125,17 @@ jobs:
             runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/qit-webui/frontend/package-lock.json
+      - name: Install Web UI frontend dependencies
+        working-directory: crates/qit-webui/frontend
+        run: npm ci
+      - name: Build Web UI frontend bundle
+        working-directory: crates/qit-webui/frontend
+        run: npm run build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace
@@ -140,6 +162,17 @@ jobs:
             runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/qit-webui/frontend/package-lock.json
+      - name: Install Web UI frontend dependencies
+        working-directory: crates/qit-webui/frontend
+        run: npm ci
+      - name: Build Web UI frontend bundle
+        working-directory: crates/qit-webui/frontend
+        run: npm run build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test workspace
@@ -179,6 +212,17 @@ jobs:
             archive_extension: zip
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/qit-webui/frontend/package-lock.json
+      - name: Install Web UI frontend dependencies
+        working-directory: crates/qit-webui/frontend
+        run: npm ci
+      - name: Build Web UI frontend bundle
+        working-directory: crates/qit-webui/frontend
+        run: npm run build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary

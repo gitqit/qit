@@ -88,6 +88,7 @@ pub fn write_credentials_file(
     Ok(Some(path))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn print_serve_summary(
     worktree: &Path,
     exported_branch: &str,
