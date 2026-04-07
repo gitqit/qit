@@ -21,7 +21,6 @@ export function LandingPage() {
   return (
     <LandingShell
       ctaHref={installCta.href}
-      ctaLabel={installCta.label}
       navItems={[
         { href: '#features', label: 'Features' },
         { href: '#preview', label: 'Preview' },

@@ -16,11 +16,11 @@ export function SectionIntro({
   align?: 'left' | 'center'
 }) {
   return (
-    <div className={classNames('space-y-3', align === 'center' ? 'mx-auto max-w-3xl text-center' : 'max-w-2xl')}>
+    <div className={classNames('space-y-2.5 sm:space-y-3', align === 'center' ? 'mx-auto max-w-3xl text-center' : 'max-w-2xl')}>
       <SectionEyebrow>{eyebrow}</SectionEyebrow>
       <div className="space-y-2">
-        <h2 className="text-3xl font-black tracking-tight text-ink sm:text-4xl">{title}</h2>
-        <p className="text-base leading-7 text-ink-muted sm:text-lg">{description}</p>
+        <h2 className="text-2xl font-black tracking-tight text-ink sm:text-3xl lg:text-4xl">{title}</h2>
+        <p className="text-[15px] leading-7 text-ink-muted sm:text-lg">{description}</p>
       </div>
     </div>
   )
@@ -42,10 +42,16 @@ export function HeroActions({
 
   return (
     <div className="flex flex-col gap-2.5 sm:flex-row">
-      <ButtonLink href={primaryHref} rel={primaryIsExternal ? 'noreferrer' : undefined} target={primaryIsExternal ? '_blank' : undefined}>
+      <ButtonLink
+        className="w-full sm:w-auto"
+        href={primaryHref}
+        rel={primaryIsExternal ? 'noreferrer' : undefined}
+        target={primaryIsExternal ? '_blank' : undefined}
+      >
         {primaryLabel}
       </ButtonLink>
       <ButtonLink
+        className="w-full sm:w-auto"
         href={secondaryHref}
         rel={secondaryIsExternal ? 'noreferrer' : undefined}
         target={secondaryIsExternal ? '_blank' : undefined}
@@ -90,7 +96,7 @@ export function FaqItem({
     <Disclosure as="div">
       {({ open }) => (
         <Surface className="panel-surface-soft p-0">
-          <DisclosureButton className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left">
+          <DisclosureButton className="flex w-full items-start justify-between gap-3 px-4 py-3 text-left sm:items-center">
             <span className="text-base font-semibold text-ink sm:text-lg">{question}</span>
             <ChevronDown
               aria-hidden="true"
@@ -116,7 +122,7 @@ export function LinkCluster({
     <div className="flex flex-wrap items-center gap-2.5">
       {links.map((link) => (
         <ButtonLink
-          className="px-3.5 py-2 text-sm"
+          className="w-full px-3.5 py-2 text-sm sm:w-auto"
           href={link.href}
           key={link.href}
           rel={isExternalHref(link.href) ? 'noreferrer' : undefined}
