@@ -63,7 +63,7 @@ function MetadataManager() {
     const title = doc ? `${doc.title} | Qit Docs` : location.pathname === '/' ? siteTitle : 'Qit'
     const description = doc ? doc.description : siteDescription
     const baseUrl = new URL(import.meta.env.BASE_URL, window.location.origin)
-    const socialImageUrl = new URL('social-card.svg', baseUrl).toString()
+    const socialImageUrl = new URL('social-card.png', baseUrl).toString()
     const pageUrl = new URL(location.pathname, window.location.origin).toString()
 
     document.title = title
@@ -75,7 +75,7 @@ function MetadataManager() {
     upsertMeta('property', 'og:site_name', 'Qit')
     upsertMeta('property', 'og:url', pageUrl)
     upsertMeta('property', 'og:image', socialImageUrl)
-    upsertMeta('property', 'og:image:type', 'image/svg+xml')
+    upsertMeta('property', 'og:image:type', 'image/png')
     upsertMeta('property', 'og:image:width', '1200')
     upsertMeta('property', 'og:image:height', '630')
     upsertMeta('property', 'og:image:alt', socialImageAlt)
