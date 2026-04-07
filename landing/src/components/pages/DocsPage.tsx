@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronLeft, ChevronRight } from 'lucide-react'
+import { ChevronDown, ChevronLeft, ChevronRight } from 'lucide-react'
 import { repoUrl } from '../../lib/content'
 import { docsBySection, getAdjacentDocs, type DocEntry } from '../../lib/docs'
 import { getPrimaryInstallCta } from '../../lib/install'
@@ -162,54 +162,28 @@ export function DocsPage({
       brandHref="/"
       className="pb-0"
       ctaHref={installCta.href}
-      ctaLabel={installCta.label}
       contentSpacingClass="space-y-0"
       headerClassName="mb-5"
       navItems={docsNavItems}
     >
-      <section className="grid gap-5 md:grid-cols-[220px_minmax(0,1fr)] md:items-start xl:grid-cols-[240px_minmax(0,1fr)_230px]">
-        <aside className="md:sticky md:top-24 md:max-h-[calc(100svh-7rem)] md:self-start">
-          <Surface className="panel-surface-soft max-h-full space-y-3 overflow-y-auto p-4">
-            <div className="space-y-1.5">
-              <SectionEyebrow>Docs</SectionEyebrow>
-              <h1 className="text-xl font-black tracking-tight text-ink">Qit documentation</h1>
-            </div>
-
-            <nav aria-label="Documentation" className="space-y-3">
-              {docsBySection.map((group) => (
-                <div className="space-y-1" key={group.section}>
-                  <p className="px-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-ink-subtle">
-                    {group.section}
-                  </p>
-                  <div className="grid gap-0.5">
-                    {group.docs.map((item) => (
-                      <SiteLink
-                        className={classNames(
-                          'relative rounded-xs px-1 py-1 pl-3 text-sm font-medium leading-5 transition-colors before:absolute before:bottom-1 before:left-0 before:top-1 before:w-px before:rounded-full before:transition-colors',
-                          item.slug === doc.slug
-                            ? 'text-accent-strong before:bg-accent'
-                            : 'text-ink-muted before:bg-slate-300/70 hover:text-ink hover:before:bg-slate-400',
-                        )}
-                        href={item.href}
-                        key={item.slug}
-                      >
-                        {item.sidebarLabel}
-                      </SiteLink>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </nav>
-          </Surface>
+      <section className="grid gap-4 lg:grid-cols-[240px_minmax(0,1fr)] lg:items-start xl:grid-cols-[240px_minmax(0,1fr)_224px]">
+        <aside className="hidden lg:block">
+          <DocsSidebar currentSlug={doc.slug} />
         </aside>
 
-        <div className="space-y-4 md:pr-2">
+        <div className="space-y-4 lg:min-w-0 lg:pr-2">
+          <MobileDocsSidebar
+            currentDoc={doc}
+            currentSlug={doc.slug}
+            key={doc.slug}
+          />
+
           <Surface className="panel-surface-soft docs-article-shell p-0">
             <header className="border-b border-slate-900/8 px-5 py-5 sm:px-6">
               <div className="space-y-2">
                 <SectionEyebrow>{doc.sidebarLabel}</SectionEyebrow>
                 <div className="space-y-2">
-                  <h2 className="text-3xl font-black tracking-tight text-ink sm:text-4xl">{doc.title}</h2>
+                  <h1 className="text-3xl font-black tracking-tight text-ink sm:text-4xl">{doc.title}</h1>
                   <p className="max-w-3xl text-base leading-7 text-ink-muted sm:text-lg">{doc.description}</p>
                 </div>
               </div>
@@ -228,10 +202,16 @@ export function DocsPage({
             )}
             {next ? <DocPagerCard direction="next" doc={next} /> : null}
           </div>
+
+          {tocTree.length > 0 ? (
+            <div className="xl:hidden">
+              <DocsTableOfContents activeHeadingId={activeHeadingId} items={tocTree} />
+            </div>
+          ) : null}
         </div>
 
         {tocTree.length > 0 ? (
-          <aside className="hidden xl:block xl:self-start">
+          <aside className="hidden xl:block xl:sticky xl:top-24 xl:self-start">
             <div className="docs-toc-rail">
               <DocsTableOfContents activeHeadingId={activeHeadingId} items={tocTree} />
             </div>
@@ -239,6 +219,101 @@ export function DocsPage({
         ) : null}
       </section>
     </LandingShell>
+  )
+}
+
+function DocsSidebar({
+  currentSlug,
+}: {
+  currentSlug: string
+}) {
+  return (
+    <Surface className="panel-surface-soft space-y-3 p-4">
+      <div className="space-y-1.5">
+        <SectionEyebrow>Docs</SectionEyebrow>
+        <p className="text-xl font-black tracking-tight text-ink">Qit documentation</p>
+      </div>
+
+      <DocsNavigation currentSlug={currentSlug} />
+    </Surface>
+  )
+}
+
+function MobileDocsSidebar({
+  currentDoc,
+  currentSlug,
+}: {
+  currentDoc: DocEntry
+  currentSlug: string
+}) {
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+
+  return (
+    <Surface className="panel-surface-soft space-y-3 p-4 lg:hidden">
+      <div className="flex items-start justify-between gap-3">
+        <div className="space-y-2">
+          <SectionEyebrow>Docs</SectionEyebrow>
+          <div className="space-y-1">
+            <p className="text-base font-bold tracking-tight text-ink">{currentDoc.title}</p>
+            <p className="text-sm text-ink-muted">Browse other docs pages without sacrificing the article first view.</p>
+          </div>
+        </div>
+        <button
+          aria-controls="mobile-docs-nav"
+          aria-expanded={mobileNavOpen}
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-token border border-slate-900/8 bg-white px-3 py-2 text-sm font-semibold text-ink shadow-sm transition hover:border-accent/30 hover:text-accent-strong"
+          onClick={() => setMobileNavOpen((open) => !open)}
+          type="button"
+        >
+          {mobileNavOpen ? 'Hide pages' : 'Browse docs'}
+          <ChevronDown
+            aria-hidden="true"
+            className={classNames('h-4 w-4 transition-transform', mobileNavOpen ? 'rotate-180' : undefined)}
+            strokeWidth={2}
+          />
+        </button>
+      </div>
+
+      {mobileNavOpen ? (
+        <div id="mobile-docs-nav">
+          <DocsNavigation currentSlug={currentSlug} />
+        </div>
+      ) : null}
+    </Surface>
+  )
+}
+
+function DocsNavigation({
+  currentSlug,
+}: {
+  currentSlug: string
+}) {
+  return (
+    <nav aria-label="Documentation" className="space-y-3">
+      {docsBySection.map((group) => (
+        <div className="space-y-1" key={group.section}>
+          <p className="px-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-ink-subtle">
+            {group.section}
+          </p>
+          <div className="grid gap-0.5">
+            {group.docs.map((item) => (
+              <SiteLink
+                className={classNames(
+                  'relative rounded-xs px-1 py-1 pl-3 text-sm font-medium leading-5 transition-colors before:absolute before:bottom-1 before:left-0 before:top-1 before:w-px before:rounded-full before:transition-colors',
+                  item.slug === currentSlug
+                    ? 'text-accent-strong before:bg-accent'
+                    : 'text-ink-muted before:bg-slate-300/70 hover:text-ink hover:before:bg-slate-400',
+                )}
+                href={item.href}
+                key={item.slug}
+              >
+                {item.sidebarLabel}
+              </SiteLink>
+            ))}
+          </div>
+        </div>
+      ))}
+    </nav>
   )
 }
 
@@ -250,7 +325,7 @@ function DocsTableOfContents({
   items: TocNode[]
 }) {
   return (
-    <Surface className="panel-surface-soft max-h-full space-y-3 overflow-y-auto p-4">
+    <Surface className="panel-surface-soft space-y-3 p-4">
       <div className="space-y-1.5">
         <div className="space-y-1">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-ink-subtle">On this page</p>
@@ -335,7 +410,6 @@ export function DocsEmptyState() {
     <LandingShell
       brandHref="/"
       ctaHref={installCta.href}
-      ctaLabel={installCta.label}
       contentSpacingClass="space-y-0"
       headerClassName="mb-5"
       navItems={docsNavItems}

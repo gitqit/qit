@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="84" y1="52" x2="1116" y2="578" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7FBFF"/>
+      <stop offset="0.56" stop-color="#EEF6FF"/>
+      <stop offset="1" stop-color="#F8FBFF"/>
+    </linearGradient>
+    <radialGradient id="orbBlue" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(170 110) rotate(23) scale(290 240)">
+      <stop stop-color="#93C5FD" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#93C5FD" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="orbGreen" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1010 508) rotate(180) scale(220 180)">
+      <stop stop-color="#86EFAC" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#86EFAC" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="630" rx="36" fill="url(#bg)"/>
+  <circle cx="170" cy="110" r="240" fill="url(#orbBlue)"/>
+  <circle cx="1010" cy="508" r="180" fill="url(#orbGreen)"/>
+
+  <text x="112" y="238" fill="#0F172A" font-family="Inter, SF Pro Text, Segoe UI, Arial, sans-serif" font-size="82" font-weight="900" letter-spacing="-0.055em">
+    <tspan x="112" dy="0">Quick Git for</tspan>
+    <tspan x="112" dy="86">normal folders.</tspan>
+  </text>
+
+  <text x="112" y="414" fill="#475569" font-family="Inter, SF Pro Text, Segoe UI, Arial, sans-serif" font-size="30" font-weight="500" letter-spacing="-0.02em">
+    <tspan x="112" dy="0">Install Qit, point it at any folder, and share it over authenticated</tspan>
+    <tspan x="112" dy="42">Git Smart HTTP without dropping `.git` into the working tree.</tspan>
+  </text>
+
+  <text x="112" y="528" fill="#1D4ED8" font-family="Inter, SF Pro Text, Segoe UI, Arial, sans-serif" font-size="24" font-weight="700">
+    gitqit.net
+  </text>
+</svg>

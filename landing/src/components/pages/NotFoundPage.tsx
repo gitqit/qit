@@ -22,7 +22,6 @@ export function NotFoundPage({
     <LandingShell
       brandHref="/"
       ctaHref={installCta.href}
-      ctaLabel={installCta.label}
       contentSpacingClass="space-y-0"
       headerClassName="mb-5"
       navItems={navItems}

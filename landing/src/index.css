@@ -212,12 +212,7 @@ pre {
 }
 
 .docs-article-shell {
-  overflow: hidden;
-}
-
-.docs-scroll-column {
-  scrollbar-gutter: stable;
-  overscroll-behavior: contain;
+  overflow: visible;
 }
 
 .docs-prose {
@@ -381,15 +376,8 @@ pre {
   position: relative;
 }
 
-@media (min-width: 80rem) {
-  .docs-toc-rail {
-    position: fixed;
-    top: 6rem;
-    right: max(1rem, calc((100vw - 86rem) / 2 + 1.75rem));
-    z-index: 10;
-    width: 14.375rem;
-    max-height: calc(100svh - 7rem);
-  }
+.docs-toc-rail {
+  position: relative;
 }
 
 .docs-toc__list {
@@ -912,6 +900,57 @@ pre {
   box-shadow:
     0 10px 24px rgba(17, 24, 39, 0.08),
     inset 0 1px 0 rgba(220, 252, 231, 0.05);
+}
+
+@media (max-width: 48rem) {
+  .docs-prose h2,
+  .docs-prose h3,
+  .docs-prose h4 {
+    scroll-margin-top: 6.5rem;
+  }
+
+  .docs-prose h2 {
+    font-size: 1.4rem;
+  }
+
+  .docs-prose h3 {
+    font-size: 1.12rem;
+  }
+
+  .docs-prose p,
+  .docs-prose ul,
+  .docs-prose ol,
+  .docs-prose blockquote {
+    font-size: 0.95rem;
+    line-height: 1.7;
+  }
+
+  .docs-prose blockquote {
+    padding: 1.15rem 1rem 0.9rem 1.15rem;
+  }
+
+  .docs-prose blockquote::before {
+    left: 0.3rem;
+    top: -1rem;
+    font-size: 6.2rem;
+  }
+
+  .docs-table {
+    min-width: 30rem;
+  }
+
+  .docs-code-block__toolbar {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .docs-code-block__label {
+    margin-right: 0;
+  }
+
+  .docs-code-block__copy {
+    margin-left: auto;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
